@@ -60,6 +60,18 @@ func setupEmptyTestDatabase(t *testing.T) (*pgxpool.Pool, context.Context) {
 	return testPool, ctx
 }
 
+func TestFormatSchemaVersion(t *testing.T) {
+	for version, want := range map[uint]string{
+		0:             "0.0.0",
+		1:             "0.0.1",
+		10_000:        "0.1.0",
+		100_020_003:   "1.2.3",
+		1_299_999_999: "12.9999.9999",
+	} {
+		assert.Equal(t, want, postgremq.FormatSchemaVersion(version), "schema version %d", version)
+	}
+}
+
 func TestMigration_StatusOnEmptyDatabase(t *testing.T) {
 	pool, _ := setupEmptyTestDatabase(t)
 
@@ -185,14 +197,14 @@ func TestMigration_NewerDatabaseIsLeftUnchanged(t *testing.T) {
 	require.NoError(t, postgremq.Migrate(pool))
 
 	// A newer client migrated this database past the embedded migrations.
-	_, err := pool.Exec(ctx, "UPDATE postgremq.postgremq_migrations SET version = 999")
+	_, err := pool.Exec(ctx, "UPDATE postgremq.postgremq_migrations SET version = 900000000")
 	require.NoError(t, err)
 
 	require.NoError(t, postgremq.Migrate(pool), "a newer database is not an error")
 
 	status, err := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, err)
-	assert.Equal(t, uint(999), status.CurrentVersion, "the version must not be lowered")
+	assert.Equal(t, uint(900_000_000), status.CurrentVersion, "the version must not be lowered")
 	assert.False(t, status.Dirty)
 	assert.False(t, status.NeedsMigration)
 }

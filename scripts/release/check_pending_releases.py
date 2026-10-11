@@ -3,7 +3,7 @@
 
 Release Please tags the merge commit of every merged release PR still
 labelled `autorelease: pending` (normally the one combined release PR), and
-the release workflow then tags mq/vN on the same commit. A tag publishes (the
+the release workflow then tags mq/vX.Y.Z on the same commit. A tag publishes (the
 Go module is published by the tag alone), so each such commit must already
 have passed validation, and must be a consistent release
 (scripts/release/verify_release.py --all). A later passing commit must not

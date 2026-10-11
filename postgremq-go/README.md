@@ -20,7 +20,7 @@ Install the SQL schema in the same database as your application. All queue objec
 
 - the CLI: `postgremq migrate --dsn "$DATABASE_URL"` (see [cmd/postgremq](cmd/postgremq/README.md); `go install postgremq.dev/postgremq-go/cmd/postgremq@latest`);
 - `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql`;
-- the Go API: `postgremq.Migrate(pool)` and `postgremq.GetMigrationStatus(pool)` (see [examples/migration](examples/migration/main.go)).
+- the Go API: `postgremq.Migrate(pool)` and `postgremq.GetMigrationStatus(pool)` (see [examples/migration](examples/migration/main.go)). Versions are schema versions: the mq version stored as one number (10000 is mq 0.1.0); `postgremq.FormatSchemaVersion` turns one back into the mq version.
 
 `latest.sql` is for fresh databases only (it refuses to run on an existing installation) and records the migration version it installs, so `Migrate` can upgrade it later.
 

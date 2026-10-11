@@ -44,8 +44,8 @@ func main() {
 		log.Fatalf("Failed to get migration status: %v", err)
 	}
 
-	fmt.Printf("Current schema version: %d\n", status.CurrentVersion)
-	fmt.Printf("Latest available version: %d\n", status.LatestVersion)
+	fmt.Printf("Current schema version: %s\n", postgremq.FormatSchemaVersion(status.CurrentVersion))
+	fmt.Printf("Latest available version: %s\n", postgremq.FormatSchemaVersion(status.LatestVersion))
 	fmt.Printf("Schema is dirty: %v\n", status.Dirty)
 
 	// Check if migration is needed
@@ -60,7 +60,8 @@ func main() {
 			"This usually means a previous migration failed partway through.")
 	}
 
-	fmt.Printf("\nMigration needed: %d -> %d\n", status.CurrentVersion, status.LatestVersion)
+	fmt.Printf("\nMigration needed: %s -> %s\n",
+		postgremq.FormatSchemaVersion(status.CurrentVersion), postgremq.FormatSchemaVersion(status.LatestVersion))
 	fmt.Println("Applying migrations...")
 
 	// Apply migrations
@@ -75,7 +76,7 @@ func main() {
 	}
 
 	fmt.Printf("\nMigration completed successfully!\n")
-	fmt.Printf("New schema version: %d\n", newStatus.CurrentVersion)
+	fmt.Printf("New schema version: %s\n", postgremq.FormatSchemaVersion(newStatus.CurrentVersion))
 
 	// Now you can use PostgreMQ normally
 	log.Println("\nPostgreMQ is ready to use.")

@@ -5,6 +5,9 @@
  * protocol, so any client can migrate a database another one installed.
  *
  * Migrations only go up, to the latest version embedded in this package.
+ *
+ * A schema version is an mq version stored as one number,
+ * major * 10^8 + minor * 10^4 + patch (see `formatSchemaVersion()`).
  */
 
 import { Pool, PoolClient } from 'pg';
@@ -13,7 +16,10 @@ import { MIGRATIONS } from './migrations.generated';
 
 /** The migration state of a database, from `getMigrationStatus()`. */
 export interface MigrationStatus {
-  /** The applied version; 0 when no migration has been applied. */
+  /**
+   * The applied schema version; 0 when no migration has been applied.
+   * `formatSchemaVersion()` gives its mq version.
+   */
   currentVersion: number;
   /**
    * Whether the migration of `currentVersion` has not finished: it failed
@@ -21,7 +27,7 @@ export interface MigrationStatus {
    * without the migration lock).
    */
   dirty: boolean;
-  /** The latest migration embedded in this package. */
+  /** The schema version of the latest migration embedded in this package. */
   latestVersion: number;
   /**
    * Whether `currentVersion` is below `latestVersion`. A dirty database may
@@ -31,6 +37,14 @@ export interface MigrationStatus {
 }
 
 const LATEST_VERSION = Math.max(...MIGRATIONS.map((m) => m.version));
+
+/**
+ * The mq version (`major.minor.patch`) of a schema version, the number the
+ * version table stores: `formatSchemaVersion(10000)` is `'0.1.0'`.
+ */
+export function formatSchemaVersion(version: number): string {
+  return `${Math.floor(version / 100_000_000)}.${Math.floor(version / 10_000) % 10_000}.${version % 10_000}`;
+}
 
 /**
  * Applies the embedded migrations the database has not applied yet, up to the

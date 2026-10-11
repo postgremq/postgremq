@@ -181,8 +181,8 @@ func runCLI(args ...string) (string, string, error) {
 // latest is the newest embedded migration, which grows with every mq release.
 func versions(t *testing.T, stdout string) (current, latest int) {
 	t.Helper()
-	c := regexp.MustCompile(`Current version: (\d+)`).FindStringSubmatch(stdout)
-	l := regexp.MustCompile(`Latest version:  (\d+)`).FindStringSubmatch(stdout)
+	c := regexp.MustCompile(`Current version: .*\(schema version (\d+)\)`).FindStringSubmatch(stdout)
+	l := regexp.MustCompile(`Latest version:  .*\(schema version (\d+)\)`).FindStringSubmatch(stdout)
 	require.NotNil(t, c, stdout)
 	require.NotNil(t, l, stdout)
 	current, _ = strconv.Atoi(c[1])

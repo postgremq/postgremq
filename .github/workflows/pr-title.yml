@@ -9,6 +9,7 @@ on:
     types: [ opened, edited, synchronize, reopened ]
 
 permissions:
+  contents: read
   pull-requests: read
 
 jobs:
@@ -36,3 +37,16 @@ jobs:
           subjectPattern: ^(?![A-Z]).+$
           subjectPatternError: |
             The subject "{subject}" must start with a lowercase letter.
+      # A PR that changes the schema says what kind of change it is: the title's
+      # level (fix: patch, feat: minor, !: major) covers the change headers it
+      # adds to the pending migration (scripts/schema.py check-title).
+      - uses: actions/checkout@v7
+        if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+        with:
+          fetch-depth: 0
+      - name: Title matches the schema change
+        if: ${{ !startsWith(github.head_ref, 'release-please--') }}
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+          BASE: origin/${{ github.base_ref }}
+        run: python3 scripts/schema.py check-title "$TITLE" --base "$BASE"

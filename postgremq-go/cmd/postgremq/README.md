@@ -84,11 +84,13 @@ postgremq migrate --dsn <connection-string>
 postgremq migrate --dsn "postgres://postgres:postgres@localhost:5432/mydb"
 ```
 
+Versions are mq versions, each followed by the number the database stores
+(X×10⁸ + Y×10⁴ + Z; see [mq/README.md](../../../mq/README.md#versions-and-discovery)).
 Output on a fresh database:
 
 ```
-Current version: 0
-Latest version:  1
+Current version: none (schema version 0)
+Latest version:  0.1.0 (schema version 10000)
 Running migrations...
 ✓ Migration completed successfully
 ```
@@ -96,8 +98,8 @@ Running migrations...
 Output when there is nothing to do:
 
 ```
-Current version: 1
-Latest version:  1
+Current version: 0.1.0 (schema version 10000)
+Latest version:  0.1.0 (schema version 10000)
 ✓ Database is up to date
 ```
 
@@ -116,18 +118,18 @@ postgremq status --dsn <connection-string>
 Migrations pending:
 
 ```
-Current version: 0
-Latest version:  1
+Current version: none (schema version 0)
+Latest version:  0.1.0 (schema version 10000)
 Dirty:           false
 
-⚠ Migration needed: 1 pending migration(s)
+⚠ Migration needed: none (schema version 0) -> 0.1.0
 ```
 
 Up to date:
 
 ```
-Current version: 1
-Latest version:  1
+Current version: 0.1.0 (schema version 10000)
+Latest version:  0.1.0 (schema version 10000)
 Dirty:           false
 
 ✓ Database is up to date
@@ -141,10 +143,10 @@ The version is stored in the single-row table `postgremq.postgremq_migrations`, 
 
 | Column | Type | Meaning |
 |--------|------|---------|
-| `version` | `bigint` (primary key) | Last applied migration version |
+| `version` | `bigint` (primary key) | Last applied migration's mq version, as X×10⁸ + Y×10⁴ + Z |
 | `dirty` | `boolean` | `true` if that migration started but did not finish |
 
-Migrations are applied with [golang-migrate](https://github.com/golang-migrate/migrate) from the SQL files embedded from the Go client's copy of `mq/migrations/`.
+Migrations are applied with [golang-migrate](https://github.com/golang-migrate/migrate) from the SQL files embedded from the Go client's copy of `mq/migrations/` (`postgremq-go/migrations/`, under numbered names such as `000010000_0.1.0.up.sql`).
 
 ## Required privileges
 
@@ -215,11 +217,11 @@ If a migration fails partway, golang-migrate leaves `dirty = true` with `version
      UPDATE postgremq.postgremq_migrations SET dirty = false;
      ```
 
-   - If they are absent or have been rolled back, set the version to the previous one so the migration runs again. For version 1, delete the row so the database reads as version 0:
+   - If they are absent or have been rolled back, set the version to the previous migration's so the failed one runs again. Versions are not consecutive: take the number before the failed one from the migration file names (`postgremq-go/migrations/`, e.g. `000000001_0.0.1.up.sql` before `000010000_0.1.0.up.sql`). For the first migration, delete the row so the database reads as version 0:
 
      ```sql
-     UPDATE postgremq.postgremq_migrations SET version = <failed_version - 1>, dirty = false;
-     -- for version 1:
+     UPDATE postgremq.postgremq_migrations SET version = <previous migration's version>, dirty = false;
+     -- for the first migration:
      DELETE FROM postgremq.postgremq_migrations;
      ```
 

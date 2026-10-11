@@ -144,7 +144,7 @@ async fn concurrent_callers_in_separate_pools_are_serialised() {
 async fn leaves_a_database_migrated_by_a_newer_client_unchanged() {
     let db = TestDb::empty().await;
     migrate(&db.pool).await.unwrap();
-    sqlx::query("UPDATE postgremq.postgremq_migrations SET version = 999")
+    sqlx::query("UPDATE postgremq.postgremq_migrations SET version = 900000000")
         .execute(&db.pool)
         .await
         .unwrap();
@@ -152,7 +152,7 @@ async fn leaves_a_database_migrated_by_a_newer_client_unchanged() {
     migrate(&db.pool).await.unwrap();
 
     let status = migration_status(&db.pool).await.unwrap();
-    assert_eq!(status.current_version, 999);
+    assert_eq!(status.current_version, 900_000_000);
     assert!(!status.dirty && !status.needs_migration);
 }
 

@@ -1,21 +1,23 @@
 #!/usr/bin/env python3
-"""Releases of mq, the SQL schema: mq/vN, where N is the last migration.
+"""Releases of mq, the SQL schema: mq/vX.Y.Z, where X.Y.Z is the last migration.
 
-mq is not a Release Please component (its version is not computed from
-commits). It is released together with the clients: when a release PR is
-merged and the last migration on that commit is newer than the latest mq/v*
-tag, mq/vN is tagged on the same commit. Release notes come from the
-conventional commits that touched mq/ since the previous mq release.
+mq is not a Release Please component: its version is the pending migration's
+(mq/migrations/X.Y.Z.up.sql; scripts/schema.py), which each schema change
+bumps when it is written. It is released together with the clients: when a
+release PR is merged and the last migration on that commit is newer than the
+latest mq/v* tag, mq/vX.Y.Z is tagged on the same commit. Release notes list
+the changes (the pending migration's section headers) and the conventional
+commits that touched mq/ since the previous mq release.
 
-    mq_release.py pending [REF]              # print N if mq/vN is still to be released at REF
-    mq_release.py notes [REF]                # the release notes mq/vN would get
+    mq_release.py pending [REF]              # print X.Y.Z if mq/vX.Y.Z is still to be released at REF
+    mq_release.py notes [REF]                # the release notes it would get
     mq_release.py comment --branch main      # keep a comment on the open release PR saying what mq release it brings
-    mq_release.py release [--sha SHA]        # create mq/vN and its GitHub release, if pending
+    mq_release.py release [--sha SHA]        # create mq/vX.Y.Z and its GitHub release, if pending
 
 `release` uses the newest client release commit in HEAD's history (after
 fetching tags) unless --sha is given, so a run that failed after tagging the
 clients is repaired by the next one. `comment` and `release` need `gh`
-(GH_TOKEN) and GITHUB_REPOSITORY; `release` writes `tag=mq/vN` (or `tag=`) to
+(GH_TOKEN) and GITHUB_REPOSITORY; `release` writes `tag=mq/vX.Y.Z` (or `tag=`) to
 $GITHUB_OUTPUT when set. Release assets (latest.sql and the migrations) are
 uploaded by publish.yml.
 """
@@ -32,7 +34,10 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
-UP = re.compile(r'^(\d+)_(.+)\.up\.sql$')
+sys.path.insert(0, str(ROOT / 'scripts'))
+import schema  # noqa: E402
+from schema import Version  # noqa: E402
+
 SUBJECT = re.compile(r'^(?P<type>\w+)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?: (?P<subject>.+)$')
 BREAKING = re.compile(r'^BREAKING[ -]CHANGE: (.+?)(?=^\S[\w-]*: |\Z)', re.M | re.S)
 SECTIONS = [('feat', 'Features'), ('fix', 'Bug Fixes'), ('perf', 'Performance Improvements'),
@@ -49,21 +54,19 @@ def gh(*args: str) -> str:
     return subprocess.run(['gh', *args], check=True, capture_output=True, text=True).stdout
 
 
-def last_migration(ref: str) -> int:
-    names = git('ls-tree', '--name-only', f'{ref}:mq/migrations').split()
-    return max(int(m.group(1)) for m in map(UP.match, names) if m)
+def last_migration(ref: str) -> Version:
+    return schema.last_version_at(ref)
 
 
-def previous_release(ref: str) -> tuple[int, str] | None:
-    """The newest mq/vN tag in REF's history, as (N, tag)."""
-    tags = [t for t in git('tag', '--merged', ref, '--list', 'mq/v*').split() if re.fullmatch(r'mq/v\d+', t)]
-    return max(((int(t[4:]), t) for t in tags), default=None)
+def previous_release(ref: str) -> tuple[Version, str] | None:
+    """The newest mq release in REF's history, as (version, tag)."""
+    return schema.released_tag(ref)
 
 
-def pending(ref: str) -> int | None:
-    number = last_migration(ref)
+def pending(ref: str) -> Version | None:
+    version = last_migration(ref)
     previous = previous_release(ref)
-    return number if previous is None or number > previous[0] else None
+    return version if previous is None or version > previous[0] else None
 
 
 def since(ref: str) -> str:
@@ -76,7 +79,7 @@ def since(ref: str) -> str:
 
 
 def notes(ref: str) -> str:
-    number = last_migration(ref)
+    version = last_migration(ref)
     start = since(ref)
     repo = os.environ.get('GITHUB_REPOSITORY')
     log = git('log', '--format=%H%x1f%s%x1f%b%x1e', f'{start}..{ref}', '--', 'mq/')
@@ -96,12 +99,15 @@ def notes(ref: str) -> str:
         if match['type'] in dict(SECTIONS):
             sections.setdefault(match['type'], []).append(entry)
 
-    added = [name for name in git('ls-tree', '--name-only', f'{ref}:mq/migrations').split()
-             if (m := UP.match(name)) and int(m.group(1)) > (previous_release(ref) or (0, ''))[0]]
-    lines = [f'Schema version **{number}**: what `postgremq.info()` reports as `schema_version` after '
-             f'installing or upgrading to this release. Every client released with it embeds migrations 1..{number}.',
-             '',
-             'New migrations: ' + ', '.join(f'`{name}`' for name in added) + '.']
+    previous = previous_release(ref)
+    changes = [section for (v, direction), content in sorted(schema.migrations_at(ref).items())
+               if direction == 'up' and (previous is None or v > previous[0])
+               for section in schema.all_sections(content)]
+    lines = [f'mq **{version}**: the database stores it as schema version {version.encode()}, what '
+             '`postgremq.info()` reports as `schema_version` after installing or upgrading to this release. '
+             'Every client released with it embeds every migration up to it.']
+    if changes:
+        lines += ['', '### Changes', '', *(f'* `{name}` ({level})' for name, level in changes)]
     if breaking:
         lines += ['', '### ⚠ BREAKING CHANGES', '', *breaking]
     for kind, title in SECTIONS:
@@ -127,13 +133,13 @@ def cmd_comment(branch: str) -> int:
     # Tags too: this run may have just released mq.
     git('fetch', '-q', '--tags', 'origin', f'+refs/heads/{head}:refs/remotes/origin/{head}')
     ref = f'origin/{head}'
-    number = pending(ref)
-    if number is None:
+    version = pending(ref)
+    if version is None:
         body = (f'{MARKER}\nNo mq release: the last migration ({last_migration(ref)}) '
                 'is already released.\n')
     else:
-        body = (f'{MARKER}\n## mq v{number}\n\nMerging this PR also releases **mq v{number}** '
-                f'(tag `mq/v{number}`) on the same commit.\n\n{notes(ref)}')
+        body = (f'{MARKER}\n## mq v{version}\n\nMerging this PR also releases **mq v{version}** '
+                f'(tag `mq/v{version}`) on the same commit.\n\n{notes(ref)}')
     comments = json.loads(gh('api', f'repos/{repo}/issues/{pr["number"]}/comments?per_page=100'))
     existing = next((c for c in comments if c['body'].startswith(MARKER)), None)
     if existing and existing['body'].strip() == body.strip():
@@ -169,12 +175,12 @@ def cmd_release(sha: str | None) -> int:
             print('mq: no client release yet; nothing to release.')
             set_output('tag', '')
             return 0
-    number = pending(sha)
-    if number is None:
+    version = pending(sha)
+    if version is None:
         print(f'mq: nothing to release at {sha[:12]} (migration {last_migration(sha)} is already released).')
         set_output('tag', '')
         return 0
-    tag = f'mq/v{number}'
+    tag = f'mq/v{version}'
     # The release API ignores --target for an existing tag: never attach the
     # release to a tag made elsewhere (another branch, by hand).
     if git('ls-remote', '--tags', 'origin', f'refs/tags/{tag}').strip():
@@ -182,7 +188,7 @@ def cmd_release(sha: str | None) -> int:
                          'delete the stray tag (and its release) and re-run')
     with tempfile.NamedTemporaryFile('w', suffix='.md', delete=False) as file:
         file.write(notes(sha))
-    gh('release', 'create', tag, '--repo', repo, '--target', sha, '--title', f'mq: v{number}',
+    gh('release', 'create', tag, '--repo', repo, '--target', sha, '--title', f'mq: v{version}',
        '--notes-file', file.name)
     print(f'Released {tag} at {sha[:12]}.')
     set_output('tag', tag)
@@ -202,9 +208,9 @@ def main() -> int:
     args = parser.parse_args()
 
     if args.command == 'pending':
-        number = pending(args.ref)
-        if number is not None:
-            print(number)
+        version = pending(args.ref)
+        if version is not None:
+            print(version)
         return 0
     if args.command == 'notes':
         print(notes(args.ref), end='')

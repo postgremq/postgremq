@@ -7,14 +7,17 @@
 Used on release PRs (--all), by the release guard before tags are created
 (--all), and by the publish workflow on each release tag. Checks:
 
-- every client points at the last migration (scripts/schema.py check: the Go
-  copy, the Rust and TypeScript pins, the version latest.sql records);
+- the schema is consistent (scripts/schema.py check: at most one pending
+  migration, versioned by its change headers; every client's copy of the
+  migrations and the version latest.sql records are in step);
 - a client's version agrees across the Release Please manifest and its own
   files (Cargo.toml/Cargo.lock, package.json/package-lock.json; the Go module
   is versioned by its tag only), and its CHANGELOG.md has an entry for it;
-- mq/vN: N is the last migration; with --all, when the release brings a new
-  mq version, every client is part of it (else a client would keep shipping
-  an older schema while mq/vN is released);
+- mq/vX.Y.Z: X.Y.Z is the last migration; with --all, when the release brings
+  a new mq version, every client is part of it (else a client would keep
+  shipping an older schema while mq is released), and no commit scoped to the
+  schema alone (`feat(sql): ...`) since the last mq release asks for a higher
+  level than the new version's;
 - the Go module requires no other module of this repository and has a LICENSE;
 - with --tag-exists, the tag exists and points at HEAD.
 """
@@ -31,6 +34,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / 'scripts'))
 import schema  # noqa: E402
+
+REVERTS_COMMIT = re.compile(r'This reverts commit ([0-9a-f]{7,40})')
+REVERTS_PR = re.compile(r'^Reverts [\w.-]+/[\w.-]+#(\d+)', re.M)
 
 # client component (tag prefix) -> package path in release-please-config.json
 CLIENTS = {
@@ -65,7 +71,7 @@ class Checker:
             self.errors.append(f'schema: {error}')
             return
         for description, _ in changes:
-            self.errors.append(f'not in sync with the last migration (run `make sync`): {description}')
+            self.errors.append(f'schema not in sync (run `make sync`): {description}')
 
     def client(self, component: str, version: str) -> None:
         path = CLIENTS[component]
@@ -103,17 +109,16 @@ class Checker:
                     f'postgremq-ts/package-lock.json does not record {version}')
 
     def every_client_with_new_schema(self, manifest: dict[str, str]) -> None:
-        """A release that brings mq/vN must release every client: they all
-        embed the new migration (scripts/schema.py), and a client left out
-        would keep shipping the previous schema. A client is in the release
-        when its manifest version has no tag yet."""
+        """A release that brings a new mq version must release every client:
+        they all embed the new migration (scripts/schema.py), and a client
+        left out would keep shipping the previous schema. A client is in the
+        release when its manifest version has no tag yet."""
         try:
-            last = schema.latest()
+            last = schema.Tree.load().last()
         except schema.SchemaError:
             return  # reported by schema()
-        released = [int(t[4:]) for t in git('tag', '--merged', 'HEAD', '--list', 'mq/v*').split()
-                    if re.fullmatch(r'mq/v\d+', t)]
-        if released and last <= max(released):
+        released = schema.released()
+        if released is not None and last <= released:
             return
         for component, path in CLIENTS.items():
             tag = f'{component}/v{manifest[path]}'
@@ -122,9 +127,47 @@ class Checker:
                         f'shipping the previous schema: add a feat/fix commit for it (the migration commit '
                         f'was probably not feat/fix)')
 
+    def mq_level_covers_schema_commits(self) -> None:
+        """A release must not understate a schema change: every commit since
+        the last mq release that touched mq/migrations and is scoped to the
+        schema alone asks for at most the new version's level (PR titles are
+        checked as they merge; this catches what got past that)."""
+        try:
+            tree = schema.Tree.load()
+        except schema.SchemaError:
+            return  # reported by schema()
+        pending = tree.pending()
+        if not pending:
+            return
+        level = pending[-1].level_from(tree.base)
+        previous = schema.released_tag('HEAD')
+        start = previous[1] if previous else json.loads(
+            (ROOT / 'release-please-config.json').read_text())['bootstrap-sha']
+        log = git('log', '--format=%H%x1f%s%x1f%b%x1e', f'{start}..HEAD', '--', schema.MIGRATIONS_DIR)
+        commits = [record.strip('\n').split('\x1f') for record in log.split('\x1e') if record.strip()]
+        # A reverted change is no longer in the release: `git revert` writes
+        # "This reverts commit <sha>", GitHub's revert PRs "Reverts <repo>#<n>"
+        # (the reverted PR's squash commit ends with "(#<n>)").
+        reverted_shas = {sha for _, _, body in commits for sha in REVERTS_COMMIT.findall(body)}
+        reverted_prs = {pr for _, _, body in commits for pr in REVERTS_PR.findall(body)}
+        for sha, subject, body in commits:
+            pr = re.search(r'\(#(\d+)\)$', subject)
+            if REVERTS_COMMIT.search(body) or REVERTS_PR.search(body) or \
+                    any(sha.startswith(r) for r in reverted_shas) or (pr and pr.group(1) in reverted_prs):
+                continue
+            sha = sha[:7]
+            try:
+                asked, scopes = schema.title_level(subject)
+            except schema.SchemaError:
+                continue
+            if scopes and scopes <= schema.SCHEMA_SCOPES and schema.rank(asked) > schema.rank(level):
+                self.errors.append(f'{sha} "{subject}" is a {asked} schema change, but this release makes mq '
+                                   f'{pending[-1]}, a {level} bump of {tree.base}: add a {asked} change header '
+                                   f'to the pending migration (`make migration`)')
+
     def mq(self, version: str) -> None:
         try:
-            last = schema.latest()
+            last = schema.Tree.load().last()
         except schema.SchemaError:
             return  # reported by schema()
         self.expect(version == str(last), f'mq/v{version}: the last migration is {last}, not {version}')
@@ -133,7 +176,7 @@ class Checker:
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     target = parser.add_mutually_exclusive_group(required=True)
-    target.add_argument('tag', nargs='?', help='a release tag, e.g. rust/v0.2.0 or mq/v3')
+    target.add_argument('tag', nargs='?', help='a release tag, e.g. rust/v0.2.0 or mq/v0.1.0')
     target.add_argument('--all', action='store_true', help='every client at its manifest version, and mq')
     parser.add_argument('--tag-exists', action='store_true', help='also require the tag to point at HEAD')
     args = parser.parse_args()
@@ -145,12 +188,13 @@ def main() -> int:
         for component, path in CLIENTS.items():
             checker.client(component, manifest[path])
         checker.every_client_with_new_schema(manifest)
+        checker.mq_level_covers_schema_commits()
         label = 'all components'
     else:
         component, sep, version = args.tag.rpartition('/v')
         if not sep or component not in [*CLIENTS, 'mq']:
             parser.error(f'not a release tag: {args.tag} '
-                         f'(want mq/vN or one of {", ".join(f"{c}/vX.Y.Z" for c in CLIENTS)})')
+                         f'(want one of {", ".join(f"{c}/vX.Y.Z" for c in [*CLIENTS, "mq"])})')
         if component == 'mq':
             checker.mq(version)
         else:
