@@ -41,46 +41,50 @@ outside these directories (docs, `observability/`, CI) release nothing.
   the migrated database) bumps MAJOR, an additive one MINOR, a fix PATCH,
   before 1.0 as after. `mq/vX.Y.Z` is the schema at migration X.Y.Z; the
   database stores it as one number, X×10⁸ + Y×10⁴ + Z (0.1.0 is 10000), which
-  `postgremq.info()` reports as `schema_version`. Clients check the protocol
-  major (below), not the version.
+  `postgremq.info()` reports as `schema_version`. Clients check its major
+  when they connect (below).
 - Published versions and tags are immutable. A correction is a new release.
 
 ## The SQL schema
 
-### Protocol major and discovery
+### Compatibility and discovery
 
-The protocol major is the contract clients rely on: SQL function signatures,
-result types, error codes, ownership rules and delivery semantics. It is
-currently **1**. Additive changes (a new function, an added optional
-parameter with a default, an added result field) keep it; incompatible ones
-need a new major.
+The mq major is the contract clients rely on: SQL function signatures, result
+types, error codes, ownership rules and delivery semantics. Additive changes (a
+new function, an added optional parameter with a default, an added result
+field) are minor versions and keep it; incompatible ones are a new major.
 
 ```sql
 SELECT postgremq.info();
--- {"schema_version": 10000, "protocol_major": 1}
+-- {"schema_version": 10001, "protocol_major": 1}
 ```
 
 `schema_version` is the version of the last migration applied, stored as one
-number (10000 is mq 0.1.0): the exact schema and function state of the
+number (10001 is mq 0.1.1): the exact schema and function state of the
 database. `info()` reads it from the version table that every install path
 maintains (the migrators and `latest.sql`). The clients' migration status
 reports the same number; `FormatSchemaVersion` (Go), `format_schema_version`
 (Rust) and `formatSchemaVersion` (TypeScript) turn it into the mq version,
 and the CLI shows both.
 
-`postgremq.info()` and its two fields are stable across protocol majors;
-fields may be added. Each client declares the majors it implements
-(`SupportedProtocolMajors()` in Go, `SUPPORTED_PROTOCOL_MAJORS` in TypeScript
-and Rust), checks `info()` when it connects, and rejects any other major with
-a typed compatibility error that names the schema version, its major and the
-supported majors (Go `*CompatibilityError` / `ErrIncompatibleSchema`,
-TypeScript `CompatibilityError`, Rust `Error::Incompatible`). A database
-without `info()` gets the same error saying it needs an installation or
-upgrade; connection and permission errors keep their real cause. Within a
-supported major, clients call SQL functions directly: a function missing from
-an older installation fails with the database's own error (SQLSTATE 42883),
-through normal error handling. A client may declare a second major only when
-it implements and tests both contracts.
+Each client declares the mq majors it implements (`SupportedMQMajors()` in Go,
+`SUPPORTED_MQ_MAJORS` in TypeScript and Rust; `[0]` now), checks
+`schema_version` when it connects, and rejects any other major with a typed
+compatibility error that names the schema version and the supported majors
+(Go `*CompatibilityError` / `ErrIncompatibleSchema`, TypeScript
+`CompatibilityError`, Rust `Error::Incompatible`). A database without
+`info()`, or whose `info()` reports no schema version, gets the same error
+saying it needs an installation or upgrade; connection and permission errors
+keep their real cause. Within a supported major, clients call SQL functions
+directly: a function missing from an older installation fails with the
+database's own error (SQLSTATE 42883), through normal error handling. A
+client may declare a second major only when it implements and tests both
+contracts.
+
+`protocol_major` is for clients up to 0.3.0, which check it instead of the mq
+major: since mq 0.1.1 `info()` derives it from the version (the mq major + 1),
+so those clients accept every 0.x schema and refuse mq 1.0.0. `info()`, its
+signature and these fields are stable; fields may be added.
 
 ### Migrations, latest.sql and the clients
 
@@ -104,9 +108,6 @@ it implements and tests both contracts.
   sections, so the next mq version is always visible on `main`, and releases
   have no gaps. A pending migration may still change until it is released;
   a database migrated from an unreleased build is rebuilt, not upgraded.
-- The protocol major is a literal in `info()`; only a migration that breaks
-  the client contract redefines `info()` with a new major (a breaking change
-  for every client).
 - `mq/sql/latest.sql` is the fresh-install script: everything the migrations
   produce, in one file. A guard at the top refuses to run when the version
   table `postgremq.postgremq_migrations` exists (an existing installation is

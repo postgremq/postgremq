@@ -108,7 +108,9 @@ def notes(ref: str) -> str:
              'Every client released with it embeds every migration up to it.']
     if changes:
         lines += ['', '### Changes', '', *(f'* `{name}` ({level})' for name, level in changes)]
-    if breaking:
+    # The schema breaks only with a major version: a commit marked breaking for
+    # the clients it also touched is not a breaking schema change.
+    if breaking and (previous is None or version.major > previous[0].major):
         lines += ['', '### ⚠ BREAKING CHANGES', '', *breaking]
     for kind, title in SECTIONS:
         if kind in sections:

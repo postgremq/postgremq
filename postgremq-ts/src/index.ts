@@ -40,8 +40,8 @@ export {
   ErrCodeValidation,
 } from './errors';
 
-// Protocol compatibility metadata.
-export { SUPPORTED_PROTOCOL_MAJORS } from './protocol';
+// Schema compatibility metadata.
+export { SUPPORTED_MQ_MAJORS } from './compatibility';
 
 // Schema migrations (compatible with the Go client and the CLI).
 export { migrate, getMigrationStatus, formatSchemaVersion, MigrationStatus } from './migrate';

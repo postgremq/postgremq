@@ -1,9 +1,9 @@
 // Smoke test of the packed npm package, installed outside the repository
 // (scripts/release/smoke-npm.sh): type-checked with --strict against the
 // published declarations, then run: migrate a fresh database, connect
-// (protocol check), publish, consume and ack one message.
+// (schema check), publish, consume and ack one message.
 import { Pool } from 'pg';
-import { connect, migrate, getMigrationStatus, SUPPORTED_PROTOCOL_MAJORS, CompatibilityError } from 'postgremq';
+import { connect, migrate, getMigrationStatus, formatSchemaVersion, SUPPORTED_MQ_MAJORS, CompatibilityError } from 'postgremq';
 
 async function main(): Promise<void> {
   const url = process.env.SMOKE_DATABASE_URL;
@@ -27,7 +27,7 @@ async function main(): Promise<void> {
       await connection.close();
     }
     const unused: typeof CompatibilityError = CompatibilityError;
-    console.log(`npm smoke ok: protocol majors ${SUPPORTED_PROTOCOL_MAJORS.join(',')}, schema version ${status.currentVersion}`, unused.name);
+    console.log(`npm smoke ok: mq majors ${SUPPORTED_MQ_MAJORS.join(',')}, mq ${formatSchemaVersion(status.currentVersion)}`, unused.name);
   } finally {
     await pool.end();
   }

@@ -1,6 +1,6 @@
 //! Smoke test of the packaged crate, built outside the repository
 //! (scripts/release/smoke-rust.sh): migrate a fresh database, connect
-//! (protocol check), publish, consume and ack one message.
+//! (schema check), publish, consume and ack one message.
 
 use postgremq::{Connection, ConnectionOptions, ConsumeOptions, PublishOptions, QueueOptions};
 
@@ -24,9 +24,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     delivery.ack().await?;
     conn.close().await;
     println!(
-        "rust smoke ok: protocol majors {:?}, schema version {}",
-        postgremq::SUPPORTED_PROTOCOL_MAJORS,
-        status.current_version
+        "rust smoke ok: mq majors {:?}, mq {}",
+        postgremq::SUPPORTED_MQ_MAJORS,
+        postgremq::format_schema_version(status.current_version)
     );
     Ok(())
 }

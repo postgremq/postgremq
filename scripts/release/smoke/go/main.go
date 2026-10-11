@@ -1,5 +1,5 @@
 // Smoke test of the published Go client, built from outside the repository
-// (scripts/release/smoke-go.sh): migrate a fresh database, connect (protocol
+// (scripts/release/smoke-go.sh): migrate a fresh database, connect (schema
 // check), then publish, consume and ack one message.
 package main
 
@@ -61,6 +61,6 @@ func main() {
 	case <-ctx.Done():
 		log.Fatal("no message")
 	}
-	fmt.Printf("go smoke ok: protocol majors %v, schema version %d\n",
-		postgremq.SupportedProtocolMajors(), status.CurrentVersion)
+	fmt.Printf("go smoke ok: mq majors %v, mq %s\n",
+		postgremq.SupportedMQMajors(), postgremq.FormatSchemaVersion(status.CurrentVersion))
 }

@@ -40,8 +40,9 @@ type MigrationStatus struct {
 
 // FormatSchemaVersion returns the mq version (major.minor.patch) of a schema
 // version, the number the version table stores: 10000 is "0.1.0".
-func FormatSchemaVersion(version uint) string {
-	v := uint64(version)
+func FormatSchemaVersion(version uint) string { return formatSchemaVersion(uint64(version)) }
+
+func formatSchemaVersion(v uint64) string {
 	return fmt.Sprintf("%d.%d.%d", v/100_000_000, v/10_000%10_000, v%10_000)
 }
 

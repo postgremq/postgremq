@@ -1,4 +1,4 @@
-//! Protocol compatibility: the `postgremq.info()` check at connect.
+//! Schema compatibility: the `postgremq.info()` check at connect.
 
 #![allow(
     clippy::unwrap_used,
@@ -12,7 +12,7 @@ mod common;
 use common::TestDb;
 use std::future::Future as _;
 
-use postgremq::{Connection, ConnectionOptions, Error, ErrorKind, SUPPORTED_PROTOCOL_MAJORS};
+use postgremq::{Connection, ConnectionOptions, Error, ErrorKind, SUPPORTED_MQ_MAJORS};
 
 async fn connect(pool: &sqlx::PgPool) -> postgremq::Result<Connection> {
     Connection::from_pool(pool.clone(), ConnectionOptions::default()).await
@@ -22,29 +22,51 @@ async fn execute(pool: &sqlx::PgPool, sql: &'static str) {
     sqlx::raw_sql(sql).execute(pool).await.unwrap();
 }
 
+async fn fake_info(pool: &sqlx::PgPool, body: &str) {
+    sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+        "CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb LANGUAGE sql STABLE AS $$ {body} $$"
+    )))
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
 #[test]
-fn declares_protocol_major_1() {
-    assert_eq!(SUPPORTED_PROTOCOL_MAJORS, &[1]);
+fn declares_mq_major_0() {
+    assert_eq!(SUPPORTED_MQ_MAJORS, &[0]);
 }
 
 #[tokio::test]
-async fn the_installed_schema_speaks_a_supported_major() {
+async fn the_installed_schema_has_a_supported_major() {
     let db = TestDb::new().await;
-    let major: i32 = sqlx::query_scalar("SELECT (postgremq.info()->>'protocol_major')::int")
+    let version: i64 = sqlx::query_scalar("SELECT (postgremq.info()->>'schema_version')::bigint")
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert!(SUPPORTED_PROTOCOL_MAJORS.contains(&u32::try_from(major).unwrap()));
+    assert!(SUPPORTED_MQ_MAJORS.contains(&(u64::try_from(version).unwrap() / 100_000_000)));
     connect(&db.pool).await.unwrap().close().await;
+}
+
+#[tokio::test]
+async fn other_versions_of_the_same_major_are_accepted() {
+    // protocol_major is only for older clients: it is ignored.
+    for body in [
+        "SELECT jsonb_build_object('schema_version', 1, 'protocol_major', 1)",
+        "SELECT jsonb_build_object('schema_version', 99999999, 'protocol_major', 99)",
+        "SELECT jsonb_build_object('schema_version', 10001)",
+    ] {
+        let db = TestDb::new().await;
+        fake_info(&db.pool, body).await;
+        connect(&db.pool).await.unwrap().close().await;
+    }
 }
 
 #[tokio::test]
 async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
     let db = TestDb::new().await;
-    execute(
+    fake_info(
         &db.pool,
-        "CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb LANGUAGE sql STABLE \
-         AS $$ SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 99) $$",
+        "SELECT jsonb_build_object('schema_version', 100020003, 'protocol_major', 1)",
     )
     .await;
 
@@ -54,44 +76,44 @@ async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
     match &err {
         Error::Incompatible {
             schema_version,
-            protocol_major,
             source,
             ..
         } => {
-            assert_eq!(*schema_version, Some(42));
-            assert_eq!(*protocol_major, Some(99));
+            assert_eq!(*schema_version, Some(100_020_003));
             assert!(source.is_none());
         }
         other => panic!("{other:?}"),
     }
     let message = err.to_string();
     assert!(
-        message.contains("version 42") && message.contains("99") && message.contains("[1]"),
+        message.contains("mq 1.2.3 (schema version 100020003)")
+            && message.contains("mq majors [0]"),
         "{message}"
     );
     assert!(std::error::Error::source(&err).is_none());
 }
 
 #[tokio::test]
-async fn malformed_discovery_is_incompatible() {
+async fn missing_or_malformed_schema_versions_are_incompatible() {
     for body in [
-        "SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 'one')",
-        "SELECT jsonb_build_object('schema_version', 42, 'protocol_major', -1)",
-        "SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 1e30)",
-        "SELECT jsonb_build_object('schema_version', 42)",
+        "SELECT jsonb_build_object('schema_version', NULL, 'protocol_major', 1)",
+        "SELECT jsonb_build_object('schema_version', 'one')",
+        "SELECT jsonb_build_object('schema_version', -1)",
+        "SELECT jsonb_build_object('schema_version', 0)",
+        "SELECT jsonb_build_object('schema_version', 1e30)",
+        "SELECT jsonb_build_object('protocol_major', 1)",
         "SELECT NULL::jsonb",
     ] {
         let db = TestDb::new().await;
-        sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
-            "CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb LANGUAGE sql STABLE AS $$ {body} $$"
-        )))
-        .execute(&db.pool)
-        .await
-        .unwrap();
+        fake_info(&db.pool, body).await;
 
         let err = connect(&db.pool).await.unwrap_err();
 
         assert_eq!(err.kind(), ErrorKind::Incompatible, "{body}: {err:?}");
+        assert!(
+            err.to_string().contains("no schema version"),
+            "{body}: {err}"
+        );
     }
 }
 
@@ -124,10 +146,9 @@ fn from_pool_outside_a_tokio_runtime_is_a_validation_error() {
 #[tokio::test]
 async fn connect_rejects_an_unsupported_major() {
     let db = TestDb::new().await;
-    execute(
+    fake_info(
         &db.pool,
-        "CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb LANGUAGE sql STABLE \
-         AS $$ SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 99) $$",
+        "SELECT jsonb_build_object('schema_version', 100000000)",
     )
     .await;
 

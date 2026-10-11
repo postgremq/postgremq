@@ -127,20 +127,18 @@ pub enum Error {
     Payload(#[source] serde_json::Error),
 
     /// The database's PostgreMQ installation is not compatible with this
-    /// client: its protocol major is not in
-    /// [`SUPPORTED_PROTOCOL_MAJORS`](crate::SUPPORTED_PROTOCOL_MAJORS) (the
-    /// message lists them), or it has no discovery function
+    /// client: its schema version's mq major is not in
+    /// [`SUPPORTED_MQ_MAJORS`](crate::SUPPORTED_MQ_MAJORS) (the message lists
+    /// them), it reports no schema version, or it has no discovery function
     /// (`postgremq.info()`) and needs an installation or upgrade (then
     /// `source` is the database error).
-    #[error("{}", incompatible_message(*schema_version, *protocol_major, source.is_some()))]
+    #[error("{}", incompatible_message(*schema_version, source.is_some()))]
     #[non_exhaustive]
     Incompatible {
-        /// The installed schema version (the last migration applied); `None`
-        /// when discovery is missing or reports none.
+        /// The installed schema version (the last migration applied;
+        /// [`format_schema_version`](crate::format_schema_version) gives its
+        /// mq version); `None` when discovery is missing or reports none.
         schema_version: Option<u64>,
-        /// The installation's protocol major; `None` when discovery is
-        /// missing or reports none, or not a valid major.
-        protocol_major: Option<u32>,
         /// The database error when discovery is missing.
         #[source]
         source: Option<sqlx::Error>,
@@ -300,22 +298,22 @@ impl Error {
     }
 }
 
-fn incompatible_message(
-    schema_version: Option<u64>,
-    protocol_major: Option<u32>,
-    discovery_missing: bool,
-) -> String {
-    let supported = crate::SUPPORTED_PROTOCOL_MAJORS;
+fn incompatible_message(schema_version: Option<u64>, discovery_missing: bool) -> String {
+    let supported = crate::SUPPORTED_MQ_MAJORS;
     if discovery_missing {
         return format!(
-            "postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports protocol majors {supported:?})"
+            "postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports mq majors {supported:?})"
         );
     }
-    let major = protocol_major.map_or_else(|| "none".to_owned(), |major| major.to_string());
-    let schema = schema_version.map_or_else(|| "unknown".to_owned(), |version| version.to_string());
-    format!(
-        "the database's PostgreMQ schema (version {schema}) uses protocol major {major}; this client supports {supported:?}"
-    )
+    match schema_version {
+        None => format!(
+            "the database's PostgreMQ installation reports no schema version; it needs an installation or upgrade (client supports mq majors {supported:?})"
+        ),
+        Some(version) => format!(
+            "the database's PostgreMQ schema is mq {} (schema version {version}); this client supports mq majors {supported:?}",
+            crate::format_schema_version(version)
+        ),
+    }
 }
 
 /// The SQLSTATE of a database error.

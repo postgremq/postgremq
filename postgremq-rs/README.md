@@ -88,13 +88,14 @@ and closes in `close`. `Connection::from_pool(pool, options).await` uses an
 existing `PgPool`, which it never closes; it must be called inside a Tokio
 runtime.
 
-Both read `postgremq.info()` and check that the installation speaks a
-protocol major this client implements (`postgremq::SUPPORTED_PROTOCOL_MAJORS`,
-currently `[1]`). Otherwise they return `Error::Incompatible` with the
-schema version, its protocol major and the supported majors; a database
-without `info()` (not installed, or older than discovery) gets it too, with
-the database error as its source, meaning it needs an installation or
-upgrade. Connection and permission errors are returned as they are. Within a
+Both read `postgremq.info()` and check that the installation's schema version
+has an mq major this client implements (`postgremq::SUPPORTED_MQ_MAJORS`,
+currently `[0]`). Otherwise they return `Error::Incompatible` with the schema
+version (the message also shows its mq version and the supported majors). A
+database without `info()` (not installed, or older than discovery), or whose
+`info()` reports no schema version, gets it too, meaning it needs an
+installation or upgrade; when `info()` is missing, its source is the database
+error. Connection and permission errors are returned as they are. Within a
 supported major, a function the installation lacks fails with the database's
 error (SQLSTATE `42883`, `Error::Sqlx`) like any other.
 `Connection` is cheap to clone: clones share the pool, one `LISTEN` session and

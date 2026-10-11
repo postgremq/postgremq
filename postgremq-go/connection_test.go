@@ -47,14 +47,14 @@ func (m *MockPool) Query(ctx context.Context, sql string, args ...interface{}) (
 	return nil, nil
 }
 
-// discoverySQL is the protocol check Dial and DialFromPool run first.
+// discoverySQL is the schema check Dial and DialFromPool run first.
 const discoverySQL = "SELECT postgremq.info()"
 
-// discoveryRow answers the protocol check in pool test doubles.
+// discoveryRow answers the schema check in pool test doubles.
 type discoveryRow struct{}
 
 func (discoveryRow) Scan(dest ...any) error {
-	*(dest[0].(*[]byte)) = []byte(`{"schema_version": 1, "protocol_major": 1}`)
+	*(dest[0].(*[]byte)) = []byte(`{"schema_version": 10001, "protocol_major": 1}`)
 	return nil
 }
 

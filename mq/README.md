@@ -424,7 +424,7 @@ row.
 
 ```sql
 SELECT postgremq.info();
--- {"schema_version": 10000, "protocol_major": 1}
+-- {"schema_version": 10001, "protocol_major": 1}
 ```
 
 `schema_version` is the version of the last migration applied, stored as one
@@ -435,12 +435,15 @@ upgrades (the migrations) both maintain; `null` without that table. A
 released migration never changes, so equal released versions mean equal
 schemas. The mq release `mq/v0.1.0` is schema version 10000. `info()` is
 the one `SECURITY DEFINER` function, so runtime roles need no privilege on the
-version table to call it. `protocol_major` is
-the contract clients rely on: function signatures, result types, error codes,
-ownership rules and delivery semantics. Additive changes keep the major;
-incompatible changes get a new one. Each client checks it when connecting and
-rejects a major it does not implement. `info()` and these two fields stay
-stable across protocol majors; fields may be added.
+version table to call it.
+
+The mq major is the contract clients rely on: function signatures, result
+types, error codes, ownership rules and delivery semantics. Additive changes
+keep the major; incompatible changes get a new one. Each client checks the
+major of `schema_version` when connecting and rejects a major it does not
+implement. `protocol_major` is for clients up to 0.3.0, which check it
+instead: the mq major + 1. `info()` and these fields stay stable; fields may
+be added.
 
 ## Function reference
 

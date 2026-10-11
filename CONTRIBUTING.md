@@ -182,7 +182,7 @@ PR title must be a [Conventional Commit](https://www.conventionalcommits.org/)
 
 Examples: `feat(go): add WithGroupKey publish option`,
 `fix(sql): keep group order when a nack is delayed`,
-`feat(ts)!: make connect() check the protocol major`,
+`feat(ts)!: make connect() check the mq major`,
 `feat(sql): add queue priority` (a minor schema change, with `make sync`).
 
 ## Reporting bugs and requesting features

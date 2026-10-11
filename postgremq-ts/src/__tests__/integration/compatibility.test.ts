@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll, afterEach } from '@jest/globals';
 import { Connection } from '../../connection';
 import { CompatibilityError } from '../../errors';
-import { SUPPORTED_PROTOCOL_MAJORS } from '../../protocol';
+import { SUPPORTED_MQ_MAJORS } from '../../compatibility';
 import { createEmptyTestDatabase, createIsolatedTestConnection, getSharedTestDatabase, TestDatabase } from '../helpers';
 
 let shared: TestDatabase;
@@ -35,29 +35,64 @@ async function connectTo(connectionString: string): Promise<unknown> {
   }
 }
 
-describe('protocol compatibility', () => {
-  test('declares protocol major 1, read-only', () => {
-    expect(SUPPORTED_PROTOCOL_MAJORS).toEqual([1]);
-    expect(Object.isFrozen(SUPPORTED_PROTOCOL_MAJORS)).toBe(true);
+async function fakeInfo(pool: { query: (sql: string) => Promise<unknown> }, info: string): Promise<void> {
+  await pool.query(`CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
+    LANGUAGE sql STABLE AS $$ SELECT '${info}'::jsonb $$`);
+}
+
+describe('schema compatibility', () => {
+  test('declares mq major 0, read-only', () => {
+    expect(SUPPORTED_MQ_MAJORS).toEqual([0]);
+    expect(Object.isFrozen(SUPPORTED_MQ_MAJORS)).toBe(true);
   });
 
-  test('the installed schema speaks a supported major', async () => {
+  test('the installed schema has a supported major', async () => {
     const iso = await installed();
-    const { rows } = await iso.pool.query("SELECT (postgremq.info()->>'protocol_major')::int AS major");
-    expect(SUPPORTED_PROTOCOL_MAJORS).toContain(rows[0].major);
+    const { rows } = await iso.pool.query("SELECT (postgremq.info()->>'schema_version')::bigint AS version");
+    expect(SUPPORTED_MQ_MAJORS).toContain(Math.floor(Number(rows[0].version) / 100_000_000));
     expect(await connectTo(iso.connectionString)).toBeUndefined();
+  });
+
+  test('other versions of the same major are accepted; protocol_major is ignored', async () => {
+    const iso = await installed();
+    for (const info of [
+      '{"schema_version": 1, "protocol_major": 1}',
+      '{"schema_version": 99999999, "protocol_major": 99}',
+      '{"schema_version": 10001}',
+    ]) {
+      await fakeInfo(iso.pool, info);
+      expect(await connectTo(iso.connectionString)).toBeUndefined();
+    }
   });
 
   test('an unsupported major is rejected with the versions involved', async () => {
     const iso = await installed();
-    await iso.pool.query(`CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
-      LANGUAGE sql STABLE AS $$ SELECT jsonb_build_object('schema_version', 42, 'protocol_major', 99) $$`);
+    await fakeInfo(iso.pool, '{"schema_version": 100020003, "protocol_major": 1}');
 
     const err = await connectTo(iso.connectionString);
 
     expect(err).toBeInstanceOf(CompatibilityError);
-    expect(err).toMatchObject({ schemaVersion: 42, protocolMajor: 99, supportedMajors: [1] });
-    expect((err as Error).message).toMatch(/version 42.*99/);
+    expect(err).toMatchObject({ schemaVersion: 100_020_003, supportedMajors: [0] });
+    expect((err as Error).message).toContain('mq 1.2.3 (schema version 100020003)');
+    expect((err as Error).message).toContain('mq majors [0]');
+  });
+
+  test('a missing or malformed schema version is incompatible', async () => {
+    const iso = await installed();
+    for (const info of [
+      '{"schema_version": null, "protocol_major": 1}',
+      '{"schema_version": "one"}',
+      '{"schema_version": -1}',
+      '{"schema_version": 0}',
+      '{"schema_version": 1.5}',
+      '{"protocol_major": 1}',
+    ]) {
+      await fakeInfo(iso.pool, info);
+      const err = await connectTo(iso.connectionString);
+      expect(err).toBeInstanceOf(CompatibilityError);
+      expect((err as CompatibilityError).schemaVersion).toBeUndefined();
+      expect((err as Error).message).toContain('no schema version');
+    }
   });
 
   test('missing discovery means the installation needs an upgrade', async () => {

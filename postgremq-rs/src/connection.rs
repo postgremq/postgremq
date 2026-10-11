@@ -293,8 +293,8 @@ impl Connection {
     ///
     /// [`Error::Validation`] for invalid options; [`Error::Sqlx`] if the pool
     /// cannot connect; [`Error::Incompatible`] if the database's
-    /// `postgremq.info()` reports a protocol major not in
-    /// [`SUPPORTED_PROTOCOL_MAJORS`](crate::SUPPORTED_PROTOCOL_MAJORS), or is
+    /// `postgremq.info()` reports a schema version whose mq major is not in
+    /// [`SUPPORTED_MQ_MAJORS`](crate::SUPPORTED_MQ_MAJORS), reports none, or is
     /// missing (the database needs a PostgreMQ installation or upgrade).
     pub async fn connect(url: &str, options: ConnectionOptions) -> Result<Self> {
         options.retry.validate()?;
@@ -308,7 +308,7 @@ impl Connection {
             .idle_timeout(IDLE_TIMEOUT)
             .connect(url)
             .await?;
-        if let Err(err) = crate::protocol::check(&pool).await {
+        if let Err(err) = crate::compatibility::check(&pool).await {
             pool.close().await;
             return Err(err);
         }
@@ -351,11 +351,11 @@ impl Connection {
     /// [`Error::Incompatible`] as for [`connect`](Self::connect). The pool is
     /// consumed even on error; pass a clone to keep using it (e.g. to call
     /// [`migrate`](crate::migrate) after `Error::Incompatible`);
-    /// [`Error::Sqlx`] if the protocol check cannot reach the database.
+    /// [`Error::Sqlx`] if the schema check cannot reach the database.
     pub async fn from_pool(pool: PgPool, options: ConnectionOptions) -> Result<Self> {
         options.retry.validate()?;
         require_runtime()?;
-        crate::protocol::check(&pool).await?;
+        crate::compatibility::check(&pool).await?;
         Self::build(pool, false, options)
     }
 

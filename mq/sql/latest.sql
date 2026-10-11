@@ -84,21 +84,21 @@ CREATE SCHEMA IF NOT EXISTS postgremq;
  *   - extend_queue_keep_alive_multi / delete_inactive_queues for exclusive queues.
  *   - pmq_maintenance_fast: bundled cron entry — retires crashed-final-attempt
  *     rows to DLQ, reaps expired exclusive queues; returns counters.
- *   - info: discovery of the installed schema version and the protocol major.
+ *   - info: discovery of the installed schema version (and the legacy protocol major).
  *   - Management: create_topic, create_queue, delete_topic, delete_queue,
  *     list_topics, list_queues, get_queue_statistics, clean_up_* helpers,
  *     list_messages, get_message, get_next_visible_time, cleanup_completed_messages.
  */
 
 
--- Discovery: the installed schema version and the protocol major that
--- clients check when they connect. schema_version is the version of the
--- last migration applied, an mq version stored as one number (major*10^8 +
--- minor*10^4 + patch; 0.1.0 is 10000), read from the version table the
--- migrators and latest.sql maintain (NULL without it); protocol_major
--- changes only with a migration that breaks the client contract. The
--- signature and these two fields stay stable across protocol majors; fields
--- may be added.
+-- Discovery: the installed schema version, which clients check when they
+-- connect. schema_version is the version of the last migration applied, an
+-- mq version stored as one number (major*10^8 + minor*10^4 + patch; 0.1.0 is
+-- 10000), read from the version table the migrators and latest.sql maintain
+-- (NULL without it). Clients accept the mq majors they implement: a breaking
+-- schema change bumps the major. protocol_major is for the clients that check
+-- it instead (up to 0.3.0): the mq major + 1. The signature and these fields
+-- stay stable; fields may be added.
 -- SECURITY DEFINER, unlike every other function, so that runtime roles need
 -- no privilege on the version table to connect.
 CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
@@ -111,7 +111,8 @@ BEGIN
     IF to_regclass('postgremq.postgremq_migrations') IS NOT NULL THEN
         SELECT version INTO v_schema_version FROM postgremq.postgremq_migrations LIMIT 1;
     END IF;
-    RETURN jsonb_build_object('schema_version', v_schema_version, 'protocol_major', 1);
+    RETURN jsonb_build_object('schema_version', v_schema_version,
+                              'protocol_major', coalesce(v_schema_version / 100000000, 0) + 1);
 END;
 $$;
 
@@ -1850,4 +1851,4 @@ $$;
  */
 CREATE TABLE postgremq.postgremq_migrations (version bigint not null primary key, dirty boolean not null);
 
-INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (10000, false);
+INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (10001, false);
