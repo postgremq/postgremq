@@ -162,15 +162,27 @@ jobs:
         if: env.COMPONENT == 'npm' && steps.npm.outputs.published != 'true'
         working-directory: postgremq-ts
         env:
-          NODE_AUTH_TOKEN: ${{ vars.NPM_TRUSTED_PUBLISHING != 'true' && secrets.NPM_TOKEN || '' }}
+          TRUSTED: ${{ vars.NPM_TRUSTED_PUBLISHING == 'true' }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
+          # Trusted publishing (OIDC) only happens when no token is
+          # configured: NODE_AUTH_TOKEN must be unset, not empty (an empty
+          # token counts as one and npm then fails with ENEEDAUTH).
+          if [ "$TRUSTED" != true ]; then
+            export NODE_AUTH_TOKEN="$NPM_TOKEN"
+          fi
+          unset NPM_TOKEN
           npm ci
           npm run build
           # Pre-releases (e.g. 0.3.0-rc.1) must not become `latest`.
           tag=latest
           case "$VERSION" in *-*) tag=next ;; esac
           if [ "$PUBLISH" = true ]; then
-            npm publish --provenance --access public --tag "$tag"
+            # On failure, show npm's trusted publishing (OIDC) diagnostics.
+            npm publish --provenance --access public --tag "$tag" || {
+              grep -ih 'oidc\|trusted\|provenance' ~/.npm/_logs/*-debug-0.log | tail -20
+              exit 1
+            }
           else
             echo "PUBLISH_ENABLED is not true: dry run only."
             npm publish --dry-run --access public --tag "$tag"
