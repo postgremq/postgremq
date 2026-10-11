@@ -17,7 +17,10 @@ publishing follow automatically.
 | TypeScript client | `postgremq-ts/` | `package.json` | `npm/vX.Y.Z` | npm package `postgremq` |
 
 `release-please-config.json` defines the three clients;
-`.release-please-manifest.json` holds each one's last released version.
+`.release-please-manifest.json` holds each one's last released version. The
+release PR is rebuilt on top of `main` after every push (`always-update`),
+so it is never behind `main` (the ruleset requires up-to-date branches) and
+its checks run against exactly what would be released.
 Release Please assigns commits to clients by the paths they change. Changes
 outside these directories (docs, `observability/`, CI) release nothing.
 
