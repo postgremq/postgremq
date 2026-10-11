@@ -272,7 +272,9 @@ edit the `mq/v1` GitHub release afterwards if you like.
   `CI`, `Conventional Commit title` and `Release PR consistency`. All three
   run on every pull request: `ci.yml` runs the tests of the areas the PR
   touches (`scripts/ci/changed_areas.py`) and its final `CI` job passes only
-  if none of them failed; `pr-title.yml`; `release-pr.yml` (skipped, which
+  if none of them failed (on the release PR it runs no tests: the PR only
+  changes versions and changelogs, `main` is validated on every push, and the
+  merge commit is validated again before tagging); `pr-title.yml`; `release-pr.yml` (skipped, which
   counts as passing, except on the release PR). The per-area workflows
   (`sql-tests.yml`, `go-tests.yml`, ...) are reusable only, called by
   `ci.yml`, `release.yml` and `publish.yml`.
