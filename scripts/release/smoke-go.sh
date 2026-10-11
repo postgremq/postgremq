@@ -12,6 +12,19 @@ root=$(git rev-parse --show-toplevel)
 source "$root/scripts/release/smoke-lib.sh"
 version=${1:-v0.0.0-smoke}
 
+# v0.0.0-smoke is this tree, whatever it holds: never reuse a copy an earlier
+# run left in the module cache (CI restores it), or files the tree no longer
+# has would still be built. Released versions never change, so they stay.
+if [ "$version" = v0.0.0-smoke ]; then
+  modcache=$(go env GOMODCACHE)
+  for cached in "$modcache"/postgremq.dev/postgremq-go@v0.0.0-smoke \
+                "$modcache"/cache/download/postgremq.dev/postgremq-go/@v/v0.0.0-smoke.*; do
+    [ -e "$cached" ] || continue
+    chmod -R u+w "$cached"
+    rm -rf "$cached"
+  done
+fi
+
 while IFS='=' read -r key value; do
   export "$key=$value"
 done < <("$root/scripts/release/go-proxy.sh" "$SMOKE_WORK/proxy" "$version")
