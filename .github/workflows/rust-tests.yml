@@ -1,0 +1,110 @@
+name: Rust Tests
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'postgremq-rs/**'
+      - 'mq/sql/**'
+      - 'mq/migrations/**'
+      - 'observability/**'
+      - 'docs/observability.md'
+      - '.github/workflows/rust-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
+
+jobs:
+  test:
+    name: Test Rust Client
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgremq_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      POSTGREMQ_TEST_DATABASE_URL: postgres://postgres:postgres@localhost:5432/postgremq_test
+      CARGO_TERM_COLOR: always
+
+    defaults:
+      run:
+        working-directory: ./postgremq-rs
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@1.98
+      with:
+        components: clippy, rustfmt
+
+    - name: Cache cargo
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          postgremq-rs/target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('postgremq-rs/Cargo.toml', 'postgremq-rs/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Check formatting
+      run: cargo fmt --check
+
+    - name: Clippy (default features)
+      run: cargo clippy --locked --all-targets -- -D warnings
+
+    - name: Clippy (all features)
+      run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+    - name: Docs
+      run: cargo doc --no-deps --all-features
+      env:
+        RUSTDOCFLAGS: -D warnings
+
+    - name: Test (default features, metrics compiled out)
+      run: cargo test --locked
+
+    - name: Test (all features, including the metrics contract)
+      run: cargo test --locked --all-features
+
+  msrv:
+    name: Check MSRV (1.94)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: ./postgremq-rs
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+
+    - name: Set up Rust 1.94
+      uses: dtolnay/rust-toolchain@1.94
+
+    - name: Check (default features)
+      run: cargo check --locked --all-targets
+
+    - name: Check (all features)
+      run: cargo check --locked --all-targets --all-features

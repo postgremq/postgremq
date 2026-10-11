@@ -1,0 +1,132 @@
+{
+  "scope": "postgremq",
+  "version": "1",
+  "histogram_boundaries": [
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.075,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1,
+    2.5,
+    5,
+    7.5,
+    10
+  ],
+  "metrics": {
+    "messaging.client.operation.duration": "s",
+    "messaging.process.duration": "s",
+    "messaging.client.consumed.messages": "{message}",
+    "postgremq.client.handlers.active": "{handler}",
+    "postgremq.client.renewal.lost": "{message}",
+    "messaging.client.sent.messages": "{message}"
+  },
+  "scenario_operations": [
+    {
+      "name": "publish",
+      "destination": "metrics",
+      "transaction": false,
+      "error": "",
+      "count": 1,
+      "type": "send"
+    },
+    {
+      "name": "publish",
+      "destination": "metrics",
+      "transaction": true,
+      "error": "",
+      "count": 1,
+      "type": "send"
+    },
+    {
+      "name": "publish",
+      "destination": "missing",
+      "transaction": false,
+      "error": "queue_not_found",
+      "count": 1,
+      "type": "send"
+    },
+    {
+      "name": "consume",
+      "destination": "q",
+      "transaction": false,
+      "error": "",
+      "count": 5,
+      "type": "receive"
+    },
+    {
+      "name": "ack",
+      "destination": "q",
+      "transaction": true,
+      "error": "",
+      "count": 1,
+      "type": "settle"
+    },
+    {
+      "name": "nack",
+      "destination": "q",
+      "transaction": false,
+      "error": "",
+      "count": 1,
+      "type": "settle"
+    },
+    {
+      "name": "release",
+      "destination": "q",
+      "transaction": false,
+      "error": "",
+      "count": 1,
+      "type": "settle"
+    },
+    {
+      "name": "ack",
+      "destination": "q",
+      "transaction": false,
+      "error": "lease_lost",
+      "count": 1,
+      "type": "settle"
+    },
+    {
+      "name": "extend",
+      "destination": "q",
+      "transaction": false,
+      "error": "",
+      "count": 1,
+      "type": "extend"
+    }
+  ],
+  "received": {
+    "first": 2,
+    "redelivered": 2
+  },
+  "sent": [
+    {
+      "name": "publish",
+      "destination": "metrics",
+      "transaction": false,
+      "error": "",
+      "count": 1,
+      "type": "send"
+    },
+    {
+      "name": "publish",
+      "destination": "metrics",
+      "transaction": true,
+      "error": "",
+      "count": 1,
+      "type": "send"
+    },
+    {
+      "name": "publish",
+      "destination": "missing",
+      "transaction": false,
+      "error": "queue_not_found",
+      "count": 1,
+      "type": "send"
+    }
+  ]
+}

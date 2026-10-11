@@ -1,0 +1,204 @@
+name: Publish
+
+# Publishes one release tag to its registry. Called by release.yml for each tag
+# it creates, and by its manual run to retry a publish (Actions > Release >
+# Run workflow, with the existing tag). Only release.yml calls it: npm and
+# crates.io trusted publishing check the calling workflow's file name, and npm
+# allows one trusted publisher per package.
+#
+# Every run checks out the tag, verifies that its manifest, version files,
+# changelog and schema sync agree with the tag, and smoke-tests the package
+# built from it; a retry also re-runs the component's tests on the tag. A version
+# already in its registry is skipped. Registry uploads happen only when the
+# repository variable PUBLISH_ENABLED is "true"; otherwise each step is a dry
+# run.
+#
+# Credentials: crates.io and npm trusted publishing (OIDC) when the variables
+# CRATES_IO_TRUSTED_PUBLISHING / NPM_TRUSTED_PUBLISHING are "true", otherwise
+# the CARGO_REGISTRY_TOKEN / NPM_TOKEN secrets. The Go module (with its CLI) is
+# published by its tag; this only asks the Go module proxy to fetch it. mq
+# (mq/vN) has no registry: its GitHub release gets latest.sql and the
+# migrations as assets.
+
+on:
+  workflow_call:
+    inputs:
+      tag:
+        type: string
+        required: true
+      run-tests:
+        type: boolean
+        default: false
+permissions:
+  contents: read
+
+jobs:
+  resolve:
+    name: Verify ${{ inputs.tag }}
+    runs-on: ubuntu-latest
+    outputs:
+      component: ${{ steps.tag.outputs.component }}
+      version: ${{ steps.tag.outputs.version }}
+      smoke: ${{ steps.tag.outputs.smoke }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+          fetch-depth: 0
+      - name: Parse the tag
+        id: tag
+        run: |
+          tag='${{ inputs.tag }}'
+          component=${tag%/v*}
+          version=${tag##*/v}
+          case "$component" in
+            mq) smoke='' ;;
+            postgremq-go) smoke='go' ;;
+            rust) smoke='rust' ;;
+            npm) smoke='npm' ;;
+            *) echo "::error::$tag is not a release tag"; exit 1 ;;
+          esac
+          {
+            echo "component=$component"
+            echo "version=$version"
+            echo "smoke=$smoke"
+          } >> "$GITHUB_OUTPUT"
+      - name: Verify versions, changelog and schema sync against the tag
+        run: python3 scripts/release/verify_release.py '${{ inputs.tag }}' --tag-exists
+
+  test-sql:
+    needs: resolve
+    if: inputs.run-tests && needs.resolve.outputs.component == 'mq'
+    uses: ./.github/workflows/sql-tests.yml
+    with:
+      ref: refs/tags/${{ inputs.tag }}
+  test-go:
+    needs: resolve
+    if: inputs.run-tests && needs.resolve.outputs.component == 'postgremq-go'
+    uses: ./.github/workflows/go-tests.yml
+    with:
+      ref: refs/tags/${{ inputs.tag }}
+  test-rust:
+    needs: resolve
+    if: inputs.run-tests && needs.resolve.outputs.component == 'rust'
+    uses: ./.github/workflows/rust-tests.yml
+    with:
+      ref: refs/tags/${{ inputs.tag }}
+  test-npm:
+    needs: resolve
+    if: inputs.run-tests && needs.resolve.outputs.component == 'npm'
+    uses: ./.github/workflows/typescript-tests.yml
+    with:
+      ref: refs/tags/${{ inputs.tag }}
+
+  smoke:
+    needs: resolve
+    if: needs.resolve.outputs.smoke != ''
+    uses: ./.github/workflows/packages.yml
+    with:
+      ref: refs/tags/${{ inputs.tag }}
+      components: ${{ needs.resolve.outputs.smoke }}
+
+  publish:
+    name: Publish ${{ inputs.tag }}
+    needs: [ resolve, test-sql, test-go, test-rust, test-npm, smoke ]
+    if: ${{ !cancelled() && !failure() && needs.resolve.result == 'success' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write   # mq: release assets
+      id-token: write
+    env:
+      COMPONENT: ${{ needs.resolve.outputs.component }}
+      VERSION: ${{ needs.resolve.outputs.version }}
+      PUBLISH: ${{ vars.PUBLISH_ENABLED == 'true' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ inputs.tag }}
+
+      # --- Rust: crates.io ---
+      - uses: dtolnay/rust-toolchain@1.98
+        if: env.COMPONENT == 'rust'
+      - name: Already on crates.io?
+        id: crate
+        if: env.COMPONENT == 'rust'
+        run: |
+          if curl -sf -A 'postgremq-release (github.com/postgremq/postgremq)' "https://crates.io/api/v1/crates/postgremq/$VERSION" >/dev/null; then
+            echo "postgremq $VERSION is already on crates.io; skipping."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: crates.io trusted publishing token
+        id: crates-auth
+        if: env.COMPONENT == 'rust' && steps.crate.outputs.published != 'true' && env.PUBLISH == 'true' && vars.CRATES_IO_TRUSTED_PUBLISHING == 'true'
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: cargo publish
+        if: env.COMPONENT == 'rust' && steps.crate.outputs.published != 'true'
+        working-directory: postgremq-rs
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ steps.crates-auth.outputs.token || secrets.CARGO_REGISTRY_TOKEN }}
+        run: |
+          if [ "$PUBLISH" = true ]; then
+            cargo publish --locked
+          else
+            echo "PUBLISH_ENABLED is not true: dry run only."
+            cargo publish --locked --dry-run
+          fi
+
+      # --- TypeScript: npm ---
+      - uses: actions/setup-node@v4
+        if: env.COMPONENT == 'npm'
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+      - name: Already on npm?
+        id: npm
+        if: env.COMPONENT == 'npm'
+        run: |
+          if [ "$(npm view "postgremq@$VERSION" version 2>/dev/null)" = "$VERSION" ]; then
+            echo "postgremq@$VERSION is already on npm; skipping."
+            echo "published=true" >> "$GITHUB_OUTPUT"
+          fi
+      - name: npm publish
+        if: env.COMPONENT == 'npm' && steps.npm.outputs.published != 'true'
+        working-directory: postgremq-ts
+        env:
+          NODE_AUTH_TOKEN: ${{ vars.NPM_TRUSTED_PUBLISHING != 'true' && secrets.NPM_TOKEN || '' }}
+        run: |
+          npm ci
+          npm run build
+          # Pre-releases (e.g. 0.3.0-rc.1) must not become `latest`.
+          tag=latest
+          case "$VERSION" in *-*) tag=next ;; esac
+          if [ "$PUBLISH" = true ]; then
+            npm publish --provenance --access public --tag "$tag"
+          else
+            echo "PUBLISH_ENABLED is not true: dry run only."
+            npm publish --dry-run --access public --tag "$tag"
+          fi
+
+      # --- Go module: published by its tag ---
+      - uses: actions/setup-go@v5
+        if: env.COMPONENT == 'postgremq-go'
+        with:
+          go-version: '1.26'
+      - name: Ask the Go module proxy to fetch the module
+        if: env.COMPONENT == 'postgremq-go'
+        run: |
+          if [ "$PUBLISH" = true ]; then
+            # Needs working postgremq.dev discovery (the website repository).
+            GOWORK=off GOPROXY=https://proxy.golang.org go list -m "postgremq.dev/postgremq-go@v$VERSION"
+          else
+            echo "PUBLISH_ENABLED is not true: postgremq.dev/postgremq-go@v$VERSION is published by its tag; not asking the proxy."
+          fi
+
+      # --- mq: GitHub release assets (no registry) ---
+      - name: Attach latest.sql and the migrations to the mq release
+        if: env.COMPONENT == 'mq'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag }}
+        run: |
+          assets=$(mktemp -d)
+          cp mq/sql/latest.sql "$assets/postgremq-v$VERSION.sql"
+          tar -czf "$assets/postgremq-migrations-v$VERSION.tar.gz" -C mq migrations
+          gh release upload "$TAG" "$assets"/* --clobber

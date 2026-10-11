@@ -1,0 +1,25 @@
+name: Release PR
+
+# Runs on every pull request so it can be a required check: on the release
+# PR (branch release-please--…) it verifies that the proposed release is
+# consistent; on any other PR the job is skipped, which counts as passing.
+# The release guard checks the same again before tagging.
+
+on:
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  release-pr:
+    name: Release PR consistency
+    if: startsWith(github.head_ref, 'release-please--')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Verify the proposed release
+        run: python3 scripts/release/verify_release.py --all

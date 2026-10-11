@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# Installed by `make hooks`. Refuses a commit when the clients do not point at
+# the last migration (run `make sync`). Checks the working tree.
+exec python3 "$(git rev-parse --show-toplevel)/scripts/schema.py" check

@@ -1,0 +1,71 @@
+# Auto detect text files and perform LF normalization
+* text=auto
+
+# Source code
+*.go text eol=lf
+*.ts text eol=lf
+*.js text eol=lf
+*.sql text eol=lf
+*.py text eol=lf
+
+# Config files
+*.json text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+*.toml text eol=lf
+*.ini text eol=lf
+
+# Documentation
+*.md text eol=lf
+*.txt text eol=lf
+
+# Shell scripts
+*.sh text eol=lf
+*.bash text eol=lf
+
+# Git
+.gitattributes text eol=lf
+.gitignore text eol=lf
+
+# CI/CD
+Dockerfile text eol=lf
+docker-compose*.yml text eol=lf
+
+# Binary files
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar.gz binary
+*.woff binary
+*.woff2 binary
+*.ttf binary
+*.eot binary
+*.svg binary
+
+# Go specific
+go.mod text eol=lf
+go.sum text eol=lf
+
+# TypeScript/Node specific
+package.json text eol=lf
+package-lock.json text eol=lf linguist-generated=true
+tsconfig.json text eol=lf
+.npmrc text eol=lf
+.npmignore text eol=lf
+
+# Python specific
+requirements.txt text eol=lf
+setup.py text eol=lf
+*.pyc binary
+
+# Export ignore
+.gitattributes export-ignore
+.gitignore export-ignore
+.github export-ignore
+.vscode export-ignore
+.idea export-ignore
+*.test export-ignore

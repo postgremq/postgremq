@@ -1,0 +1,69 @@
+{
+  "name": "postgremq",
+  "version": "0.1.0",
+  "description": "TypeScript client for PostgreMQ message queue system",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "prepare": "node scripts/embed-migrations.js",
+    "build": "node scripts/embed-migrations.js && tsc",
+    "clean": "rm -rf dist",
+    "prepublishOnly": "npm run build",
+    "example": "ts-node examples/basic-usage.ts",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "test:coverage": "jest --coverage",
+    "test:integration": "jest --testPathPatterns=integration",
+    "example:metrics": "ts-node examples/metrics.ts"
+  },
+  "keywords": [
+    "postgres",
+    "postgresql",
+    "message-queue",
+    "mq",
+    "queue",
+    "async",
+    "messaging"
+  ],
+  "author": "Slava Koltovich",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/postgremq/postgremq.git",
+    "directory": "postgremq-ts"
+  },
+  "devDependencies": {
+    "@jest/globals": "^30.5.2",
+    "@opentelemetry/exporter-metrics-otlp-http": "^0.223.0",
+    "@opentelemetry/resources": "^2.12.0",
+    "@opentelemetry/sdk-metrics": "^2.12.0",
+    "@types/jest": "^30.0.0",
+    "@types/node": "^22.20.5",
+    "jest": "^30.5.2",
+    "testcontainers": "^12.2.0",
+    "ts-jest": "^29.4.14",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  },
+  "dependencies": {
+    "@opentelemetry/api": "^1.9.1",
+    "@types/pg": "^8.23.1",
+    "pg": "^8.23.1"
+  },
+  "postgremq": {
+    "mq-schema": 1
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "files": [
+    "dist/**/*",
+    "README.md",
+    "LICENSE",
+    "!dist/__tests__"
+  ],
+  "bugs": {
+    "url": "https://github.com/postgremq/postgremq/issues"
+  },
+  "homepage": "https://github.com/postgremq/postgremq#readme"
+}

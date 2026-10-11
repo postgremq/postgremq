@@ -1,0 +1,98 @@
+[package]
+name = "postgremq"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+description = "Rust client for PostgreMQ, a PostgreSQL-backed message queue"
+license = "MIT"
+repository = "https://github.com/postgremq/postgremq"
+documentation = "https://docs.rs/postgremq"
+readme = "README.md"
+keywords = ["postgres", "queue", "messaging", "sqlx"]
+categories = ["database", "asynchronous"]
+# The integration tests load ../mq/sql/latest.sql, which is outside the crate.
+# `migrations` is a symlink to ../mq/migrations; cargo packages its files.
+exclude = ["tests/", "migrations/*.down.sql"]
+
+[dependencies]
+futures-core = "0.3"
+serde = "1"
+serde_json = "1"
+sqlx = { version = "0.9", default-features = false, features = ["runtime-tokio", "postgres", "json", "uuid", "tls-rustls-ring-native-roots"] }
+thiserror = "2"
+tokio = { version = "1.47", features = ["rt", "sync", "time", "macros"] }
+tokio-util = "0.7"
+tracing = "0.1"
+uuid = "1"
+# Optional client metrics (docs/observability.md): the API only; the
+# application owns the SDK, readers and exporters.
+opentelemetry = { version = "0.33", default-features = false, features = ["metrics"], optional = true }
+
+# The mq schema version `migrate` embeds: migrations 1..N (see build.rs).
+# Bump it, once those migrations are in an mq release, to ship newer SQL.
+[package.metadata.postgremq]
+mq-schema = 1
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+
+[features]
+## Client metrics through an application-supplied OpenTelemetry meter provider.
+otel = ["dep:opentelemetry"]
+
+[dev-dependencies]
+serde = { version = "1", features = ["derive"] }
+uuid = { version = "1", features = ["v4"] }
+testcontainers-modules = { version = "0.15", features = ["postgres"] }
+testcontainers = { version = "0.27", features = ["reusable-containers"] }
+tokio = { version = "1.47", features = ["rt-multi-thread", "macros", "sync", "time", "test-util"] }
+opentelemetry_sdk = { version = "0.33", default-features = false, features = ["metrics", "testing"] }
+opentelemetry-otlp = { version = "0.33", default-features = false, features = ["http-proto", "reqwest-blocking-client", "metrics"] }
+
+[[example]]
+name = "metrics"
+required-features = ["otel"]
+
+[[test]]
+name = "metrics"
+required-features = ["otel"]
+
+[lints.rust]
+unsafe_code = "forbid"
+missing_docs = "warn"
+missing_debug_implementations = "warn"
+unreachable_pub = "warn"
+
+[lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+style = { level = "warn", priority = -1 }
+complexity = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+cast_lossless = "warn"
+allow_attributes_without_reason = "deny"
+missing_errors_doc = "warn"
+missing_panics_doc = "warn"
+return_self_not_must_use = "warn"
+redundant_clone = "warn"
+use_self = "warn"
+large_futures = "warn"
+future_not_send = "warn"
+significant_drop_tightening = "warn"
+
+[lints.rustdoc]
+broken_intra_doc_links = "deny"

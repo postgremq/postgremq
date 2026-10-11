@@ -1,0 +1,85 @@
+# Tested with otel/opentelemetry-collector-contrib:0.147.0.
+# One active SQL scraper per database. Applications send their own metrics to OTLP.
+receivers:
+  sqlquery/postgremq:
+    driver: postgres
+    datasource: ${env:POSTGREMQ_METRICS_DSN}
+    collection_interval: 15s
+    queries:
+      - sql: SELECT * FROM postgremq.queue_metrics()
+        metrics:
+          - metric_name: postgremq.queue.active
+            value_column: active
+            data_type: gauge
+            value_type: int
+            unit: '1'
+            attribute_columns: [queue_name, topic_name]
+          - metric_name: postgremq.queue.messages.ready
+            value_column: ready
+            data_type: gauge
+            value_type: int
+            unit: '{message}'
+            attribute_columns: [queue_name, topic_name]
+          - metric_name: postgremq.queue.messages.delayed
+            value_column: delayed
+            data_type: gauge
+            value_type: int
+            unit: '{message}'
+            attribute_columns: [queue_name, topic_name]
+          - metric_name: postgremq.queue.messages.processing
+            value_column: processing
+            data_type: gauge
+            value_type: int
+            unit: '{message}'
+            attribute_columns: [queue_name, topic_name]
+          - metric_name: postgremq.queue.messages.exhausted
+            value_column: exhausted
+            data_type: gauge
+            value_type: int
+            unit: '{message}'
+            attribute_columns: [queue_name, topic_name]
+          - metric_name: postgremq.queue.messages.dead_letter
+            value_column: dead_letter
+            data_type: gauge
+            value_type: int
+            unit: '{message}'
+            attribute_columns: [queue_name, topic_name]
+          - metric_name: postgremq.queue.oldest_ready_age
+            value_column: oldest_ready_age_seconds
+            data_type: gauge
+            value_type: double
+            unit: s
+            attribute_columns: [queue_name, topic_name]
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+processors:
+  memory_limiter:
+    check_interval: 1s
+    limit_mib: 128
+    spike_limit_mib: 32
+  resource/postgremq:
+    attributes:
+      - key: service.name
+        value: postgremq
+        action: upsert
+      - key: service.instance.id
+        value: ${env:POSTGREMQ_DATABASE_ID}
+        action: upsert
+  batch: {}
+exporters:
+  prometheus:
+    endpoint: 0.0.0.0:8889
+    resource_to_telemetry_conversion:
+      enabled: true
+service:
+  pipelines:
+    metrics/queues:
+      receivers: [sqlquery/postgremq]
+      processors: [memory_limiter, resource/postgremq, batch]
+      exporters: [prometheus]
+    metrics/clients:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      exporters: [prometheus]

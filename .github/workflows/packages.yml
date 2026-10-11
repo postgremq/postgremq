@@ -1,0 +1,117 @@
+name: Packages
+
+# What would be published, built and used from outside the repository: the Go
+# module and its CLI through a module proxy (GOWORK=off), the packed npm
+# package, and the packaged crate. Each smoke test runs against a fresh
+# database.
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'mq/**'
+      - 'postgremq-go/**'
+      - 'postgremq-rs/**'
+      - 'postgremq-ts/**'
+      - 'scripts/release/**'
+      - 'release-please-config.json'
+      - '.release-please-manifest.json'
+      - '.github/workflows/packages.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to check (default: the triggering commit)"
+        type: string
+        default: ''
+      components:
+        description: Space-separated subset of "go npm rust" (default all)
+        type: string
+        default: 'go npm rust'
+
+env:
+  SMOKE_ADMIN_URL: postgres://postgres:postgres@localhost:5432/postgres
+
+jobs:
+  go:
+    name: Go modules (external install)
+    if: github.event_name == 'pull_request' || contains(inputs.components, 'go')
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: [ '5432:5432' ]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          fetch-depth: 0
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - name: Install the client and CLI from a module proxy and run them
+        run: |
+          # At a release tag, install that exact version from the tag.
+          version=$(git describe --exact-match --tags --match 'postgremq-go/v*' 2>/dev/null | sed 's#^postgremq-go/##' || true)
+          scripts/release/smoke-go.sh "${version:-v0.0.0-smoke}"
+
+  npm:
+    name: npm package
+    if: github.event_name == 'pull_request' || contains(inputs.components, 'npm')
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: [ '5432:5432' ]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: postgremq-ts/package-lock.json
+      - run: npm ci
+        working-directory: postgremq-ts
+      - name: Pack, install outside the repository, type-check and run
+        run: scripts/release/smoke-npm.sh
+
+  rust:
+    name: Rust crate
+    if: github.event_name == 'pull_request' || contains(inputs.components, 'rust')
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports: [ '5432:5432' ]
+        options: >-
+          --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: dtolnay/rust-toolchain@1.98
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            postgremq-rs/target
+          key: ${{ runner.os }}-cargo-package-${{ hashFiles('postgremq-rs/Cargo.toml', 'postgremq-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-package-
+      - name: Package, inspect, build a consumer outside the repository and run it
+        run: scripts/release/smoke-rust.sh
+      - name: Publication dry run
+        working-directory: postgremq-rs
+        run: cargo publish --dry-run --locked

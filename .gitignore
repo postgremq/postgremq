@@ -1,0 +1,121 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual Environment
+venv/
+ENV/
+env/
+.env
+.venv
+env.bak/
+venv.bak/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+.project
+.pydevproject
+.settings/
+*.sublime-workspace
+*.sublime-project
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Distribution / packaging
+.Python
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+
+# Logs
+*.log
+logs/
+log/
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# node js
+node_modules/
+
+# Test credentials and local settings
+.env*
+!.env.example
+.env.test.local
+.env.local
+postgremq-go/.env.test
+postgremq-ts/.env.test
+**/test-credentials.*
+**/credentials.*
+**/*credentials*
+**/*secret*
+**/*password*
+
+# Go test artifacts
+postgremq-go/coverage.out
+*.test
+*.out
+
+# CLI binary
+postgremq-go/bin/
+
+# Example binaries
+postgremq-go/examples/basic/basic
+postgremq-go/examples/transactions/transactions
+postgremq-go/examples/migration/migration
+postgremq-go/examples/metrics/metrics
+
+# Claude Code: personal settings and notes stay local
+.claude/settings.local.json
+CLAUDE.local.md
+
+# TypeScript build and coverage
+postgremq-ts/dist/
+postgremq-ts/coverage/
+postgremq-ts/src/migrations.generated.ts
+
+# Temporary files
+*.tmp
+*.temp
+.scratch/
+
+tmp/
+# Rust client build output
+postgremq-rs/target/

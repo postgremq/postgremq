@@ -1,0 +1,85 @@
+name: Go Tests
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'postgremq-go/**'
+      - 'mq/**'
+      - 'go.work'
+      - 'observability/**'
+      - 'scripts/release/**'
+      - '.github/workflows/go-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
+
+jobs:
+  test:
+    name: Test Go Client
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        go-version: ['1.25', '1.26']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ matrix.go-version }}
+
+    - name: Cache Go modules
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cache/go-build
+          ~/go/pkg/mod
+        key: ${{ runner.os }}-go-${{ matrix.go-version }}-${{ hashFiles('**/go.sum') }}
+        restore-keys: |
+          ${{ runner.os }}-go-${{ matrix.go-version }}-
+
+    # The module as published: GOWORK=off, its own go.mod and go.sum. The CLI
+    # (cmd/postgremq) is part of it.
+    - name: Run tests
+      working-directory: postgremq-go
+      env:
+        GOWORK: 'off'
+      run: go test -v -race -timeout=20m -coverprofile=coverage.out -covermode=atomic ./...
+
+  lint:
+    name: Lint Go Code
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: '1.26'
+
+    - name: golangci-lint
+      uses: golangci/golangci-lint-action@v8
+      with:
+        version: v2.12
+        working-directory: postgremq-go
+        args: --timeout=5m
+
+    # Workspace mode (go.work): the examples use this tree's client.
+    - name: Build and vet the examples
+      run: |
+        go build ./postgremq-go/examples/...
+        go vet ./postgremq-go/examples/...

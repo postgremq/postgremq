@@ -1,0 +1,92 @@
+name: TypeScript Tests
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'postgremq-ts/**'
+      - 'mq/sql/**'
+      - 'mq/migrations/**'
+      - 'observability/**'
+      - '.github/workflows/typescript-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
+
+jobs:
+  test:
+    name: Test TypeScript Client
+    runs-on: ubuntu-latest
+
+    strategy:
+      matrix:
+        node-version: ['22', '24']
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        cache-dependency-path: postgremq-ts/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./postgremq-ts
+      run: npm ci
+
+    - name: Run linter
+      working-directory: ./postgremq-ts
+      run: npm run lint --if-present
+
+    - name: Run build
+      working-directory: ./postgremq-ts
+      run: npm run build
+
+    - name: Run tests
+      working-directory: ./postgremq-ts
+      run: npm run test:coverage
+
+    # Uncomment to enable Codecov (requires CODECOV_TOKEN secret)
+    # - name: Upload coverage to Codecov
+    #   uses: codecov/codecov-action@v4
+    #   with:
+    #     files: ./postgremq-ts/coverage/lcov.info
+    #     flags: typescript
+    #     name: typescript-node-${{ matrix.node-version }}
+    #     token: ${{ secrets.CODECOV_TOKEN }}
+    #     fail_ci_if_error: false
+
+  type-check:
+    name: TypeScript Type Check
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: '24'
+        cache: 'npm'
+        cache-dependency-path: postgremq-ts/package-lock.json
+
+    - name: Install dependencies
+      working-directory: ./postgremq-ts
+      run: npm ci
+
+    - name: Type check
+      working-directory: ./postgremq-ts
+      run: npx tsc --noEmit

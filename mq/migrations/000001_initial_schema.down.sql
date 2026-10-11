@@ -1,0 +1,3 @@
+-- Down migrations are not supported for PostgreMQ.
+-- To remove an installation and all queue data, explicitly run:
+-- DROP SCHEMA postgremq CASCADE;

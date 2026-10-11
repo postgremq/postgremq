@@ -1,0 +1,31 @@
+# Isolated demo database. No persistent volumes: docker compose down removes it.
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_PASSWORD: postgremq
+      POSTGRES_DB: postgremq
+    ports:
+      - '127.0.0.1:55432:5432'
+    volumes:
+      - ../mq/sql/latest.sql:/docker-entrypoint-initdb.d/01-schema.sql:ro
+      - ./demo-init.sql:/docker-entrypoint-initdb.d/02-demo.sql:ro
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U postgres -d postgremq']
+      interval: 1s
+      timeout: 5s
+      retries: 30
+  collector:
+    image: otel/opentelemetry-collector-contrib:0.147.0
+    command: ['--config=/etc/otelcol/collector.yaml']
+    environment:
+      POSTGREMQ_METRICS_DSN: 'postgres://postgremq_metrics:metrics@postgres:5432/postgremq?sslmode=disable&connect_timeout=5&statement_timeout=5000'
+      POSTGREMQ_DATABASE_ID: postgremq-demo
+    volumes:
+      - ./collector.yaml:/etc/otelcol/collector.yaml:ro
+    ports:
+      - '127.0.0.1:4318:4318'
+      - '127.0.0.1:8889:8889'
+    depends_on:
+      postgres:
+        condition: service_healthy

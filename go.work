@@ -1,0 +1,6 @@
+go 1.26.0
+
+use (
+	./postgremq-go
+	./postgremq-go/examples/metrics
+)

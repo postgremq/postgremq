@@ -1,0 +1,60 @@
+name: SQL Tests
+
+on:
+  pull_request:
+    branches: [ main ]
+    paths:
+      - 'mq/**'
+      - 'postgremq-go/migrations/**'
+      - 'postgremq-rs/Cargo.toml'
+      - 'postgremq-ts/package.json'
+      - 'scripts/schema.py'
+      - 'scripts/release/check_migrations_immutable.sh'
+      - 'Makefile'
+      - '.github/workflows/sql-tests.yml'
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
+
+jobs:
+  test:
+    name: Test SQL Implementation
+    runs-on: ubuntu-latest
+
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        ref: ${{ inputs.ref }}
+        fetch-depth: 0
+
+    # Every client points at the last migration (the Go copy, the Rust and
+    # TypeScript pins, latest.sql's recorded version): `make sync`.
+    - name: Clients in sync with the last migration
+      run: python3 scripts/schema.py check
+
+    # A migration's number is the schema version postgremq.info() reports, so
+    # migrations already on the base branch never change.
+    - name: Existing migrations are unchanged
+      if: github.event_name == 'pull_request'
+      run: scripts/release/check_migrations_immutable.sh "origin/${{ github.base_ref }}"
+
+    - name: Set up Python
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+        cache-dependency-path: mq/tests/requirements.txt
+
+    - name: Install dependencies
+      working-directory: ./mq
+      run: |
+        python -m pip install --upgrade pip
+        pip install -r tests/requirements.txt
+
+    - name: Run tests
+      working-directory: ./mq
+      run: pytest tests/tests.py -v --tb=short

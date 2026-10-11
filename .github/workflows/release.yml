@@ -1,0 +1,198 @@
+name: Release
+
+# Every push to main: validate, then let Release Please tag a merged release
+# PR (with mq/vN on the same commit when it brings a new migration), open or
+# update the one release PR, and publish what was tagged. See RELEASE.md.
+#
+# Run manually (Actions > Release > Run workflow) with an existing release tag
+# to retry its publication. Every publication goes through this workflow
+# because registry trusted publishing is configured for release.yml.
+#
+# A failed run creates no tags and opens no PRs; the next passing run picks up
+# every unreleased change. Tags are created only for a release PR whose merge
+# commit passed validation (scripts/release/check_pending_releases.py), so a
+# later passing commit never authorizes tagging an earlier failed one.
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag to publish again, e.g. rust/v0.2.0 or mq/v3
+        type: string
+        required: true
+      run-tests:
+        description: Run the component's tests on the tag first
+        type: boolean
+        default: true
+
+# No workflow-level concurrency: every pushed commit is validated (the guard
+# needs the Validated job of each release PR's merge commit). Only the jobs
+# that change the repository are serialized; a queued one replaced by a newer
+# run loses nothing, since each run handles every pending release.
+
+permissions:
+  contents: read
+
+jobs:
+  sql:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/sql-tests.yml
+  go:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/go-tests.yml
+  rust:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/rust-tests.yml
+  typescript:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/typescript-tests.yml
+  observability:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/observability-tests.yml
+  packages:
+    if: github.event_name == 'push'
+    uses: ./.github/workflows/packages.yml
+
+  # The single gate the release guard looks for on a commit: all validation
+  # of this exact commit passed. Keep the name in sync with
+  # check_pending_releases.py.
+  validated:
+    name: Validated
+    needs: [ sql, go, rust, typescript, observability, packages ]
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Validation passed for ${{ github.sha }}"
+
+  release:
+    name: Release Please
+    needs: validated
+    runs-on: ubuntu-latest
+    concurrency:
+      group: release-please-${{ github.ref }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+      actions: read
+    outputs:
+      mq-tag: ${{ steps.mq.outputs.tag }}
+      go-tag: ${{ steps.tags.outputs['postgremq-go--tag_name'] }}
+      rust-tag: ${{ steps.tags.outputs['postgremq-rs--tag_name'] }}
+      npm-tag: ${{ steps.tags.outputs['postgremq-ts--tag_name'] }}
+    steps:
+      # Release PRs opened with the default GITHUB_TOKEN do not trigger the
+      # PR workflows (no required checks). A GitHub App token does; configure
+      # the RELEASE_APP_ID variable and RELEASE_APP_PRIVATE_KEY secret.
+      - name: GitHub App token
+        id: app
+        if: vars.RELEASE_APP_ID != ''
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.RELEASE_APP_ID }}
+          private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
+      - name: Without a GitHub App
+        if: vars.RELEASE_APP_ID == ''
+        run: echo "::warning::RELEASE_APP_ID is not set; release PRs use GITHUB_TOKEN and their checks will not run automatically."
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Release guard
+        id: guard
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+        run: python3 scripts/release/check_pending_releases.py --branch "${{ github.ref_name }}" --validated-sha "${{ github.sha }}"
+
+      - name: Tag merged release PRs and create GitHub releases
+        id: tags
+        if: steps.guard.outputs.tag == 'true'
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.app.outputs.token || github.token }}
+          target-branch: ${{ github.ref_name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-pull-request: true
+
+      # mq is versioned by its last migration, not by Release Please: tag
+      # mq/vN on the newest client release commit when that commit brings a
+      # migration not released yet (also repairs a run that failed after
+      # tagging the clients).
+      - name: Release mq with a new migration
+        id: mq
+        if: steps.guard.outputs.tag == 'true'
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+        run: python3 scripts/release/mq_release.py release
+
+      - name: Open or update the release PR
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ steps.app.outputs.token || github.token }}
+          target-branch: ${{ github.ref_name }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+          skip-github-release: true
+
+      - name: Say on the release PR which mq release it brings
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token || github.token }}
+        run: python3 scripts/release/mq_release.py comment --branch "${{ github.ref_name }}"
+
+  publish-mq:
+    needs: release
+    if: needs.release.outputs.mq-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.mq-tag }}
+    permissions:
+      contents: write
+      id-token: write
+    secrets: inherit
+  publish-go:
+    needs: release
+    if: needs.release.outputs.go-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.go-tag }}
+    permissions:
+      contents: write
+      id-token: write
+    secrets: inherit
+  publish-rust:
+    needs: release
+    if: needs.release.outputs.rust-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.rust-tag }}
+    permissions:
+      contents: write
+      id-token: write
+    secrets: inherit
+  publish-npm:
+    needs: release
+    if: needs.release.outputs.npm-tag != ''
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ needs.release.outputs.npm-tag }}
+    permissions:
+      contents: write
+      id-token: write
+    secrets: inherit
+
+  # Manual run: retry publishing an existing tag.
+  retry:
+    name: Retry ${{ inputs.tag }}
+    if: github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/publish.yml
+    with:
+      tag: ${{ inputs.tag }}
+      run-tests: ${{ inputs.run-tests }}
+    permissions:
+      contents: write
+      id-token: write
+    secrets: inherit

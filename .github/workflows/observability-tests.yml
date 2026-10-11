@@ -1,0 +1,47 @@
+name: Observability Tests
+on:
+  pull_request:
+    branches: [main]
+    paths: ['observability/**', 'mq/**', 'postgremq-go/**', 'postgremq-ts/**', 'postgremq-rs/**', 'docs/observability.md', '.github/workflows/observability-tests.yml']
+  workflow_call:
+    inputs:
+      ref:
+        description: "Commit, branch or tag to test (default: the triggering commit)"
+        type: string
+        default: ''
+jobs:
+  collector:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: postgremq-ts/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - run: pip install -r mq/tests/requirements.txt
+      - run: npm ci
+        working-directory: postgremq-ts
+      - uses: dtolnay/rust-toolchain@1.98
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            postgremq-rs/target
+          key: ${{ runner.os }}-cargo-example-${{ hashFiles('postgremq-rs/Cargo.toml', 'postgremq-rs/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-example-
+      # Built ahead of the test, so its run fits the test's per-client timeout.
+      - run: cargo build --locked --example metrics --features otel
+        working-directory: postgremq-rs
+      - run: pytest observability/test_collector.py -v
