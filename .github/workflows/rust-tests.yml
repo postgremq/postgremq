@@ -1,15 +1,6 @@
 name: Rust Tests
 
 on:
-  pull_request:
-    branches: [ main ]
-    paths:
-      - 'postgremq-rs/**'
-      - 'mq/sql/**'
-      - 'mq/migrations/**'
-      - 'observability/**'
-      - 'docs/observability.md'
-      - '.github/workflows/rust-tests.yml'
   workflow_call:
     inputs:
       ref:
@@ -46,7 +37,7 @@ jobs:
 
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         ref: ${{ inputs.ref }}
         fetch-depth: 0
@@ -57,7 +48,7 @@ jobs:
         components: clippy, rustfmt
 
     - name: Cache cargo
-      uses: actions/cache@v4
+      uses: actions/cache@v6
       with:
         path: |
           ~/.cargo/registry
@@ -95,7 +86,7 @@ jobs:
         working-directory: ./postgremq-rs
     steps:
     - name: Checkout code
-      uses: actions/checkout@v4
+      uses: actions/checkout@v7
       with:
         ref: ${{ inputs.ref }}
         fetch-depth: 0

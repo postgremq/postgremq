@@ -6,17 +6,6 @@ name: Packages
 # database.
 
 on:
-  pull_request:
-    branches: [ main ]
-    paths:
-      - 'mq/**'
-      - 'postgremq-go/**'
-      - 'postgremq-rs/**'
-      - 'postgremq-ts/**'
-      - 'scripts/release/**'
-      - 'release-please-config.json'
-      - '.release-please-manifest.json'
-      - '.github/workflows/packages.yml'
   workflow_call:
     inputs:
       ref:
@@ -45,13 +34,14 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
           fetch-depth: 0
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
+          cache-dependency-path: postgremq-go/go.sum
       - name: Install the client and CLI from a module proxy and run them
         run: |
           # At a release tag, install that exact version from the tag.
@@ -71,10 +61,10 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
@@ -97,11 +87,11 @@ jobs:
         options: >-
           --health-cmd "pg_isready -U postgres" --health-interval 5s --health-timeout 5s --health-retries 10
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
       - uses: dtolnay/rust-toolchain@1.98
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry

@@ -3,10 +3,7 @@
 A message queue built entirely on PostgreSQL: plain SQL tables and functions,
 with client libraries for Go, TypeScript and Rust.
 
-[![SQL Tests](https://github.com/postgremq/postgremq/actions/workflows/sql-tests.yml/badge.svg)](https://github.com/postgremq/postgremq/actions/workflows/sql-tests.yml)
-[![Go Tests](https://github.com/postgremq/postgremq/actions/workflows/go-tests.yml/badge.svg)](https://github.com/postgremq/postgremq/actions/workflows/go-tests.yml)
-[![TypeScript Tests](https://github.com/postgremq/postgremq/actions/workflows/typescript-tests.yml/badge.svg)](https://github.com/postgremq/postgremq/actions/workflows/typescript-tests.yml)
-[![Rust Tests](https://github.com/postgremq/postgremq/actions/workflows/rust-tests.yml/badge.svg)](https://github.com/postgremq/postgremq/actions/workflows/rust-tests.yml)
+[![Build](https://github.com/postgremq/postgremq/actions/workflows/release.yml/badge.svg?branch=main)](https://github.com/postgremq/postgremq/actions/workflows/release.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
 
 PostgreMQ runs in the PostgreSQL database you already have. It is a SQL

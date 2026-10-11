@@ -41,7 +41,7 @@ jobs:
       version: ${{ steps.tag.outputs.version }}
       smoke: ${{ steps.tag.outputs.smoke }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ inputs.tag }}
           fetch-depth: 0
@@ -112,7 +112,7 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       PUBLISH: ${{ vars.PUBLISH_ENABLED == 'true' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: refs/tags/${{ inputs.tag }}
 
@@ -145,7 +145,7 @@ jobs:
           fi
 
       # --- TypeScript: npm ---
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         if: env.COMPONENT == 'npm'
         with:
           node-version: '24'
@@ -177,10 +177,11 @@ jobs:
           fi
 
       # --- Go module: published by its tag ---
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         if: env.COMPONENT == 'postgremq-go'
         with:
           go-version: '1.26'
+          cache: false
       - name: Ask the Go module proxy to fetch the module
         if: env.COMPONENT == 'postgremq-go'
         run: |
