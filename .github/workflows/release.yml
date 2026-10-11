@@ -1,7 +1,7 @@
 name: Release
 
 # Every push to main: validate, then let Release Please tag a merged release
-# PR (with mq/vN on the same commit when it brings a new migration), open or
+# PR (with mq/vX.Y.Z on the same commit when it brings a new migration), open or
 # update the one release PR, and publish what was tagged. See RELEASE.md.
 #
 # Run manually (Actions > Release > Run workflow) with an existing release tag
@@ -19,7 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag to publish again, e.g. rust/v0.2.0 or mq/v3
+        description: Existing release tag to publish again, e.g. rust/v0.2.0 or mq/v0.1.0
         type: string
         required: true
       run-tests:
@@ -119,7 +119,7 @@ jobs:
           skip-github-pull-request: true
 
       # mq is versioned by its last migration, not by Release Please: tag
-      # mq/vN on the newest client release commit when that commit brings a
+      # mq/vX.Y.Z on the newest client release commit when that commit brings a
       # migration not released yet (also repairs a run that failed after
       # tagging the clients).
       - name: Release mq with a new migration

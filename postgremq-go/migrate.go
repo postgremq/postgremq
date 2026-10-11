@@ -20,19 +20,29 @@ import (
 
 const MigrationsTable = "postgremq_migrations"
 
-// migrationsFS holds the schema migrations: a copy of mq/migrations that
-// `make sync` keeps identical to it (a module cannot embed files outside its
-// directory). Do not edit them here.
+// migrationsFS holds the schema migrations: a copy of mq/migrations under
+// numbered names (<schema version>_<mq version>.up.sql) that `make sync` keeps
+// in step with it (a module cannot embed files outside its directory). Do not
+// edit them here.
 //
 //go:embed migrations/*.up.sql
 var migrationsFS embed.FS
 
-// MigrationStatus represents the current state of migrations
+// MigrationStatus represents the current state of migrations. Versions are
+// schema versions: an mq version stored as one number, major*10^8 +
+// minor*10^4 + patch; FormatSchemaVersion gives the mq version.
 type MigrationStatus struct {
 	CurrentVersion uint
 	Dirty          bool
 	LatestVersion  uint
 	NeedsMigration bool
+}
+
+// FormatSchemaVersion returns the mq version (major.minor.patch) of a schema
+// version, the number the version table stores: 10000 is "0.1.0".
+func FormatSchemaVersion(version uint) string {
+	v := uint64(version)
+	return fmt.Sprintf("%d.%d.%d", v/100_000_000, v/10_000%10_000, v%10_000)
 }
 
 // Migrate applies the embedded migrations the database has not applied yet,
@@ -175,7 +185,7 @@ func getLatestMigrationVersion() uint {
 			continue
 		}
 
-		// Parse version from filename like "000001_initial_schema.up.sql"
+		// Parse version from filename like "000010000_0.1.0.up.sql"
 		parts := strings.SplitN(name, "_", 2)
 		if len(parts) < 1 {
 			continue

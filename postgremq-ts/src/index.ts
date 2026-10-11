@@ -44,7 +44,7 @@ export {
 export { SUPPORTED_PROTOCOL_MAJORS } from './protocol';
 
 // Schema migrations (compatible with the Go client and the CLI).
-export { migrate, getMigrationStatus, MigrationStatus } from './migrate';
+export { migrate, getMigrationStatus, formatSchemaVersion, MigrationStatus } from './migrate';
 
 // Import implementation classes
 import { Connection as ConnectionImpl } from './connection';

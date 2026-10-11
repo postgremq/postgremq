@@ -6,7 +6,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 PostgreMQ is a PostgreSQL-based message queue system. Four independently
 versioned components (see "Versioning, commits and releases" below):
-- **mq**: Core PostgreSQL implementation (SQL functions and schema); released as `mq/vN` (N = last migration), not a Go module
+- **mq**: Core PostgreSQL implementation (SQL functions and schema); semver, released as `mq/vX.Y.Z` (X.Y.Z = last migration, `mq/migrations/X.Y.Z.up.sql`), not a Go module
 - **postgremq-go**: Go client library; module `postgremq.dev/postgremq-go`, package `postgremq`; the CLI (`migrate`, `status`, stdlib `flag`) is `postgremq-go/cmd/postgremq` in the same module
 - **postgremq-ts**: TypeScript client library (npm `postgremq`)
 - **postgremq-rs**: Rust client library (crate `postgremq`, sqlx 0.9 + Tokio)
@@ -180,8 +180,8 @@ Both clients support configurable retry with exponential backoff for transient d
 ## Key Files
 
 - `mq/sql/latest.sql`: Complete schema and SQL functions (fresh install; guard + records the latest migration)
-- `mq/migrations/`: golang-migrate migrations (upgrade path; released ones immutable)
-- `Makefile`, `scripts/schema.py`: `make migration name=…`, `make sync` (Go migration copy, Rust/TS pins, latest.sql version → last migration), `make check`, `make test-*`
+- `mq/migrations/`: `X.Y.Z.up.sql` migrations (upgrade path; released ones immutable, at most one pending)
+- `Makefile`, `scripts/schema.py`: `make migration name=… bump=patch|minor|major`, `make sync` (pending migration, every client's numbered copy, latest.sql version), `make check`, `make test-*`; `schema.py check-title` (PR title vs schema level)
 - `RELEASE.md`, `release-please-config.json`, `.github/workflows/release.yml` (also the manual publish retry), `publish.yml`, `packages.yml`, `release-pr.yml`: release process
 - `.github/workflows/ci.yml` + `scripts/ci/changed_areas.py`: the one PR workflow; runs the reusable per-area test workflows the PR touches, final required `CI` job
 - `scripts/release/`: release guard, consistency checks, mq releases (`mq_release.py`), Go module proxy, smoke tests
@@ -208,7 +208,7 @@ plus mq when the release commit carries a new migration:
 
 | Component | Path | Tag |
 |---|---|---|
-| mq (SQL) | `mq/` (version = last migration number; not in Release Please) | `mq/vN` |
+| mq (SQL) | `mq/` (version = last migration, semver; not in Release Please) | `mq/vX.Y.Z` |
 | Go client + CLI | `postgremq-go/` | `postgremq-go/vX.Y.Z` |
 | Rust | `postgremq-rs/` (`Cargo.toml`) | `rust/vX.Y.Z` |
 | TypeScript | `postgremq-ts/` (`package.json`) | `npm/vX.Y.Z` |
@@ -237,32 +237,42 @@ plus mq when the release commit carries a new migration:
   component's release note is accurate; a cross-cutting change touches each
   component's path and appears in each changelog.
 - **Never** edit client versions, `.release-please-manifest.json`, client
-  `CHANGELOG.md` files or an existing migration in a feature PR. The release
+  `CHANGELOG.md` files or a released migration in a feature PR. The release
   PR is generated: don't hand-edit it beyond changelog wording.
-- Every client ALWAYS points at the last migration, in the same commit that
-  adds it: run `make sync` (copies `mq/migrations` to
-  `postgremq-go/migrations/`, sets the Rust `mq-schema`, TS `"mq-schema"` and
-  latest.sql's recorded version). CI fails otherwise. Never edit
-  `postgremq-go/migrations/` by hand. A migration commit therefore touches
-  every client and releases all of them; type it `feat`/`fix`/`perf`.
+- Every client ALWAYS embeds every migration, in the same commit that
+  changes them: run `make sync` (copies `mq/migrations` into
+  `postgremq-{go,rs,ts}/migrations/` as `<stored version>_<X.Y.Z>.up.sql`,
+  sets latest.sql's recorded version). CI fails otherwise. Never edit the
+  copies by hand. A schema commit therefore touches every client and releases
+  all of them; its PR title's level must cover its schema change (`fix`
+  patch, `feat` minor, `!` major; exact when scoped `sql` alone; CI:
+  `schema.py check-title`).
 - Commits made by Claude end with the attribution lines the session asks for.
 
 ### SQL contract rules
 
 - `postgremq.info()` → `{"schema_version", "protocol_major"}`. schema_version
-  = number of the last migration applied (read from
-  `postgremq.postgremq_migrations`); protocol major is 1, a literal in
+  = version of the last migration applied, stored as major·10⁸ + minor·10⁴ +
+  patch (0.1.0 = 10000; read from `postgremq.postgremq_migrations`; clients'
+  `FormatSchemaVersion`/`format_schema_version`/`formatSchemaVersion` decode
+  it); protocol major is 1, a literal in
   `info()`. Clients check the major on connect (`SupportedProtocolMajors()` /
   `SUPPORTED_PROTOCOL_MAJORS`) and reject others with a typed compatibility
   error. Additive SQL changes keep the major; incompatible ones need a new
   major (a migration redefining info(); breaking for every client). No
   capability lists or feature probes.
-- A migration NEVER changes once merged to `main` (CI:
-  `scripts/release/check_migrations_immutable.sh`): schema/function changes
-  are `make migration name=<snake_case>` (next number, 1..N without gaps), the
-  SQL in it AND the same change in `mq/sql/latest.sql` (fresh install ==
-  migrations; tests check it), then `make sync`, all in one commit. 000001 is
-  editable only until the first mq release.
+- A RELEASED migration (one in the newest `mq/v*` release in history) NEVER
+  changes (CI: `schema.py check --base`). At most one migration is pending
+  (the next mq release); every schema change is a section in it, opened by
+  `-- ── change: <name> · <level> ──…`, and its version is the last release
+  bumped by the highest section level. Schema/function changes are `make
+  migration name=<snake_case> bump=<level>` (creates/joins/renames the pending
+  migration and adds the header), the SQL below the header AND the same
+  change in `mq/sql/latest.sql` (fresh install == migrations; tests check
+  it), then `make sync`, all in one commit. After a rebase, `make sync` merges
+  two pending migrations (main's sections first). Legacy names
+  (`000001_*.sql`, tag `mq/v1`) are read from history as stored version N =
+  0.0.1.
 
 ## Important Notes
 

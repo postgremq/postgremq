@@ -2,8 +2,9 @@
 
 The clients are versioned independently by
 [Release Please](https://github.com/googleapis/release-please), running in
-`.github/workflows/release.yml`; the SQL schema (mq) is versioned by its last
-migration. Everything unreleased collects in **one release PR**; merging it
+`.github/workflows/release.yml`; the SQL schema (mq) is versioned by its
+migrations, which carry semantic versions. Everything unreleased collects in
+**one release PR**; merging it
 releases every component in it. Tags, GitHub releases and registry
 publishing follow automatically.
 
@@ -11,7 +12,7 @@ publishing follow automatically.
 
 | Component | Directory | Version | Tag | Published as |
 |-----------|-----------|---------|-----|--------------|
-| SQL schema (mq) | `mq/` | the last migration number | `mq/vN` | GitHub release with `latest.sql` and the migrations attached |
+| SQL schema (mq) | `mq/` | the last migration (`mq/migrations/X.Y.Z.up.sql`) | `mq/vX.Y.Z` | GitHub release with `latest.sql` and the migrations attached |
 | Go client and CLI | `postgremq-go/` | the tag | `postgremq-go/vX.Y.Z` | Go module `postgremq.dev/postgremq-go` (package `postgremq`; CLI `postgremq.dev/postgremq-go/cmd/postgremq`) |
 | Rust client | `postgremq-rs/` | `Cargo.toml` | `rust/vX.Y.Z` | crates.io crate `postgremq` |
 | TypeScript client | `postgremq-ts/` | `package.json` | `npm/vX.Y.Z` | npm package `postgremq` |
@@ -35,9 +36,13 @@ outside these directories (docs, `observability/`, CI) release nothing.
     fix bumps PATCH.
   - Breaking changes are listed under **⚠ BREAKING CHANGES** in the release
     notes, from the commit's `!` or `BREAKING CHANGE:` footer.
-- mq: `mq/vN` is the schema at migration N, exactly what `postgremq.info()`
-  reports as `schema_version`. Compatibility is the protocol major (below),
-  not the version number.
+- mq: semantic versioning of the schema, as the people who write each change
+  declare it: a breaking change (clients already deployed stop working against
+  the migrated database) bumps MAJOR, an additive one MINOR, a fix PATCH,
+  before 1.0 as after. `mq/vX.Y.Z` is the schema at migration X.Y.Z; the
+  database stores it as one number, X×10⁸ + Y×10⁴ + Z (0.1.0 is 10000), which
+  `postgremq.info()` reports as `schema_version`. Clients check the protocol
+  major (below), not the version.
 - Published versions and tags are immutable. A correction is a new release.
 
 ## The SQL schema
@@ -52,12 +57,16 @@ need a new major.
 
 ```sql
 SELECT postgremq.info();
--- {"schema_version": 7, "protocol_major": 1}
+-- {"schema_version": 10000, "protocol_major": 1}
 ```
 
-`schema_version` is the number of the last migration applied: the exact
-schema and function state of the database. `info()` reads it from the version
-table that every install path maintains (the migrators and `latest.sql`).
+`schema_version` is the version of the last migration applied, stored as one
+number (10000 is mq 0.1.0): the exact schema and function state of the
+database. `info()` reads it from the version table that every install path
+maintains (the migrators and `latest.sql`). The clients' migration status
+reports the same number; `FormatSchemaVersion` (Go), `format_schema_version`
+(Rust) and `formatSchemaVersion` (TypeScript) turn it into the mq version,
+and the CLI shows both.
 
 `postgremq.info()` and its two fields are stable across protocol majors;
 fields may be added. Each client declares the majors it implements
@@ -75,13 +84,26 @@ it implements and tests both contracts.
 
 ### Migrations, latest.sql and the clients
 
-- `mq/migrations/` holds [golang-migrate](https://github.com/golang-migrate/migrate)
-  migrations, numbered 1..N without gaps. A migration's number is a schema
-  version, so **a migration never changes once it is on `main`**: a schema or
-  function change adds a new migration. CI fails a PR that modifies, deletes
-  or renames an existing migration
-  (`scripts/release/check_migrations_immutable.sh`); until the first mq
-  release, `000001_initial_schema` may still be edited.
+- `mq/migrations/X.Y.Z.up.sql` migrates the schema to mq X.Y.Z (the
+  [golang-migrate](https://github.com/golang-migrate/migrate) protocol: one
+  version table row, an advisory lock, a dirty flag). A migration is
+  **released** once it is part of the newest `mq/v*` release in the branch's
+  history, and **a released migration never changes**: CI
+  (`scripts/schema.py check --base`) fails a PR that modifies, deletes or
+  renames one.
+- **At most one migration is pending**: the one not in the last release,
+  which becomes the next mq release. Every schema change goes into it as a
+  section opened by a header naming the change and its level:
+
+  ```sql
+  -- ── change: add_queue_priority · minor ──────────────────────────────────
+  ALTER TABLE postgremq.queues ADD COLUMN priority int;
+  ```
+
+  Its version is the last release bumped by the highest level among its
+  sections, so the next mq version is always visible on `main`, and releases
+  have no gaps. A pending migration may still change until it is released;
+  a database migrated from an unreleased build is rebuilt, not upgraded.
 - The protocol major is a literal in `info()`; only a migration that breaks
   the client contract redefines `info()` with a new major (a breaking change
   for every client).
@@ -89,16 +111,16 @@ it implements and tests both contracts.
   produce, in one file. A guard at the top refuses to run when the version
   table `postgremq.postgremq_migrations` exists (an existing installation is
   upgraded with the migrations), and the end records the last migration's
-  number.
-- **Every client always embeds every migration.** At any commit the Go client
-  carries a copy of `mq/migrations` (`postgremq-go/migrations/`; a Go module
-  cannot embed files outside its directory), and the Rust and TypeScript
-  clients pin the last migration number (`[package.metadata.postgremq]
-  mq-schema` in `postgremq-rs/Cargo.toml`, `"postgremq": {"mq-schema"}` in
-  `postgremq-ts/package.json`) and embed migrations 1..N from `mq/migrations`
-  at build time. `make sync` writes all of these and the version `latest.sql`
+  version.
+- **Every client always embeds every migration.** Each client carries a copy
+  of `mq/migrations` under numbered names, `<stored version>_<mq
+  version>.up.sql` (`postgremq-go/migrations/`, `postgremq-rs/migrations/`,
+  `postgremq-ts/migrations/`), and embeds all of it: a Go module and a crate
+  cannot embed files outside their directories, and a copy inside each
+  client's path is what makes Release Please release every client with a
+  schema change. `make sync` writes the copies and the version `latest.sql`
   records; CI (`scripts/schema.py check`) refuses a commit where any of them
-  is behind.
+  is behind. Never edit a copy.
 - The SQL test suite (`mq/tests/tests.py`) checks that a fresh `latest.sql`
   install and a database migrated through every migration have identical
   schema dumps, version rows and `info()`; that `info()` reports the last
@@ -109,22 +131,49 @@ it implements and tests both contracts.
 A schema change is one commit (one PR):
 
 ```bash
-make migration name=add_queue_priority   # creates mq/migrations/00000N_add_queue_priority.up.sql
-# write the migration, and the same change in mq/sql/latest.sql
-make sync                                # Go copy, Rust/TS pins, latest.sql's version
-make test-sql                            # optional locally; CI runs everything
+make migration name=add_queue_priority bump=minor   # adds a change header to the pending migration
+# write the SQL below the header, and the same change in mq/sql/latest.sql
+make sync                                           # client copies, latest.sql's version
+make test-sql                                       # optional locally; CI runs everything
 git add -A && git commit -m "feat(sql): add queue priority"
 ```
 
-`make hooks` installs a pre-commit hook that refuses a commit while the
-clients are out of sync (it checks the working tree; CI checks the commit). Because `make sync` changes a file in every client,
-the commit releases every client with the new schema, and their changelogs
-list it.
+`make migration` fetches the `mq/v*` tags, then:
 
-If two open PRs add the same migration number, the second one fails CI after
-the first merges (`schema: two migrations numbered N`): rename its migration
-to the next number and run `make sync`. Requiring branches to be up to date
-before merging (repository settings) catches this before the merge.
+| Pending migration | It |
+|---|---|
+| none (the last migration is released) | creates the last release bumped by `bump` |
+| one, at the same or a higher level | adds the header to it |
+| one, at a lower level | renames it to the higher version, then adds the header |
+
+and prints where to write. `make hooks` installs a pre-commit hook that
+refuses a commit while the schema is inconsistent or out of sync (it checks
+the working tree; CI checks the commit). Because `make sync` changes a file in
+every client, the commit releases every client with the new schema, and their
+changelogs list it.
+
+**The PR title states the level.** `pr-title.yml` runs `scripts/schema.py
+check-title`: a PR that changes `mq/migrations` needs a releasing type
+(`fix`/`perf`: patch, `feat`: minor, `!`: major), at least as high as every
+change header it adds; a title scoped to the schema alone (`fix(sql): ...`,
+`feat(mq): ...`) must match the highest level exactly. Before the release
+PR is merged, `verify_release.py --all` checks again that no schema-scoped
+commit since the last mq release asks for more than the new version gives.
+
+**Two PRs changing the schema at once.** After one merges, rebasing the
+other usually conflicts on the version `latest.sql` records (take either side;
+`make sync` rewrites it) and, when both appended to the same pending
+migration, at its end (keep `main`'s sections first, then yours). When each
+PR started its own pending migration (no migration was pending when they
+branched), there are now two: `make sync` merges them into one, `main`'s
+sections first, at the version their sections call for. When the pending
+migration your branch added to was released meanwhile, `make check` reports
+the released file as changed: restore it (`git checkout mq/vX.Y.Z --
+mq/migrations/X.Y.Z.up.sql`), then `make migration` and move your section
+into the new pending migration. A pending migration of your branch that a
+release overtook (it kept a version below the release) is renamed above it by
+`make sync`. Requiring branches to be up to date before merging (repository
+settings) makes every PR resolve this before it merges.
 
 ## Day-to-day development
 
@@ -133,14 +182,14 @@ before merging (repository settings) catches this before the merge.
   (checked by `.github/workflows/pr-title.yml`); see CONTRIBUTING.md for the
   types and scopes.
 - Feature PRs never change client versions, `.release-please-manifest.json`,
-  the client changelogs, or existing migrations.
+  the client changelogs, or released migrations.
 - `feat` and `fix` (and `perf`, `revert`, `deps`) appear in release notes;
   `docs`, `test`, `ci`, `refactor`, `build` and `chore` do not, and do not
-  trigger a release on their own. A migration is a user-visible change: commit
-  it as `feat` or `fix` (or `perf`). Otherwise it waits, and a release PR that
-  brings it without releasing every client fails *Release PR consistency*
-  (each client must ship the new schema): add a `feat`/`fix` commit for the
-  missing clients.
+  trigger a release on their own. A schema change is user-visible: its title
+  is `fix`, `feat` or breaking, matching its level (checked on the PR). A
+  release PR that brings a new mq version without releasing every client fails
+  *Release PR consistency* (each client must ship the new schema): add a
+  `feat`/`fix` commit for the missing clients.
 
 ## The release pipeline
 
@@ -163,9 +212,10 @@ On every push to `main`, `release.yml`:
    their GitHub releases with the changelog sections as notes (Release
    Please, `skip-github-pull-request`).
 4. **Releases mq** (`scripts/release/mq_release.py release`): if the newest
-   client release commit carries a migration newer than the last `mq/v*` tag,
-   it creates `mq/vN` there, with notes from the commits that changed `mq/`
-   since the previous mq release.
+   client release commit carries a migration newer than the last `mq/v*` tag
+   (the pending one), it creates `mq/vX.Y.Z` there, with notes listing its
+   change headers and the commits that changed `mq/` since the previous mq
+   release.
 5. **Opens or updates** the release PR (`chore: release main`) for every
    client with unreleased `feat`/`fix` changes: version bumps, `CHANGELOG.md`
    entries, manifest (Release Please, `skip-github-release`). A comment on the
@@ -268,7 +318,8 @@ edit the `mq/v1` GitHub release afterwards if you like.
   default branch; restrict deletions, block force pushes, require linear
   history, require a pull request (0 approvals for a single maintainer;
   squash only), and require status checks with *Require branches to be up to
-  date before merging* (catches two PRs adding the same migration number):
+  date before merging* (makes two PRs changing the schema settle the pending
+  migration before the second merges):
   `CI`, `Conventional Commit title` and `Release PR consistency`. All three
   run on every pull request: `ci.yml` runs the tests of the areas the PR
   touches (`scripts/ci/changed_areas.py`) and its final `CI` job passes only
@@ -308,8 +359,9 @@ edit the `mq/v1` GitHub release afterwards if you like.
 
 | Command | Purpose |
 |---------|---------|
-| `make migration name=…`, `make sync`, `make check`, `make hooks`, `make test-*` | Schema changes and checks (`scripts/schema.py`); `make` lists them |
-| `scripts/release/check_migrations_immutable.sh [BASE]` | Fails if a migration already on BASE changed (run on PRs) |
+| `make migration name=… bump=…`, `make sync`, `make check`, `make hooks`, `make test-*` | Schema changes and checks (`scripts/schema.py`); `make` lists them |
+| `scripts/schema.py check-title TITLE --base REF` | The PR title's level covers its schema changes (run on PRs) |
+| `scripts/schema.py export DIR` | The migrations under numbered names, for migration tools (the mq release asset) |
 | `scripts/release/verify_release.py <tag>` / `--all` | Checks a release's consistency |
 | `scripts/release/check_pending_releases.py` | The release guard |
 | `scripts/release/mq_release.py pending\|notes\|comment\|release` | mq releases |

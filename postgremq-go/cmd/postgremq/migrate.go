@@ -15,8 +15,8 @@ func runMigrate(_ context.Context, pool *pgxpool.Pool, out io.Writer) error {
 		return fmt.Errorf("failed to get migration status: %w", err)
 	}
 
-	fmt.Fprintf(out, "Current version: %d\n", status.CurrentVersion)
-	fmt.Fprintf(out, "Latest version:  %d\n", status.LatestVersion)
+	fmt.Fprintf(out, "Current version: %s\n", describeVersion(status.CurrentVersion))
+	fmt.Fprintf(out, "Latest version:  %s\n", describeVersion(status.LatestVersion))
 
 	if status.Dirty {
 		return fmt.Errorf("database is in dirty state - manual intervention required")

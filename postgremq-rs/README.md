@@ -35,10 +35,13 @@ applies the migrations embedded in the crate:
 postgremq::migrate(&pool).await?; // no-op when the schema is current
 let status = postgremq::migration_status(&pool).await?;
 assert!(!status.needs_migration);
+println!("mq {}", postgremq::format_schema_version(status.current_version)); // such as mq 0.1.0
 # Ok(())
 # }
 ```
 
+Versions are schema versions: the mq version stored as one number (10000 is
+mq 0.1.0), which `format_schema_version` turns back into the mq version.
 `migrate` only goes up, to the latest version in this crate. It uses the same
 version table and advisory lock as the Go client and the
 [migration CLI](https://github.com/postgremq/postgremq/blob/main/postgremq-go/cmd/postgremq/README.md),

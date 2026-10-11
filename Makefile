@@ -1,8 +1,10 @@
 # PostgreMQ development tasks. `make` lists them.
 #
-# Schema changes: `make migration name=<snake_case>`, write the migration and
-# the same change in mq/sql/latest.sql, then `make sync` and commit everything
-# in one commit. CI runs `make check`.
+# Schema changes: `make migration name=<snake_case> bump=<patch|minor|major>`,
+# write the SQL below the change header it adds to the pending migration
+# (mq/migrations/X.Y.Z.up.sql, the next mq release), make the same change in
+# mq/sql/latest.sql, then `make sync` and commit everything in one commit.
+# CI runs `make check`.
 
 .DEFAULT_GOAL := help
 PYTHON ?= python3
@@ -11,18 +13,17 @@ BASE ?= origin/main
 
 .PHONY: help migration sync check hooks test test-sql test-go test-rs test-ts
 
-## migration name=<snake_case>: add mq/migrations/NNNNNN_<name>.up.sql with the next number
+## migration name=<snake_case> bump=<patch/minor/major>: start a schema change in the pending migration
 migration:
-	@$(PYTHON) scripts/schema.py new "$(name)"
+	@$(PYTHON) scripts/schema.py new "$(name)" "$(bump)"
 
-## sync: point every client at the last migration (Go copy, Rust/TS pins, latest.sql)
+## sync: settle the pending migration; copy migrations into every client; set latest.sql's version
 sync:
 	@$(PYTHON) scripts/schema.py sync
 
-## check: schema in sync and migrations on BASE (default origin/main) unchanged, as CI checks
+## check: schema consistent and in sync, released migrations unchanged since BASE (default origin/main)
 check:
-	@$(PYTHON) scripts/schema.py check
-	@scripts/release/check_migrations_immutable.sh $(BASE)
+	@$(PYTHON) scripts/schema.py check --base $(BASE)
 
 ## hooks: install a pre-commit hook that refuses commits with the schema out of sync
 hooks:

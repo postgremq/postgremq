@@ -25,9 +25,8 @@ import subprocess
 import sys
 
 AREAS: dict[str, list[str]] = {
-    'sql': ['mq/**', 'postgremq-go/migrations/**', 'postgremq-rs/Cargo.toml', 'postgremq-ts/package.json',
-            'scripts/schema.py', 'scripts/release/check_migrations_immutable.sh', 'Makefile',
-            '.github/workflows/sql-tests.yml'],
+    'sql': ['mq/**', 'postgremq-go/migrations/**', 'postgremq-rs/migrations/**', 'postgremq-ts/migrations/**',
+            'scripts/schema.py', 'Makefile', '.github/workflows/sql-tests.yml'],
     'go': ['postgremq-go/**', 'mq/**', 'go.work', 'observability/**', 'scripts/release/**',
            '.github/workflows/go-tests.yml'],
     'rust': ['postgremq-rs/**', 'mq/sql/**', 'mq/migrations/**', 'observability/**', 'docs/observability.md',

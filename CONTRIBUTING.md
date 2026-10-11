@@ -46,27 +46,36 @@ pytest tests/tests.py -v
 ```
 
 `mq/sql/latest.sql` is the fresh-install script and `mq/migrations/` the
-upgrade path. A migration never changes once merged to `main` (its number is
-the schema version `postgremq.info()` reports; CI checks it): fix a merged
-migration with a new one. A schema or function change is:
+upgrade path. Migrations carry the mq version they migrate to
+(`mq/migrations/X.Y.Z.up.sql`), and at most one is pending: the next mq
+release, which every schema change adds a section to. A released migration
+never changes (CI checks it). A schema or function change is:
 
 ```bash
-make migration name=add_queue_priority   # mq/migrations/00000N_add_queue_priority.up.sql
-# write the migration, and the same change in mq/sql/latest.sql
-make sync                                # every client now points at migration N
+make migration name=add_queue_priority bump=minor   # patch: a fix; minor: additive; major: breaking
+# write the SQL below the header it added, and the same change in mq/sql/latest.sql
+make sync                                           # every client's copy, latest.sql's version
 ```
 
-and one commit with all of it. The SQL tests check that both paths produce
-the same schema. Every client embeds every migration, and `make sync` keeps
-them at the last one: it copies the migrations into
-`postgremq-go/migrations/` (a Go module cannot embed files outside its
-directory; never edit the copy), sets the Rust and TypeScript pins
-(`mq-schema`) and the version `latest.sql` records. CI fails when any of them
-is behind (`make check`); `make hooks` installs a pre-commit hook that checks
-the same. The TypeScript build and Jest generate
-`postgremq-ts/src/migrations.generated.ts`, and `postgremq-rs/build.rs` reads
-`postgremq-rs/migrations`, a symlink to `mq/migrations` (on Windows, clone
-with `git config core.symlinks true`).
+and one commit with all of it, in a PR titled at the same level (`fix(sql):`
+for patch, `feat(sql):` for minor, `feat(sql)!:` for major; CI checks it).
+`make migration` creates the pending migration, adds your section to it, or
+renames it to a higher version when your change needs one, and prints where
+to write. The SQL tests check that both paths produce the same schema.
+
+Every client embeds every migration: `make sync` copies them into
+`postgremq-go/migrations/`, `postgremq-rs/migrations/` and
+`postgremq-ts/migrations/` under numbered names (never edit a copy), and sets
+the version `latest.sql` records. CI fails when any of them is behind (`make
+check`); `make hooks` installs a pre-commit hook that checks the same. The
+TypeScript build and Jest generate `postgremq-ts/src/migrations.generated.ts`
+from its copy.
+
+After rebasing a schema PR on a `main` that also changed the schema, run
+`make sync`: it merges two pending migrations into one and rewrites the
+version `latest.sql` records (resolve a conflict on that line either way). A
+database you migrated from your branch is then rebuilt, not upgraded.
+RELEASE.md has the full rules.
 
 ### Go
 
@@ -157,13 +166,16 @@ PR title must be a [Conventional Commit](https://www.conventionalcommits.org/)
   release notes and release nothing on their own.
 - **Scopes**: `sql`, `go`, `cli`, `ts`, `rs`, `docs`, `ci`, `release`, or
   several (`sql,go`). The scope is for readers; Release Please decides which
-  clients a commit releases from the paths it changes. A migration commit
+  clients a commit releases from the paths it changes. A schema commit
   (scope `sql`) changes every client (`make sync`), so it releases all of
-  them, and mq with them.
+  them, and mq with them. Its type gives the level of its schema change
+  (`fix` patch, `feat` minor, `!` major): exactly, when the scope is `sql`
+  (or `mq`) alone; at least, when other scopes share the PR.
 - **Breaking changes**: add `!` after the scope and a `BREAKING CHANGE:`
   footer in the PR description's squash commit body, saying what breaks and
-  how to migrate. Before 1.0 this is a minor release, listed under
-  "BREAKING CHANGES".
+  how to migrate. Before 1.0 a client's breaking change is a minor release,
+  listed under "BREAKING CHANGES"; a breaking schema change bumps mq's major
+  version.
 - Commits on your branch can be anything; only the squash commit counts. Keep
   a PR to one component where you can, so each release note says what changed
   in that component.
@@ -171,7 +183,7 @@ PR title must be a [Conventional Commit](https://www.conventionalcommits.org/)
 Examples: `feat(go): add WithGroupKey publish option`,
 `fix(sql): keep group order when a nack is delayed`,
 `feat(ts)!: make connect() check the protocol major`,
-`feat(sql): add queue priority` (a migration, with `make sync`).
+`feat(sql): add queue priority` (a minor schema change, with `make sync`).
 
 ## Reporting bugs and requesting features
 

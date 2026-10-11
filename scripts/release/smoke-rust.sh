@@ -11,9 +11,12 @@ source "$root/scripts/release/smoke-lib.sh"
 cd "$root/postgremq-rs"
 version=$(awk -F'"' '/^version = / { print $2; exit }' Cargo.toml)
 cargo package --locked --allow-dirty --list > "$SMOKE_WORK/files"
-for required in build.rs Cargo.toml README.md LICENSE src/lib.rs migrations/000001_initial_schema.up.sql; do
+for required in build.rs Cargo.toml README.md LICENSE src/lib.rs migrations/000000001_0.0.1.up.sql; do
   grep -qx "$required" "$SMOKE_WORK/files" || { echo "smoke-rust: package lacks $required" >&2; exit 1; }
 done
+if [ "$(grep -c '^migrations/.*\.up\.sql$' "$SMOKE_WORK/files")" -ne "$(ls migrations/*.up.sql | wc -l)" ]; then
+  echo "smoke-rust: package lacks some of migrations/" >&2; exit 1
+fi
 if grep -q '^tests/' "$SMOKE_WORK/files"; then
   echo "smoke-rust: package includes tests/" >&2; exit 1
 fi

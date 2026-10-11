@@ -92,11 +92,13 @@ CREATE SCHEMA IF NOT EXISTS postgremq;
 
 
 -- Discovery: the installed schema version and the protocol major that
--- clients check when they connect. schema_version is the number of the last
--- migration applied, read from the version table the migrators and
--- latest.sql maintain (NULL without it); protocol_major changes only with a
--- migration that breaks the client contract. The signature and these two
--- fields stay stable across protocol majors; fields may be added.
+-- clients check when they connect. schema_version is the version of the
+-- last migration applied, an mq version stored as one number (major*10^8 +
+-- minor*10^4 + patch; 0.1.0 is 10000), read from the version table the
+-- migrators and latest.sql maintain (NULL without it); protocol_major
+-- changes only with a migration that breaks the client contract. The
+-- signature and these two fields stay stable across protocol majors; fields
+-- may be added.
 -- SECURITY DEFINER, unlike every other function, so that runtime roles need
 -- no privilege on the version table to connect.
 CREATE OR REPLACE FUNCTION postgremq.info() RETURNS jsonb
@@ -1842,9 +1844,10 @@ $$;
  * Records the migration this script is equivalent to, in the version table
  * the migrators use (golang-migrate's layout: every client's migrate and the
  * CLI), so they upgrade a database installed from this script like one they
- * installed, and postgremq.info() reports it as schema_version. Must name the
- * latest migration in mq/migrations.
+ * installed, and postgremq.info() reports it as schema_version. Must be the
+ * latest migration in mq/migrations, stored as one number (major*10^8 +
+ * minor*10^4 + patch); `make sync` sets it.
  */
 CREATE TABLE postgremq.postgremq_migrations (version bigint not null primary key, dirty boolean not null);
 
-INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (1, false);
+INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (10000, false);

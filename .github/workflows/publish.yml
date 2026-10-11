@@ -17,7 +17,7 @@ name: Publish
 # CRATES_IO_TRUSTED_PUBLISHING / NPM_TRUSTED_PUBLISHING are "true", otherwise
 # the CARGO_REGISTRY_TOKEN / NPM_TOKEN secrets. The Go module (with its CLI) is
 # published by its tag; this only asks the Go module proxy to fetch it. mq
-# (mq/vN) has no registry: its GitHub release gets latest.sql and the
+# (mq/vX.Y.Z) has no registry: its GitHub release gets latest.sql and the
 # migrations as assets.
 
 on:
@@ -213,5 +213,11 @@ jobs:
         run: |
           assets=$(mktemp -d)
           cp mq/sql/latest.sql "$assets/postgremq-v$VERSION.sql"
-          tar -czf "$assets/postgremq-migrations-v$VERSION.tar.gz" -C mq migrations
+          # Numbered names (<schema version>_<mq version>.up.sql), which
+          # golang-migrate and other migration tools read. mq/v1 predates
+          # `export`; its migrations already have numbered names.
+          python3 scripts/schema.py export "$assets/migrations" ||
+            cp -R mq/migrations "$assets/migrations"
+          tar -czf "$assets/postgremq-migrations-v$VERSION.tar.gz" -C "$assets" migrations
+          rm -r "$assets/migrations"
           gh release upload "$TAG" "$assets"/* --clobber

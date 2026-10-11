@@ -28,9 +28,10 @@ equivalent to, so the migrators upgrade a database installed from it like one
 they installed. Run it with `ON_ERROR_STOP` (as below), so psql stops at the
 first error instead of running the rest of the file.
 
-Each mq release (`mq/vN`, N the last migration) attaches the files to its
-[GitHub release](https://github.com/postgremq/postgremq/releases):
-`postgremq-vN.sql` (`latest.sql`) and `postgremq-migrations-vN.tar.gz`.
+Each mq release (`mq/vX.Y.Z`, X.Y.Z the last migration) attaches the files to
+its [GitHub release](https://github.com/postgremq/postgremq/releases):
+`postgremq-vX.Y.Z.sql` (`latest.sql`) and `postgremq-migrations-vX.Y.Z.tar.gz`
+(the migrations under the numbered names migration tools read).
 
 **psql**
 
@@ -38,7 +39,10 @@ Each mq release (`mq/vN`, N the last migration) attaches the files to its
 psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql
 ```
 
-**Migrations.** `mq/migrations/` uses the golang-migrate file layout. The
+**Migrations.** `mq/migrations/X.Y.Z.up.sql` migrates to mq X.Y.Z; the
+database stores the version as one number, X×10⁸ + Y×10⁴ + Z (0.1.0 is 10000).
+The clients embed copies under golang-migrate's numbered names
+(`000010000_0.1.0.up.sql`). The
 [PostgreMQ CLI](../postgremq-go/cmd/postgremq/README.md) (`postgremq migrate --dsn …`) and
 every client apply the files: Go `postgremq.Migrate(pool)`, TypeScript
 `migrate(pool)` and Rust `postgremq::migrate(&pool)`. They share one protocol,
@@ -49,12 +53,13 @@ installed. Migrations only go up, to the latest version the client embeds; a
 database already at a newer version is left unchanged, and a dirty one is an
 error. `GetMigrationStatus` / `getMigrationStatus` / `migration_status` and
 `postgremq status` only read, and work before installation too. To use the
-golang-migrate CLI directly, create the schema first and point it at the same
-version table:
+golang-migrate CLI directly, create the schema first and point it at the
+numbered migrations (an mq release's `postgremq-migrations-vX.Y.Z.tar.gz`, or
+`postgremq-go/migrations/` in the repository) and the same version table:
 
 ```sh
 psql "$DATABASE_URL" -c 'CREATE SCHEMA IF NOT EXISTS postgremq'
-migrate -path mq/migrations \
+migrate -path postgremq-go/migrations \
   -database 'postgres://user:pass@host:5432/db?x-migrations-table=%22postgremq%22.%22postgremq_migrations%22&x-migrations-table-quoted=1' \
   up
 ```
@@ -62,9 +67,11 @@ migrate -path mq/migrations \
 Down migrations are not supported. To remove an installation and all of its queue
 data, run `DROP SCHEMA postgremq CASCADE`.
 
-Every client embeds all of these migrations: at any commit the Go client's
-copy (`postgremq-go/migrations/`) and the Rust and TypeScript pins point at
-the last one (`make sync`, checked by CI).
+Every client embeds all of these migrations: at any commit each client's copy
+(`postgremq-go/migrations/`, `postgremq-rs/migrations/`,
+`postgremq-ts/migrations/`) matches `mq/migrations/` (`make sync`, checked by
+CI). How migrations are versioned and released is in
+[RELEASE.md](../RELEASE.md#migrations-latestsql-and-the-clients).
 
 ## Schema, roles and transactions
 
@@ -417,15 +424,16 @@ row.
 
 ```sql
 SELECT postgremq.info();
--- {"schema_version": 7, "protocol_major": 1}
+-- {"schema_version": 10000, "protocol_major": 1}
 ```
 
-`schema_version` is the number of the last migration applied, the exact
-schema and function state of the database, read from the version table
+`schema_version` is the version of the last migration applied, stored as one
+number (X×10⁸ + Y×10⁴ + Z; 10000 is mq 0.1.0): the exact schema and function
+state of the database, read from the version table
 `postgremq.postgremq_migrations` that fresh installs (`latest.sql`) and
 upgrades (the migrations) both maintain; `null` without that table. A
-migration never changes once merged, so equal numbers mean equal schemas. The
-mq release `mq/vN` is schema version N. `info()` is
+released migration never changes, so equal released versions mean equal
+schemas. The mq release `mq/v0.1.0` is schema version 10000. `info()` is
 the one `SECURITY DEFINER` function, so runtime roles need no privilege on the
 version table to call it. `protocol_major` is
 the contract clients rely on: function signatures, result types, error codes,

@@ -2,8 +2,8 @@ import { describe, test, expect, beforeAll, afterEach, jest } from '@jest/global
 import * as fs from 'fs';
 import * as path from 'path';
 import { Pool } from 'pg';
-import { migrate, getMigrationStatus, migrationLockId } from '../../migrate';
-import { MIGRATIONS, MQ_SCHEMA } from '../../migrations.generated';
+import { migrate, getMigrationStatus, migrationLockId, formatSchemaVersion } from '../../migrate';
+import { MIGRATIONS } from '../../migrations.generated';
 import { DirtySchemaError } from '../../errors';
 import { Connection } from '../../connection';
 import { createEmptyTestDatabase, createIsolatedTestConnection, getSharedTestDatabase, TestDatabase } from '../helpers';
@@ -37,17 +37,22 @@ async function advisoryLocksHeld(pool: Pool): Promise<number> {
 const latest = Math.max(...MIGRATIONS.map((m) => m.version));
 
 describe('embedded migrations', () => {
-  test('are migrations 1..N for the pinned schema version N, byte for byte', () => {
-    const pin = JSON.parse(fs.readFileSync(path.join(__dirname, '../../../package.json'), 'utf8')).postgremq['mq-schema'];
-    expect(MQ_SCHEMA).toBe(pin);
-    const dir = path.join(__dirname, '../../../../mq/migrations');
+  test('are every migration in migrations/, in order, byte for byte', () => {
+    const dir = path.join(__dirname, '../../../migrations');
     const files = fs.readdirSync(dir).filter((f) => /^\d+_.+\.up\.sql$/.test(f)).sort();
-    const expected = files.filter((f) => Number(f.split('_')[0]) <= pin);
-    expect(MIGRATIONS.map((m) => `${String(m.version).padStart(6, '0')}_${m.name}.up.sql`)).toEqual(expected);
-    for (const m of MIGRATIONS) {
-      const file = expected.find((f) => Number(f.split('_')[0]) === m.version)!;
-      expect(m.sql).toBe(fs.readFileSync(path.join(dir, file), 'utf8'));
+    expect(MIGRATIONS.map((m) => `${String(m.version).padStart(9, '0')}_${formatSchemaVersion(m.version)}.up.sql`))
+      .toEqual(files);
+    for (const [i, m] of MIGRATIONS.entries()) {
+      expect(m.sql).toBe(fs.readFileSync(path.join(dir, files[i]), 'utf8'));
     }
+  });
+
+  test('formatSchemaVersion gives the mq version of a schema version', () => {
+    expect(formatSchemaVersion(0)).toBe('0.0.0');
+    expect(formatSchemaVersion(1)).toBe('0.0.1');
+    expect(formatSchemaVersion(10_000)).toBe('0.1.0');
+    expect(formatSchemaVersion(100_020_003)).toBe('1.2.3');
+    expect(formatSchemaVersion(1_299_999_999)).toBe('12.9999.9999');
   });
 
   test('the advisory lock id matches golang-migrate', () => {
@@ -144,12 +149,12 @@ describe('migrate', () => {
   test('leaves a database migrated by a newer client unchanged', async () => {
     const { pool } = await emptyDatabase();
     await migrate(pool);
-    await pool.query('UPDATE postgremq.postgremq_migrations SET version = 999');
+    await pool.query('UPDATE postgremq.postgremq_migrations SET version = 900000000');
 
     await migrate(pool);
 
     await expect(getMigrationStatus(pool)).resolves.toEqual({
-      currentVersion: 999,
+      currentVersion: 900_000_000,
       dirty: false,
       latestVersion: latest,
       needsMigration: false,

@@ -20,16 +20,13 @@ jobs:
         ref: ${{ inputs.ref }}
         fetch-depth: 0
 
-    # Every client points at the last migration (the Go copy, the Rust and
-    # TypeScript pins, latest.sql's recorded version): `make sync`.
-    - name: Clients in sync with the last migration
-      run: python3 scripts/schema.py check
-
-    # A migration's number is the schema version postgremq.info() reports, so
-    # migrations already on the base branch never change.
-    - name: Existing migrations are unchanged
-      if: github.event_name == 'pull_request'
-      run: scripts/release/check_migrations_immutable.sh "origin/${{ github.base_ref }}"
+    # At most one pending migration, versioned by its change headers; every
+    # client's copy and latest.sql's recorded version in step (`make sync`);
+    # on a PR, released migrations unchanged since the base branch.
+    - name: Schema consistent and released migrations unchanged
+      env:
+        BASE: ${{ github.event_name == 'pull_request' && format('origin/{0}', github.base_ref) || '' }}
+      run: python3 scripts/schema.py check ${BASE:+--base "$BASE"}
 
     - name: Set up Python
       uses: actions/setup-python@v7
