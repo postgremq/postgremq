@@ -183,6 +183,7 @@ Both clients support configurable retry with exponential backoff for transient d
 - `mq/migrations/`: golang-migrate migrations (upgrade path; released ones immutable)
 - `Makefile`, `scripts/schema.py`: `make migration name=…`, `make sync` (Go migration copy, Rust/TS pins, latest.sql version → last migration), `make check`, `make test-*`
 - `RELEASE.md`, `release-please-config.json`, `.github/workflows/release.yml` (also the manual publish retry), `publish.yml`, `packages.yml`, `release-pr.yml`: release process
+- `.github/workflows/ci.yml` + `scripts/ci/changed_areas.py`: the one PR workflow; runs the reusable per-area test workflows the PR touches, final required `CI` job
 - `scripts/release/`: release guard, consistency checks, mq releases (`mq_release.py`), Go module proxy, smoke tests
 - `postgremq-go/connection.go`: Go connection management and pool handling
 - `postgremq-go/actor.go`: generic connection-level background actor (shared select-loop skeleton; keep-alive and extender are `scheduler` instances)

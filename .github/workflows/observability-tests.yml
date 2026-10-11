@@ -1,8 +1,5 @@
 name: Observability Tests
 on:
-  pull_request:
-    branches: [main]
-    paths: ['observability/**', 'mq/**', 'postgremq-go/**', 'postgremq-ts/**', 'postgremq-rs/**', 'docs/observability.md', '.github/workflows/observability-tests.yml']
   workflow_call:
     inputs:
       ref:
@@ -14,25 +11,26 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref }}
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
-      - uses: actions/setup-node@v4
+          cache-dependency-path: postgremq-go/**/go.sum
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: postgremq-ts/package-lock.json
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.11'
       - run: pip install -r mq/tests/requirements.txt
       - run: npm ci
         working-directory: postgremq-ts
       - uses: dtolnay/rust-toolchain@1.98
-      - uses: actions/cache@v4
+      - uses: actions/cache@v6
         with:
           path: |
             ~/.cargo/registry

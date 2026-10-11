@@ -1,0 +1,81 @@
+name: CI
+
+# One run per pull request. `changes` works out which areas the PR touches
+# (scripts/ci/changed_areas.py); each area's tests run only when needed, in
+# parallel, through the same reusable workflows release.yml uses on main. The
+# final `CI` job always runs and fails if any test job failed or was
+# cancelled (skipped ones count as passing), so it is the one test check to
+# require on main.
+
+on:
+  pull_request:
+    branches: [ main ]
+
+concurrency:
+  group: ci-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      sql: ${{ steps.areas.outputs.sql }}
+      go: ${{ steps.areas.outputs.go }}
+      rust: ${{ steps.areas.outputs.rust }}
+      typescript: ${{ steps.areas.outputs.typescript }}
+      observability: ${{ steps.areas.outputs.observability }}
+      packages: ${{ steps.areas.outputs.packages }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: areas
+        run: python3 scripts/ci/changed_areas.py "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+
+  sql:
+    needs: changes
+    if: needs.changes.outputs.sql == 'true'
+    uses: ./.github/workflows/sql-tests.yml
+  go:
+    needs: changes
+    if: needs.changes.outputs.go == 'true'
+    uses: ./.github/workflows/go-tests.yml
+  rust:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
+    uses: ./.github/workflows/rust-tests.yml
+  typescript:
+    needs: changes
+    if: needs.changes.outputs.typescript == 'true'
+    uses: ./.github/workflows/typescript-tests.yml
+  observability:
+    needs: changes
+    if: needs.changes.outputs.observability == 'true'
+    uses: ./.github/workflows/observability-tests.yml
+  packages:
+    needs: changes
+    if: needs.changes.outputs.packages == 'true'
+    uses: ./.github/workflows/packages.yml
+
+  ci:
+    name: CI
+    needs: [ changes, sql, go, rust, typescript, observability, packages ]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: All required test jobs passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          echo "$RESULTS" | python3 -c '
+          import json, sys
+          results = {job: need["result"] for job, need in json.load(sys.stdin).items()}
+          for job, result in results.items():
+              print(f"{job}: {result}")
+          failed = [job for job, result in results.items() if result not in ("success", "skipped")]
+          sys.exit(f"failed: {failed}" if failed else 0)
+          '

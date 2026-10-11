@@ -89,7 +89,7 @@ jobs:
       - name: GitHub App token
         id: app
         if: vars.RELEASE_APP_ID != ''
-        uses: actions/create-github-app-token@v2
+        uses: actions/create-github-app-token@v3
         with:
           app-id: ${{ vars.RELEASE_APP_ID }}
           private-key: ${{ secrets.RELEASE_APP_PRIVATE_KEY }}
@@ -97,7 +97,7 @@ jobs:
         if: vars.RELEASE_APP_ID == ''
         run: echo "::warning::RELEASE_APP_ID is not set; release PRs use GITHUB_TOKEN and their checks will not run automatically."
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -110,7 +110,7 @@ jobs:
       - name: Tag merged release PRs and create GitHub releases
         id: tags
         if: steps.guard.outputs.tag == 'true'
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@v5
         with:
           token: ${{ steps.app.outputs.token || github.token }}
           target-branch: ${{ github.ref_name }}
@@ -130,7 +130,7 @@ jobs:
         run: python3 scripts/release/mq_release.py release
 
       - name: Open or update the release PR
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@v5
         with:
           token: ${{ steps.app.outputs.token || github.token }}
           target-branch: ${{ github.ref_name }}

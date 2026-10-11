@@ -266,11 +266,13 @@ edit the `mq/v1` GitHub release afterwards if you like.
   history, require a pull request (0 approvals for a single maintainer;
   squash only), and require status checks with *Require branches to be up to
   date before merging* (catches two PRs adding the same migration number):
-  `Conventional Commit title` and `Release PR consistency`. Both run on every
-  pull request (`pr-title.yml`, `release-pr.yml`; the latter is skipped,
-  which counts as passing, except on the release PR). The test and Packages
-  workflows run only when their paths change, so do not require them; the
-  release workflow validates every commit before tagging.
+  `CI`, `Conventional Commit title` and `Release PR consistency`. All three
+  run on every pull request: `ci.yml` runs the tests of the areas the PR
+  touches (`scripts/ci/changed_areas.py`) and its final `CI` job passes only
+  if none of them failed; `pr-title.yml`; `release-pr.yml` (skipped, which
+  counts as passing, except on the release PR). The per-area workflows
+  (`sql-tests.yml`, `go-tests.yml`, ...) are reusable only, called by
+  `ci.yml`, `release.yml` and `publish.yml`.
 - **Tag ruleset for releases**: target `mq/v*`, `postgremq-go/v*`, `rust/v*`
   and `npm/v*`; restrict creations, updates and deletions and block force
   pushes, with the release GitHub App on the bypass list. Only the release
@@ -287,13 +289,14 @@ edit the `mq/v1` GitHub release afterwards if you like.
   after the first publish set the npm package to *Require two-factor
   authentication and disallow tokens*. Without trusted publishing, add scoped
   tokens as the secrets `NPM_TOKEN` and `CARGO_REGISTRY_TOKEN`.
-- **Go module path.** `postgremq.dev/postgremq-go` needs `go-import` discovery
-  on postgremq.dev (the website repository): `postgremq.dev/postgremq-go` and
-  its subpaths must answer `?go-get=1` with `<meta name="go-import"
-  content="postgremq.dev/postgremq-go git https://github.com/postgremq/postgremq">`
-  (the module lives in the `postgremq-go/` subdirectory). Until it works,
+- **Go module path.** `postgremq.dev/postgremq-go` resolves through
+  `go-import` discovery on postgremq.dev (the website repository): every path
+  under the domain answers `?go-get=1` with `<meta name="go-import"
+  content="postgremq.dev git https://github.com/postgremq/postgremq">`. The
+  prefix is the domain (the repository root), so the go command finds the
+  module in the `postgremq-go/` subdirectory with `postgremq-go/vX.Y.Z` tags.
   `scripts/release/go-proxy.sh` builds a local module proxy from a tag or the
-  working tree.
+  working tree for the smoke tests.
 - **Enable publishing**: set the variable `PUBLISH_ENABLED=true`.
 
 ## Tools
