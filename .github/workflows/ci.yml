@@ -5,7 +5,7 @@ name: CI
 # parallel, through the same reusable workflows release.yml uses on main. The
 # final `CI` job always runs and fails if any test job failed or was
 # cancelled (skipped ones count as passing), so it is the one test check to
-# require on main.
+# require on main. The release PR runs no test area (see changed_areas.py).
 
 on:
   pull_request:
@@ -34,7 +34,9 @@ jobs:
         with:
           fetch-depth: 0
       - id: areas
-        run: python3 scripts/ci/changed_areas.py "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"
+        env:
+          HEAD_REF: ${{ github.head_ref }}
+        run: python3 scripts/ci/changed_areas.py "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}" "$HEAD_REF"
 
   sql:
     needs: changes
