@@ -72,11 +72,11 @@ type Connection struct {
 // The returned Connection owns the pool and will Close() it during shutdown.
 //
 // Dial reads postgremq.info() and returns a *CompatibilityError (matching
-// ErrIncompatibleSchema) when the installation's protocol major is not one
-// of SupportedProtocolMajors(), or when discovery is missing and the database
-// needs a PostgreMQ installation or upgrade.
+// ErrIncompatibleSchema) when the installation's schema version has an mq
+// major not in SupportedMQMajors(), or when discovery is missing and the
+// database needs a PostgreMQ installation or upgrade.
 //
-// ctx is bootstrap-only: it bounds pgxpool.NewWithConfig and the protocol
+// ctx is bootstrap-only: it bounds pgxpool.NewWithConfig and the schema
 // check at construction time and is not retained by the returned Connection. Cancelling it after Dial
 // returns has no effect — call Close() to shut down the Connection.
 func Dial(ctx context.Context, config *pgxpool.Config, opts ...ConnectionOption) (*Connection, error) {
@@ -84,7 +84,7 @@ func Dial(ctx context.Context, config *pgxpool.Config, opts ...ConnectionOption)
 	if err != nil {
 		return nil, fmt.Errorf("failed to create connection pool: %w", err)
 	}
-	if err := checkProtocol(ctx, pool); err != nil {
+	if err := checkSchema(ctx, pool); err != nil {
 		pool.Close()
 		return nil, err
 	}
@@ -95,10 +95,10 @@ func Dial(ctx context.Context, config *pgxpool.Config, opts ...ConnectionOption)
 // (typically *pgxpool.Pool). The Connection does not own the pool and will not
 // close it on Connection.Close().
 //
-// ctx bounds the protocol check (see Dial) and is not retained. Lifetime is
+// ctx bounds the schema check (see Dial) and is not retained. Lifetime is
 // owned by Close().
 func DialFromPool(ctx context.Context, pool Pool, opts ...ConnectionOption) (*Connection, error) {
-	if err := checkProtocol(ctx, pool); err != nil {
+	if err := checkSchema(ctx, pool); err != nil {
 		return nil, err
 	}
 	return newConnection(ctx, pool, false, opts...)

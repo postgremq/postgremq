@@ -7,6 +7,7 @@ extern crate self as postgremq;
 
 mod admin;
 mod checkout;
+mod compatibility;
 mod connection;
 mod consumer;
 mod delivery;
@@ -17,7 +18,6 @@ mod listener;
 mod metrics;
 mod migrate;
 mod options;
-mod protocol;
 mod renewal;
 mod retry;
 mod scheduler;
@@ -25,6 +25,7 @@ mod sync;
 mod types;
 
 pub use admin::{DlqMessage, MaintenanceCounters, QueueInfo, QueueStatistics};
+pub use compatibility::SUPPORTED_MQ_MAJORS;
 pub use connection::Connection;
 pub use consumer::Consumer;
 pub use delivery::Delivery;
@@ -34,7 +35,6 @@ pub use migrate::{MigrationStatus, format_schema_version, migrate, migration_sta
 pub use options::{
     ConnectionOptions, ConsumeOptions, PublishOptions, QueueFatalHook, QueueOptions, RetryConfig,
 };
-pub use protocol::SUPPORTED_PROTOCOL_MAJORS;
 pub use types::{Generation, MessageId};
 
 /// Re-exported so applications use the same version as

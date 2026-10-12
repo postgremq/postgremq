@@ -38,13 +38,7 @@ export interface MigrationStatus {
 
 const LATEST_VERSION = Math.max(...MIGRATIONS.map((m) => m.version));
 
-/**
- * The mq version (`major.minor.patch`) of a schema version, the number the
- * version table stores: `formatSchemaVersion(10000)` is `'0.1.0'`.
- */
-export function formatSchemaVersion(version: number): string {
-  return `${Math.floor(version / 100_000_000)}.${Math.floor(version / 10_000) % 10_000}.${version % 10_000}`;
-}
+export { formatSchemaVersion } from './schema-version';
 
 /**
  * Applies the embedded migrations the database has not applied yet, up to the

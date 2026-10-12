@@ -255,12 +255,12 @@ plus mq when the release commit carries a new migration:
   = version of the last migration applied, stored as major·10⁸ + minor·10⁴ +
   patch (0.1.0 = 10000; read from `postgremq.postgremq_migrations`; clients'
   `FormatSchemaVersion`/`format_schema_version`/`formatSchemaVersion` decode
-  it); protocol major is 1, a literal in
-  `info()`. Clients check the major on connect (`SupportedProtocolMajors()` /
-  `SUPPORTED_PROTOCOL_MAJORS`) and reject others with a typed compatibility
-  error. Additive SQL changes keep the major; incompatible ones need a new
-  major (a migration redefining info(); breaking for every client). No
-  capability lists or feature probes.
+  it). Clients check its mq MAJOR on connect (`SupportedMQMajors()` /
+  `SUPPORTED_MQ_MAJORS`, now `[0]`) and reject others, or a missing version,
+  with a typed compatibility error. Additive SQL changes are minor; breaking
+  ones bump the mq major (a `major` change header). `protocol_major` is legacy,
+  for clients ≤0.3.0: derived in info() as mq major + 1 since mq 0.1.1; never
+  check it in new code. No capability lists or feature probes.
 - A RELEASED migration (one in the newest `mq/v*` release in history) NEVER
   changes (CI: `schema.py check --base`). At most one migration is pending
   (the next mq release); every schema change is a section in it, opened by

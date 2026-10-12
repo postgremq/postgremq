@@ -39,7 +39,7 @@ import {
   createDeferred,
 } from './utils';
 import { mapDbError, ConnectionClosedError, QueueFatalError, ValidationError } from './errors';
-import { checkProtocol } from './protocol';
+import { checkSchema } from './compatibility';
 
 /** Anything the connection can shut down during close(). Both ConsumerImpl
  *  and HandlerConsumer satisfy this. */
@@ -314,9 +314,10 @@ export class Connection implements IConnection {
    * notification machinery torn down, etc.). Callers must construct a
    * new Connection to reconnect.
    *
-   * It reads `postgremq.info()` and rejects a database whose protocol major
-   * is not in `SUPPORTED_PROTOCOL_MAJORS`, or that has no discovery function
-   * (it needs a PostgreMQ installation or upgrade).
+   * It reads `postgremq.info()` and rejects a database whose schema version
+   * has an mq major not in `SUPPORTED_MQ_MAJORS`, that reports no schema
+   * version, or that has no discovery function (it needs a PostgreMQ
+   * installation or upgrade).
    *
    * @returns Promise that resolves when connected
    * @throws ConnectionClosedError if close() has already been called.
@@ -327,7 +328,7 @@ export class Connection implements IConnection {
     if (this.connected) return Promise.resolve();
     if (!this.connectPromise)
       this.connectPromise = this.runDatabase(async (client) => {
-        await checkProtocol(client);
+        await checkSchema(client);
         if (this.isShuttingDown) throw new ConnectionClosedError();
         this.connected = true;
       }).finally(() => {

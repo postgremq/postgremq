@@ -3342,6 +3342,14 @@ def test_info_reports_the_schema_version_and_protocol_major(cur):
     assert cur.fetchone()[0] == {'schema_version': latest, 'protocol_major': 1}
 
 
+def test_info_derives_the_legacy_protocol_major_from_the_mq_major(cur):
+    """protocol_major (checked by clients up to 0.3.0) is the mq major + 1."""
+    for version, major in ((1, 1), (10_001, 1), (99_999_999, 1), (100_000_000, 2), (200_030_004, 3)):
+        cur.execute('UPDATE postgremq.postgremq_migrations SET version = %s', (version,))
+        cur.execute("SELECT postgremq.info()")
+        assert cur.fetchone()[0] == {'schema_version': version, 'protocol_major': major}
+
+
 def test_info_follows_the_version_table(cur):
     """schema_version is whatever the migrators last recorded; NULL without the table."""
     cur.execute('UPDATE postgremq.postgremq_migrations SET version = 7')

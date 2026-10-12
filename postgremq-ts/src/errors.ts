@@ -10,6 +10,8 @@
  * branch on the failure mode.
  */
 
+import { formatSchemaVersion } from './schema-version';
+
 /** SQLSTATE code for "lease lost" (PMQ01). */
 export const ErrCodeLeaseLost = 'PMQ01';
 /** SQLSTATE code for "queue or topic not found" (PMQ02). */
@@ -99,38 +101,36 @@ export class ConnectionClosedError extends Error {
 
 /**
  * CompatibilityError is thrown by `Connection.connect()` when the database's
- * PostgreMQ installation uses a protocol major this client does not support
- * (see `SUPPORTED_PROTOCOL_MAJORS`), or has no discovery function
- * (`postgremq.info()`) and needs an installation or upgrade. Mirrors the Go
- * client's CompatibilityError / ErrIncompatibleSchema.
+ * PostgreMQ schema has an mq major this client does not support (see
+ * `SUPPORTED_MQ_MAJORS`), reports no schema version, or has no discovery
+ * function (`postgremq.info()`) and needs an installation or upgrade. Mirrors
+ * the Go client's CompatibilityError / ErrIncompatibleSchema.
  *
  * Pure client-side error (no SQLSTATE), so it carries no `code`; when
  * discovery is missing, `cause` is the database error.
  */
 export class CompatibilityError extends Error {
-  /** The installed schema version (the last migration applied); undefined when discovery is missing. */
+  /**
+   * The installed schema version (the last migration applied;
+   * `formatSchemaVersion()` gives its mq version); undefined when discovery is
+   * missing or reports none.
+   */
   readonly schemaVersion?: number;
-  /** The installation's protocol major; undefined when discovery is missing. */
-  readonly protocolMajor?: number;
-  /** The protocol majors this client supports. */
+  /** The mq majors this client supports. */
   readonly supportedMajors: readonly number[];
   /** The database error when discovery is missing. */
   readonly cause?: Error;
-  constructor(details: {
-    schemaVersion?: number;
-    protocolMajor?: number;
-    supportedMajors: readonly number[];
-    cause?: Error;
-  }) {
+  constructor(details: { schemaVersion?: number; supportedMajors: readonly number[]; cause?: Error }) {
     const supported = `[${details.supportedMajors.join(', ')}]`;
     super(
       details.cause
-        ? `postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports protocol majors ${supported}): ${details.cause.message}`
-        : `postgremq: the database's PostgreMQ schema (version ${details.schemaVersion ?? 'unknown'}) uses protocol major ${details.protocolMajor}; this client supports ${supported}`
+        ? `postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports mq majors ${supported}): ${details.cause.message}`
+        : details.schemaVersion === undefined
+          ? `postgremq: the database's PostgreMQ installation reports no schema version; it needs an installation or upgrade (client supports mq majors ${supported})`
+          : `postgremq: the database's PostgreMQ schema is mq ${formatSchemaVersion(details.schemaVersion)} (schema version ${details.schemaVersion}); this client supports mq majors ${supported}`
     );
     this.name = 'CompatibilityError';
     this.schemaVersion = details.schemaVersion;
-    this.protocolMajor = details.protocolMajor;
     this.supportedMajors = details.supportedMajors;
     this.cause = details.cause;
   }

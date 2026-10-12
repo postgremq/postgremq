@@ -33,6 +33,7 @@ else
     cp "$file" "$src/${file#"$dir"/}"
   done)
   echo "go-proxy: $module@$version from the working tree (unreleased)" >&2
+  unreleased=1
 fi
 
 (cd "$root/scripts/release/gomodproxy" && GOWORK=off go run . -out "$out" "$module@$version=$src")
@@ -52,3 +53,7 @@ done
 echo "GOPROXY=file://$out,https://proxy.golang.org,direct"
 echo "GONOSUMDB=postgremq.dev"
 echo "GOWORK=off"
+# Go also indexes a module version's files in its build cache (GOCACHE, which
+# CI restores), again assuming they never change: a stale index would make it
+# build files this tree no longer has.
+[ -z "${unreleased:-}" ] || echo "GODEBUG=goindex=0"
