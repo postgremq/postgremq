@@ -1,5 +1,5 @@
 {
-  "postgremq-go": "0.3.0",
-  "postgremq-rs": "0.3.0",
-  "postgremq-ts": "0.3.0"
+  "postgremq-go": "0.4.0",
+  "postgremq-rs": "0.4.0",
+  "postgremq-ts": "0.4.0"
 }
