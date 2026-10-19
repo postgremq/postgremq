@@ -128,13 +128,11 @@ func (s *extScheduler) collectDue(now time.Time) []*extEntry {
 
 // flush extends every due message in one set_vt_batch_multi call.
 func (s *extScheduler) flush(ctx context.Context, due []*extEntry) extResult {
-	deadline := time.Now().Add(time.Second)
+	var earliest time.Time
 	for _, e := range due {
-		if !e.expiresAt.IsZero() {
-			deadline = minTime(deadline, e.expiresAt)
-		}
+		earliest = minTime(earliest, e.expiresAt)
 	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	ctx, cancel := context.WithDeadline(ctx, heartbeatDeadline(time.Now(), earliest))
 	defer cancel()
 	exts := make([]MultiExtension, len(due))
 	for i, entry := range due {

@@ -106,11 +106,11 @@ func (s *keepAliveScheduler) flush(ctx context.Context, due []*kaEntry) kaResult
 		intervals[i] = entry.intervalMs
 		generations[i] = entry.generation
 	}
-	deadline := time.Now().Add(time.Second)
+	var earliest time.Time
 	for _, e := range due {
-		deadline = minTime(deadline, e.expiresAt)
+		earliest = minTime(earliest, e.expiresAt)
 	}
-	ctx, cancel := context.WithDeadline(ctx, deadline)
+	ctx, cancel := context.WithDeadline(ctx, heartbeatDeadline(time.Now(), earliest))
 	defer cancel()
 	leases, err := s.conn.extendKeepAliveLeases(ctx, names, intervals, generations)
 	return kaResult{leases: leases, err: err, due: due}

@@ -154,16 +154,18 @@ schedule when it fetches them and deregisters them when they settle.
   connection, in one `set_vt_batch_multi` call of at most 100 rows (Go
   `WithExtenderBatchSize`, TypeScript `extenderBatchSize`, Rust
   `renewal_batch_size`). At most one call is in flight.
-- Each call is bounded by one second or the earliest lease deadline in the batch,
-  whichever is sooner. Go and Rust apply the connection's retry policy inside that
-  bound; TypeScript sends the call once.
+- Each call is bounded by the earliest lease deadline in the batch, but by no less
+  than one second and no more than five. Go and Rust apply the connection's retry
+  policy inside that bound; TypeScript sends the call once.
 - The SQL locks rows with `NOWAIT` and re-reads the wall clock after locking, so a
   contended row cannot delay unrelated rows and an old transaction timestamp cannot
   revive an expired lease.
-- Due entries are not re-checked against their deadline before sending. A batch
-  that contains an already expired entry has a time bound in the past and fails at
-  once; its expired entries are lost and the rest are retried after about one
-  second.
+- A due entry whose lease has expired, or expires before the SQL reaches it, is
+  left out of the result and lost on its own; the rest of the batch is renewed
+  normally.
+- A loss is found only when a call returns or reaches its bound, so a lease that
+  expires during a call is reported up to a second after its deadline, and one
+  waiting for the call in flight is reported after that call.
 
 How the client knows a lease's deadline:
 
@@ -227,9 +229,9 @@ one second and 30 days in Rust).
 
 - The queue is renewed when half of its remaining keep-alive has elapsed. Each
   tick renews every due queue of the connection in one
-  `extend_queue_keep_alive_multi` call, bounded by one second or the earliest
-  deadline. Go and Rust apply the connection's retry policy inside that bound;
-  TypeScript sends the call once.
+  `extend_queue_keep_alive_multi` call, bounded by the earliest deadline, but by
+  no less than one second and no more than five. Go and Rust apply the
+  connection's retry policy inside that bound; TypeScript sends the call once.
 - `busy` and transport errors are retried after 100 ms until the last known
   keep-alive deadline.
 - The first deadline after a declaration is the requested interval, counted in Go

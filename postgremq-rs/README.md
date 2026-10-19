@@ -370,12 +370,12 @@ in the background. Renewal is connection-level: one task per `Connection`
 renews the due deliveries of all its consumers with a single
 `set_vt_batch_multi` call per tick (at most `renewal_batch_size` per call). A
 renewal is sent once `extension_threshold` of the remaining lease has passed
-and resets the lease to `vt_secs`. Each call is bounded by one second or the
-earliest confirmed deadline, with the connection's retry policy applied inside
-that bound. A `busy` result or a transport error is retried until the last
-confirmed deadline; a delivery the server no longer reports, or whose confirmed
-lease runs out, has lost its lease: renewal stops and its `stopped()` token is
-cancelled. A delivery whose settlement has started is not reported lost, since
+and resets the lease to `vt_secs`. Each call is bounded by the earliest
+confirmed deadline, but by no less than one second and no more than five, with
+the connection's retry policy applied inside that bound. A `busy` result or a
+transport error is retried until the last confirmed deadline; a delivery the
+server no longer reports, or whose confirmed lease runs out, has lost its lease:
+renewal stops and its `stopped()` token is cancelled. A delivery whose settlement has started is not reported lost, since
 that settlement removes the row on purpose; it leaves the schedule when the
 settlement completes, successfully or not.
 

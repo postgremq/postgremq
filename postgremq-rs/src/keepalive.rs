@@ -20,13 +20,11 @@ use crate::checkout::Checkout;
 use crate::metrics::{Metrics, Operation, sqlx_error_type};
 use crate::options::RetryConfig;
 use crate::retry::{is_retryable, with_retry};
-use crate::scheduler::{Heartbeat, Schedule};
+use crate::scheduler::{Heartbeat, Schedule, heartbeat_deadline};
 use crate::types::{Generation, duration_millis, millis_until};
 
 /// Retry delay after a `busy` outcome or an error.
 const RETRY: Duration = Duration::from_millis(100);
-/// Upper bound for one keep-alive round trip.
-const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 #[derive(Debug)]
 struct Entry {
@@ -231,10 +229,7 @@ pub(crate) async fn flush(
     // rows.
     let timer = metrics.operation(Operation::KeepAlive, None, false);
     let started = Instant::now();
-    let deadline = items
-        .iter()
-        .map(|item| item.expires_at)
-        .fold(started + FLUSH_TIMEOUT, Instant::min);
+    let deadline = heartbeat_deadline(started, items.iter().map(|item| item.expires_at));
     let queues: Vec<String> = items.iter().map(|item| item.queue.to_string()).collect();
     let intervals: Vec<i64> = items
         .iter()

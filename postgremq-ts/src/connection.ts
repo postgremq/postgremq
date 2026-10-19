@@ -106,6 +106,15 @@ function extKey(queue: string, id: number, token: string): string {
   return queue + '\0' + id + '\0' + token;
 }
 
+/** Bounds a heartbeat call by the earliest confirmed deadline in its batch,
+ *  between one and five seconds: an entry about to expire must not fail the call
+ *  for the rest of the batch. The SQL leaves out a row whose deadline has passed, so
+ *  it is reported lost from the result. */
+function heartbeatBudgetMs(deadlines: Date[]): number {
+  const earliest = Math.min(...deadlines.map((d) => d.getTime() - Date.now()));
+  return Math.max(1000, Math.min(5000, earliest));
+}
+
 /**
  * Connection class for PostgreMQ client: the object `connect()` returns.
  * Manages the PostgreSQL pool and provides publish, consume and admin
@@ -1715,7 +1724,7 @@ export class Connection implements IConnection {
               ])
             );
           },
-          Math.min(1000, ...due.map(([, e]) => e.expiresAt.getTime() - Date.now()))
+          heartbeatBudgetMs(due.map(([, e]) => e.expiresAt))
         );
       } catch {
         /* Retry only while the last confirmed lease remains live. */
@@ -1930,7 +1939,7 @@ export class Connection implements IConnection {
           ids,
           tokens,
           vts,
-          Math.min(1000, ...due.map((e) => e.expiresAt.getTime() - Date.now()))
+          heartbeatBudgetMs(due.map((e) => e.expiresAt))
         );
       } catch (error) {
         // Transient failure (setVtBatchMulti makes a single attempt, with no

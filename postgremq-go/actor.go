@@ -205,3 +205,18 @@ func maxTime(a, b time.Time) time.Time {
 	}
 	return b
 }
+
+// Bounds of one heartbeat call's time budget.
+const (
+	minHeartbeatBudget = time.Second
+	maxHeartbeatBudget = 5 * time.Second
+)
+
+// heartbeatDeadline bounds a heartbeat call by the earliest confirmed deadline
+// in its batch (zero = none), between minHeartbeatBudget and
+// maxHeartbeatBudget: an entry about to expire must not fail the call for the
+// rest of the batch. The SQL leaves out a row whose deadline has passed, so it
+// is reported lost from the result.
+func heartbeatDeadline(now, earliest time.Time) time.Time {
+	return maxTime(minTime(now.Add(maxHeartbeatBudget), earliest), now.Add(minHeartbeatBudget))
+}
