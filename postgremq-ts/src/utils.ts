@@ -228,6 +228,20 @@ export function groupSeq(value: unknown): number | null {
   return seq;
 }
 
+/** Return the delay to the earliest deadline, capped at maxDelayMs. */
+export function minDeadlineDelay<T>(
+  entries: Iterable<T>,
+  getDeadlineMs: (entry: T) => number,
+  maxDelayMs: number
+): number {
+  const now = Date.now();
+  let delay = maxDelayMs;
+  for (const entry of entries) {
+    delay = Math.min(delay, getDeadlineMs(entry) - now);
+  }
+  return delay;
+}
+
 /** One deadline shared by all phases of a drain. The losing work is observed. */
 export async function untilDeadline(work: Promise<unknown>, deadline: number): Promise<void> {
   let timer: ReturnType<typeof setTimeout> | undefined;
