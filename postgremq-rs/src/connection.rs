@@ -789,6 +789,13 @@ impl Connection {
     /// The shutdown runs on its own task: cancelling a `close` call does not
     /// cancel the shutdown.
     ///
+    /// `close` waits for in-flight deliveries to settle and handlers to
+    /// return, so awaiting it from inside a handler, or from a consume loop
+    /// while holding an unsettled delivery, waits on itself until
+    /// `shutdown_timeout` passes (forever without one). From such places,
+    /// start it on another task:
+    /// `tokio::spawn(async move { conn.close().await })`.
+    ///
     /// # Examples
     ///
     /// ```no_run

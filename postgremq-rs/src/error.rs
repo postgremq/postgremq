@@ -8,7 +8,8 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// SQLSTATE codes raised by the PostgreMQ SQL functions.
 pub(crate) mod sqlstate {
-    /// The delivery's lease is gone: wrong token, not processing, or expired.
+    /// The delivery's lease is gone: wrong token or not processing (and, for
+    /// extension only, expired).
     pub(crate) const LEASE_LOST: &str = "PMQ01";
     /// A queue or topic does not exist (or an exclusive queue expired).
     pub(crate) const QUEUE_NOT_FOUND: &str = "PMQ02";
@@ -67,9 +68,11 @@ pub(crate) mod sqlstate {
 #[non_exhaustive]
 pub enum Error {
     /// The delivery's lease is no longer held (`PMQ01`): its token was
-    /// superseded, it is no longer processing, or its visibility timeout
-    /// expired. Also returned, without a source, when an already settled
-    /// delivery is settled again.
+    /// superseded or it is no longer processing. Settlement is fenced by the
+    /// delivery token only, so an expired visibility timeout alone does not
+    /// fail it; [`extend`](crate::Delivery::extend) also fails once the
+    /// visibility timeout has expired. Also returned, without a source, when
+    /// an already settled delivery is settled again.
     #[error("lease lost")]
     #[non_exhaustive]
     LeaseLost {

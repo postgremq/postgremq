@@ -37,23 +37,25 @@ export class Message {
   /** Dense 1-based position in the group, in publish commit order; null if ungrouped */
   public readonly groupSeq: number | null;
 
-  /** Visibility timeout expiration */
+  /** Visibility timeout expiration (lease end); updated by auto-extension and setVt */
   public vt: Date;
 
-  /** Internal flag to track if message has been processed */
+  /** Unused: written after a successful terminal call but never read.
+   *  terminalStarted, set before the call, is what blocks repeat calls. */
   private processed: boolean = false;
   private terminalStarted = false;
 
   /** Internal flag to track if onComplete has been called */
   private completeCalled: boolean = false;
 
-  /** AbortController used by the Consumer to signal that this message
-   *  can no longer be acked successfully — the lease was lost server-side
-   *  (auto-extension found the row missing from set_vt_batch_multi's result, or
-   *  set_vt raised PMQ01). Handlers can check `message.signal.aborted` /
-   *  listen for 'abort' to short-circuit work that would otherwise be
-   *  wasted (and may commit non-idempotent side-effects). Mirrors the Go
-   *  client's `msg.StoppedCtx`. */
+  /** AbortController behind `signal`: aborted when the consumer stops (stop,
+   *  close, queue-fatal) or a lost lease is detected (auto-extension saw the
+   *  row omitted from set_vt_batch_multi's result or its deadline pass, or
+   *  set_vt raised PMQ01). Advisory: after a lease loss an ack/nack fails
+   *  only if the message was re-claimed or removed. Handlers can check
+   *  `message.signal.aborted` / listen for 'abort' to short-circuit work that
+   *  would otherwise be wasted (and may commit non-idempotent side-effects).
+   *  Mirrors the Go client's `msg.StoppedCtx`. */
   private readonly _abortController: AbortController = new AbortController();
 
   /** Callback to invoke when message is completed */
@@ -141,14 +143,17 @@ export class Message {
   }
 
   /**
-   * AbortSignal that fires when the message's lease is lost — auto-extension
-   * could not extend the visibility timeout server-side, so any further ack /
-   * nack / setVt call from this consumer will fail with LeaseLostError.
-   * Handlers should check `message.signal.aborted` (or listen for 'abort')
+   * AbortSignal that fires when the consumer stops (stop, close, queue-fatal)
+   * or the client detects the lease is lost (auto-extension could not renew
+   * it, or setVt was rejected as lease lost). With auto-extension disabled,
+   * an expired lease is detected only through setVt. After a lease loss,
+   * setVt fails with LeaseLostError; ack/nack fail only if another consumer
+   * re-claimed the message or the row was removed. Cancellation is advisory:
+   * handlers should check `message.signal.aborted` (or listen for 'abort')
    * and short-circuit work that would otherwise be wasted or commit
    * non-idempotent side effects after the lease has already been lost.
    *
-   *   for await (const msg of consumer) {
+   *   for await (const msg of consumer.messages()) {
    *     for (let i = 0; i < workItems.length; i++) {
    *       if (msg.signal.aborted) break;
    *       await doWork(workItems[i]);
@@ -173,9 +178,9 @@ export class Message {
   }
 
   /**
-   * Cancel this message's signal — invoked by the Consumer when it
-   * determines the lease can no longer be extended.
-   * @internal — for Consumer use only.
+   * Abort this message's signal (idempotent). Called on lease loss (the
+   * connection extender, setVt) and on consumer shutdown.
+   * @internal
    */
   _cancel(): void {
     if (!this._abortController.signal.aborted) {
@@ -184,11 +189,15 @@ export class Message {
   }
 
   /**
-   * Acknowledge the message as successfully processed.
-   * This removes the message from the queue.
+   * Acknowledge the message as successfully processed. Marks this delivery
+   * completed so it is never redelivered; the completed row is kept until
+   * cleanupCompletedMessages() deletes it. Rejects with LeaseLostError if the
+   * delivery was re-claimed or removed.
    *
    * @returns Promise that resolves when acknowledgment is complete
-   * @throws Error if message has already been processed or if acknowledgment fails
+   * @throws Error if ack/nack/release was already attempted on this message;
+   *   LeaseLostError / ValidationError / QueueNotFoundError from the database
+   *   as-is; other failures wrapped in Error
    */
   async ack(): Promise<void> {
     this.checkAlreadyProcessed();
@@ -196,7 +205,6 @@ export class Message {
 
     try {
       await this.dbOperations.ack(this.queueName, this.id, this.consumerToken);
-      // Only mark as processed if the operation succeeded
       this.processed = true;
     } catch (error) {
       throw this.wrapError('Failed to acknowledge message', error);
@@ -208,11 +216,20 @@ export class Message {
   }
 
   /**
-   * Acknowledge the message within an existing transaction.
+   * Acknowledge the message within an existing transaction. The ack takes
+   * effect only if the caller's transaction commits. Never retried.
+   *
+   * `isSettled` becomes true when this call starts, and the message leaves
+   * auto-extension when the call completes, both before the caller commits.
+   * If the transaction rolls back, the lease runs out: the message is
+   * redelivered if attempts remain, otherwise maintenance moves it to the
+   * DLQ.
    *
    * @param tx - The transaction object
    * @returns Promise that resolves when acknowledgment is complete
-   * @throws Error if message has already been processed or if acknowledgment fails
+   * @throws Error if ack/nack/release was already attempted on this message;
+   *   LeaseLostError / ValidationError / QueueNotFoundError from the database
+   *   as-is; other failures wrapped in Error
    */
   async ackWithTransaction(tx: Transaction): Promise<void> {
     this.checkAlreadyProcessed();
@@ -220,7 +237,6 @@ export class Message {
 
     try {
       await this.dbOperations.ack(this.queueName, this.id, this.consumerToken, tx);
-      // Only mark as processed if the operation succeeded
       this.processed = true;
     } catch (error) {
       throw this.wrapError('Failed to acknowledge message with transaction', error);
@@ -232,11 +248,15 @@ export class Message {
 
   /**
    * Negatively acknowledge the message, returning it to the queue
-   * for reprocessing after an optional delay.
+   * for reprocessing after an optional delay. If this was the queue's last
+   * allowed delivery attempt, the message moves to the dead letter queue
+   * instead.
    *
    * @param options - Options for negative acknowledgment
    * @returns Promise that resolves when negative acknowledgment is complete
-   * @throws Error if message has already been processed or if nack fails
+   * @throws Error if ack/nack/release was already attempted on this message;
+   *   LeaseLostError / ValidationError / QueueNotFoundError from the database
+   *   as-is; other failures wrapped in Error
    */
   async nack(options?: MessageOptions): Promise<void> {
     this.checkAlreadyProcessed();
@@ -248,7 +268,6 @@ export class Message {
         : undefined;
 
       await this.dbOperations.nack(this.queueName, this.id, this.consumerToken, delayUntil);
-      // Only mark as processed if the operation succeeded
       this.processed = true;
     } catch (error) {
       throw this.wrapError('Failed to negatively acknowledge message', error);
@@ -259,12 +278,15 @@ export class Message {
   }
 
   /**
-   * Release the message back to the queue without incrementing the
-   * delivery attempt counter. Use this when you haven't actually
-   * attempted to process the message.
+   * Release the message back to the queue, visible immediately, and undo
+   * this delivery's attempt count, so it does not count toward
+   * maxDeliveryAttempts. Use this when you haven't actually attempted to
+   * process the message.
    *
    * @returns Promise that resolves when release is complete
-   * @throws Error if message has already been processed or if release fails
+   * @throws Error if ack/nack/release was already attempted on this message;
+   *   LeaseLostError / ValidationError / QueueNotFoundError from the database
+   *   as-is; other failures wrapped in Error
    */
   async release(): Promise<void> {
     this.checkAlreadyProcessed();
@@ -272,7 +294,6 @@ export class Message {
 
     try {
       await this.dbOperations.release(this.queueName, this.id, this.consumerToken);
-      // Mark as processed to prevent multiple releases
       this.processed = true;
     } catch (error) {
       throw this.wrapError('Failed to release message', error);
@@ -283,11 +304,17 @@ export class Message {
   }
 
   /**
-   * Extend the visibility timeout for this message.
+   * Set this message's lease to end `newVt` seconds from now (not added to
+   * the current lease). Independent of auto-extension, which resets the
+   * lease to visibilityTimeoutSec at its next run.
    *
-   * @param newVt - New visibility timeout in seconds
+   * @param newVt - New lease duration in whole seconds from now
    * @returns Promise that resolves to the new expiration date
-   * @throws Error if message has already been processed or if extension fails
+   * @throws LeaseLostError (and aborts `signal`) if the lease expired, or the
+   *   delivery was re-claimed or removed
+   * @throws ValidationError if newVt is negative
+   * @throws Error if ack/nack/release was already attempted on this message
+   *   (no database call is made); other failures wrapped in Error
    */
   async setVt(newVt: number): Promise<Date> {
     this.checkAlreadyProcessed();
@@ -308,8 +335,8 @@ export class Message {
   }
 
   /**
-   * Check if the message has already been processed
-   * @throws Error if message has already been processed
+   * Check whether a terminal call (ack/nack/release) was already attempted
+   * @throws Error if one was, whether or not it succeeded
    */
   private checkAlreadyProcessed(): void {
     if (this.terminalStarted) {

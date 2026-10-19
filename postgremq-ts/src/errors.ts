@@ -7,7 +7,9 @@
  * ErrQueueNotFound, ErrValidation).
  *
  * Use `instanceof LeaseLostError` (or check `err.code === 'PMQ01'`) to
- * branch on the failure mode.
+ * branch on the failure mode. Some admin methods (e.g. deleteQueue,
+ * cleanUpTopic, cleanupCompletedMessages) pass the database error through
+ * unmapped; match those on `err.code`.
  */
 
 import { formatSchemaVersion } from './schema-version';
@@ -20,11 +22,13 @@ export const ErrCodeQueueNotFound = 'PMQ02';
 export const ErrCodeValidation = 'PMQ03';
 
 /**
- * LeaseLostError is thrown by ack/nack/release/setVt/setVtBatch when the
- * consumer's lease is no longer valid: the visibility timeout expired,
- * the consumer token doesn't match (another consumer re-consumed), or
- * the message is no longer in 'processing' state. Handlers must be
- * idempotent — receiving this error means another consumer may have
+ * LeaseLostError is thrown by ack/ackWithTransaction/nack/release/setVt when
+ * this consumer does not hold the delivery: it was settled, re-claimed by
+ * another consumer (token mismatch) or removed (e.g. cleanUpQueue,
+ * deleteQueueMessage, queue deletion). Settlement is fenced by the delivery
+ * token only: an expired visibility timeout alone does not fail
+ * ack/nack/release, but setVt also fails once it has expired. Handlers must
+ * be idempotent — receiving this error means another consumer may have
  * processed the same message.
  */
 export class LeaseLostError extends Error {
@@ -38,7 +42,9 @@ export class LeaseLostError extends Error {
 /**
  * QueueNotFoundError is thrown when a referenced queue or topic does not
  * exist (or is an expired exclusive queue). Usually a misconfiguration
- * — the operation will fail until the queue/topic is created.
+ * — the operation will fail until the queue/topic is created (an expired
+ * exclusive queue must be deleted first). A consumer whose queue is gone
+ * reports QueueFatalError instead.
  */
 export class QueueNotFoundError extends Error {
   readonly code = ErrCodeQueueNotFound;
@@ -52,8 +58,12 @@ export class QueueNotFoundError extends Error {
  * ValidationError is thrown on caller-rejection paths: input validation
  * failures (negative timeouts, mismatched batch arrays, names containing
  * characters outside `[A-Za-z0-9_:.\-]`) AND state-precondition failures
- * (exclusive-queue duplicate, deleting a topic that still has messages).
- * The common thread is "the request was rejected before any state change."
+ * (a queue re-created with different parameters, deleting a topic that
+ * still has messages). The common thread is "the request was rejected
+ * before any state change." Preconditions checked by deleteQueue (DLQ
+ * entries) and cleanUpTopic (messages in the DLQ) arrive as a database
+ * error with code 'PMQ03' instead; the client-side option checks of the
+ * connection options, createQueue and maxInFlight throw a plain Error.
  */
 export class ValidationError extends Error {
   readonly code = ErrCodeValidation;
@@ -85,10 +95,12 @@ export class QueueFatalError extends Error {
 }
 
 /**
- * ConnectionClosedError is thrown by `connect()` when the connection has
- * already been closed. close() is terminal: a connection cannot be
- * resurrected — callers must construct a new Connection. Mirrors the Go
- * client's ErrConnectionClosed sentinel.
+ * ConnectionClosedError is thrown by `connect()` after close(), and by
+ * operations on a connection that is not connected (before connect() or
+ * after close(); publish, publishWithTransaction, consume, consumeHandler,
+ * createTopic and createQueue also once close() has begun). close() is terminal: a connection cannot be
+ * resurrected — use the package-level `connect()` to get a new one. Mirrors
+ * the Go client's ErrConnectionClosed sentinel.
  *
  * Pure client-side error (no SQLSTATE), so it carries no `code`.
  */

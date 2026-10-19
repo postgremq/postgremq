@@ -15,10 +15,11 @@ var _ scheduler[*extEntry, extKey, extResult] = (*extScheduler)(nil)
 // Leases remain registered throughout graceful drain, until settlement or loss.
 
 const (
-	// ExtendWindowPercent defines what percentage of the VT period to use as the
-	// extension window. Messages due within this window are batched together for
-	// efficiency.
-	ExtendWindowPercent = 20 // 20% of VT period
+	// ExtendWindowPercent is unused: the connection-level extender schedules
+	// each delivery by WithExtensionThreshold.
+	//
+	// Deprecated: it has no effect and will be removed in a future release.
+	ExtendWindowPercent = 20
 
 	// defaultExtenderBatchSize bounds how many messages one tick extends in a
 	// single set_vt_batch_multi call (statement-size guard, not correctness —

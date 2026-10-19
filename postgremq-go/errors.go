@@ -11,8 +11,10 @@ import (
 // match on the code via mapPgError, never on the human-readable text.
 const (
 	// ErrCodeLeaseLost is raised by ack/nack/release/set_vt when
-	// the consumer's lease is no longer valid: vt expired, token mismatch, or
-	// the message is no longer in the 'processing' state.
+	// the consumer's lease is no longer valid: token mismatch, or the message
+	// is no longer in the 'processing' state. Settlement is fenced by the
+	// delivery token only: an expired vt alone does not fail ack/nack/release,
+	// but set_vt also fails once vt has expired.
 	ErrCodeLeaseLost = "PMQ01"
 
 	// ErrCodeQueueNotFound is raised when a referenced queue or topic does

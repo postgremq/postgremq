@@ -578,7 +578,7 @@ scheduler:
 
 | Job | Suggested interval | Purpose |
 |---|---|---|
-| `SELECT * FROM postgremq.pmq_maintenance_fast();` | every 1–10 s, at most every 60 s | Retires abandoned final attempts to the DLQ and reaps expired exclusive queues. |
+| `SELECT * FROM postgremq.pmq_maintenance_fast();` | every 1–10 s, at least once every 60 s | Retires abandoned final attempts to the DLQ and reaps expired exclusive queues. |
 | `SELECT postgremq.cleanup_completed_messages(24, 1000);` | every 10–60 s | Deletes completed delivery rows past retention, then collects unreferenced payloads. |
 
 The `pmq_maintenance_fast` interval sets how long these wait:

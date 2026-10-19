@@ -10,13 +10,15 @@ import (
 // either, it is auto-acked only if its context is still live. A cancelled
 // return or panic is auto-nacked; explicit settlement takes precedence.
 //
-// The context is cancelled when the consumer is stopping - handlers should
+// The context is cancelled when the consumer is stopping or, with
+// auto-extension (the default), the message's lease is lost - handlers should
 // check ctx.Done() and return promptly.
 type MessageHandler func(ctx context.Context, msg *Message)
 
 // HandlerConsumer wraps a Consumer and dispatches messages to a handler function
-// with concurrency limiting. Messages are automatically acked if the handler
-// returns without calling Ack/Nack, and automatically nacked on panic.
+// with concurrency limiting. A message the handler did not settle is
+// automatically acked if the handler returned with its context live, and
+// automatically nacked if the context was cancelled or the handler panicked.
 type HandlerConsumer struct {
 	conn        *Connection
 	consumer    *Consumer
@@ -159,7 +161,9 @@ func (hc *HandlerConsumer) callHandler(msg *Message) (panicked bool) {
 }
 
 // Stop signals the handler consumer to stop and waits for all handlers to complete.
-// This method blocks until all in-flight handlers have finished.
+// This method blocks until all in-flight handlers have finished, with no
+// timeout of its own, so calling it from inside one of its handlers waits on
+// itself. Call it from another goroutine there (go hc.Stop()).
 func (hc *HandlerConsumer) Stop() {
 	// Stop underlying consumer first (non-blocking) to stop new messages arriving
 	// and cancel StoppedCtx for in-flight messages (signals handlers to stop)

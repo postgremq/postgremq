@@ -431,7 +431,7 @@ await client.purgeAllMessages();
 The database does not schedule its own maintenance. Run these from a scheduler in one place, for example a single worker or a cron job:
 
 ```typescript
-// Frequently (for example every few seconds): move final-attempt messages whose consumer crashed to the
+// Every 1–10 seconds (at least once a minute): move final-attempt messages whose consumer crashed to the
 // dead letter queue, and remove expired exclusive queues.
 const { retiredToDlq, inactiveQueuesDropped } = await client.maintenanceFast();
 

@@ -13,12 +13,12 @@ import { ValidationError, QueueNotFoundError, QueueFatalError } from './errors';
  * Validate consumer options at construction, mirroring the Go client's
  * validateConsumeOptions. Throws ValidationError synchronously so misuse
  * surfaces at consume()/consumeHandler() rather than as a silent hang
- * (e.g. batchSize 0 never fetches) or a never-extended lease (e.g.
- * extensionThreshold outside (0, 1) puts every extension time in the past).
+ * (e.g. batchSize 0 never fetches) or a mis-scheduled lease (e.g. an
+ * extensionThreshold <= 0 re-extends continuously, >= 1 schedules the
+ * extension at or after lease expiry).
  *
- * visibilityTimeoutSec === 0 is treated as "use the default" (Go maps
- * 0 -> 30) rather than rejected, so it is validated by the caller after the
- * default has been applied.
+ * visibilityTimeoutSec 0 is accepted and replaced by the default (30) in the
+ * constructor, as Go maps 0 -> 30.
  */
 export function validateConsumerOptions(options: Partial<ConsumerOptions>): void {
   for (const [name, value] of Object.entries({
@@ -97,7 +97,7 @@ export class Consumer {
     topic: '',
   };
 
-  /** Map of in-flight messages by ID */
+  /** In-flight (delivered or buffered, not yet settled) messages, keyed by consumer token */
   private inFlightMessages: Map<string, Message> = new Map();
 
   /** Buffer of fetched messages waiting to be consumed */
@@ -125,15 +125,11 @@ export class Consumer {
    *  its successor claimable), so one more fetch follows it. */
   private wokeDuringFetch: boolean = false;
 
-  /** Promise that resolves when the currently in-flight fetch completes
-   *  (success or error), or null when no fetch is running. Set
-   *  synchronously at triggerFetch() — before any await — so stop() can
-   *  reliably wait for messages a fetch already claimed server-side to
-   *  reach the buffer/inFlight tracking, even if the SQL call takes
-   *  longer than the old 1s spin cap. Without this, a fetch in progress
-   *  during stop() leaks: consume_message has already moved rows to
-   *  'processing', but the consumer is gone before the messages get
-   *  released, so the rows sit until vt expires. */
+  /** Promise of the fetch in progress (settles on success or error), or null.
+   *  Set synchronously in triggerFetch(), before any await. stop() awaits it:
+   *  a fetch that completes after stop releases the rows it claimed instead
+   *  of delivering them (see fetchMessages); stop() waits for those releases
+   *  until its shutdown deadline. */
   private fetchInFlight: Promise<void> | null = null;
 
   /** Notification unsubscribe function */
@@ -248,8 +244,10 @@ export class Consumer {
     });
   }
 
-  /** Deregister `messageId` from the connection-level extender. No-op if
-   *  auto-extension is disabled. */
+  /** Called once when `message` settles (a terminal call was attempted):
+   *  drop it from in-flight tracking, deregister it from the connection
+   *  extender (no-op if never registered), and resolve the drain wait when
+   *  nothing remains in flight. */
   private handleMessageComplete(message: Message): void {
     this.inFlightMessages.delete(message.consumerToken);
     this.connection.extenderDeregister(this.queueName, message.id, message.consumerToken);
@@ -319,8 +317,9 @@ export class Consumer {
         return;
       }
 
-      // Fetch messages. A PMQ02 here means the queue was deleted out-of-band:
-      // it's fatal for this consumer (it can never get messages again). Escalate
+      // Fetch messages. A PMQ02 here means the queue this consumer bound to is
+      // gone (deleted, recreated, or an expired exclusive queue): it's fatal
+      // for this consumer (it can never get messages again). Escalate
       // to the connection's queueFatal — which tears this consumer (and any
       // siblings on the queue) down and fires the queue-fatal signal — instead
       // of letting the error fall through to the 1s fetch-retry loop forever.
@@ -450,7 +449,10 @@ export class Consumer {
   }
 
   /**
-   * Stop the consumer
+   * Stop the consumer (idempotent): stop fetching, release buffered
+   * (undelivered) messages, fire each in-flight message's `signal`, and wait
+   * up to the connection's shutdownTimeoutMs for in-flight messages to
+   * settle. onClose listeners fire when it completes.
    * @returns Promise that resolves when consumer is stopped
    */
   stop(): Promise<void> {
@@ -485,14 +487,20 @@ export class Consumer {
   }
 
   /**
-   * getQueueName reports the queue this consumer is bound to. Used by the
-   * connection's queueFatal routing to find consumers on a gone queue.
+   * The generation (incarnation) of the queue this consumer resolved;
+   * undefined before its first fetch. Used to ignore fatal signals for an
+   * older incarnation.
    * @internal
    */
   getQueueGeneration(): string | undefined {
     return this.generation;
   }
 
+  /**
+   * getQueueName reports the queue this consumer is bound to. Used by the
+   * connection's queueFatal routing to find consumers on a gone queue.
+   * @internal
+   */
   getQueueName(): string {
     return this.queueName;
   }
@@ -540,8 +548,13 @@ export class Consumer {
   }
 
   /**
-   * Create an asynchronous iterator for consuming messages
+   * Create an asynchronous iterator for consuming messages. The first call
+   * starts the consumer (LISTEN and the first fetch). Leaving a `for await`
+   * loop early (break, return, throw) stops the consumer.
    * @returns Asynchronous iterator that yields messages
+   * @throws Error synchronously if the queue's topic is unknown (no `topic`
+   *   option was given and the connection has not learned it from
+   *   createQueue() or an earlier consumer's `topic`)
    */
   messages(): AsyncIterableIterator<Message> {
     // Start the consumer if not already running
@@ -616,8 +629,10 @@ export class Consumer {
 
       // Called by the runtime when the consumer of `for await ... of` exits
       // early — break, return, throw, an outer-scope catch. Without this, the
-      // auto-extension timer, LISTEN refcount, and any buffered/in-flight
-      // messages would leak until the GC eventually finalized the iterator.
+      // LISTEN subscription, the buffered messages (released by stop) and the
+      // connection extender's entries for in-flight messages would stay until
+      // connection.close(). return() stops the consumer, which waits up to
+      // shutdownTimeoutMs for in-flight messages to settle.
       return: async (): Promise<IteratorResult<Message>> => {
         await this.stop();
         return { done: true, value: undefined as any };

@@ -82,7 +82,7 @@ function quoteIdent(s: string): string {
 interface KeepAliveEntry {
   generation: string;
   intervalSec: number;
-  nextAt: Date; // when to extend next (= last + interval/2)
+  nextAt: Date; // when to extend next: halfway to the confirmed deadline, or ~100ms while retrying
   expiresAt: Date;
 }
 
@@ -99,22 +99,18 @@ interface ExtEntry {
   onExtended: (vt: Date) => void; // keep message.vt current after an extension
 }
 
-/** Composite (queue, message_id) key — message_id alone collides across queues
- *  because distribute_message fans one message into every queue on the topic. */
+/** Delivery-identity key (queue, message_id, consumer_token). message_id alone
+ *  collides across queues because distribute_message fans one message into
+ *  every queue on the topic, and each claim mints a new token. */
 function extKey(queue: string, id: number, token: string): string {
   return queue + '\0' + id + '\0' + token;
 }
 
-// Forward declaration for Consumer
-// export class Consumer {
-//   constructor(queueName: string, connection: Connection, options?: Partial<ConsumerOptions>) {}
-//   async stop(): Promise<void> { return Promise.resolve(); }
-// }
-
 /**
- * Connection class for PostgreMQ client
- * Manages the connection to PostgreSQL and provides methods for
- * queue operations.
+ * Connection class for PostgreMQ client: the object `connect()` returns.
+ * Manages the PostgreSQL pool and provides publish, consume and admin
+ * operations. It owns the connection-level keep-alive and vt-extension
+ * actors and the LISTEN client its consumers share. close() is terminal.
  */
 export class Connection implements IConnection {
   /** @internal Shared instrumentation for the connection and its handlers. */
@@ -142,8 +138,8 @@ export class Connection implements IConnection {
 
   // ---- Connection-level keep-alive actor ----
   // One timer per connection batches every exclusive queue's keep-alive into a
-  // single extend_queue_keep_alive_multi call per tick (collapsing the former
-  // per-queue timer + interval Maps). Mirrors the Go client's keep-alive actor.
+  // single extend_queue_keep_alive_multi call per tick. Mirrors the Go
+  // client's keep-alive actor.
   /** Per-queue keep-alive schedule, keyed by queue name. */
   private keepAliveEntries: Map<string, KeepAliveEntry> = new Map();
   /** Single timer that fires at the earliest pending keep-alive. */
@@ -152,17 +148,18 @@ export class Connection implements IConnection {
   private keepAliveFlushing = false;
 
   // ---- Connection-level visibility-timeout extender actor ----
-  // Auto-extension moved off the per-consumer schedule onto one connection
-  // timer that coalesces every consumer's due extensions into a single
-  // set_vt_batch_multi call per tick. Keyed by the COMPOSITE (queue, id) — the
-  // same message_id distributed to two queues is two independent entries.
-  /** In-flight messages awaiting extension, keyed by `${queue}\0${id}`. */
+  // One timer per connection coalesces up to `extenderBatchSize` of every
+  // consumer's due extensions into one set_vt_batch_multi call per tick.
+  // Keyed by (queue, id, token): the same message_id in two queues, or
+  // re-claimed with a new token, is a separate entry.
+  /** In-flight messages awaiting extension, keyed by `extKey(queue, id, token)`. */
   private extenderEntries: Map<string, ExtEntry> = new Map();
   /** Single timer that fires at the earliest pending extension. */
   private extenderTimer: NodeJS.Timeout | null = null;
   /** True while an extension flush is awaiting the DB (prevents overlap). */
   private extenderFlushing = false;
-  /** Backoff floor after a transient extension failure. */
+  /** Unused: only ever reset to null. A transient extension failure defers
+   *  each entry instead (see flushExtender). */
   private extenderTryAfter: Date | null = null;
   /** Per-tick cap on messages extended in one call (ConnectionOptions.extenderBatchSize). */
   private readonly extenderBatchCap: number;
@@ -170,12 +167,13 @@ export class Connection implements IConnection {
   /** Set once close() has drained consumers and stopped the background actors
    *  (keep-alive + extender). Gates the actors instead of isShuttingDown so
    *  they keep running THROUGH the consumer drain and stop only after,
-   *  mirroring the Go client's separate keepAliveCtx/extenderCtx cancelled last. */
+   *  mirroring the Go client, which stops its keep-alive and extender actors
+   *  after the consumer drain. */
   private backgroundStopped = false;
 
   /** Emitter for connection-level events the application can observe.
    *  Emits 'queueFatal' (queue, QueueFatalError) when a queue becomes gone and
-   *  its consumers are torn down. */
+   *  teardown of its consumers has begun. */
   private readonly events: EventEmitter = new EventEmitter();
 
   /** Optional callback invoked alongside the 'queueFatal' event. */
@@ -194,29 +192,31 @@ export class Connection implements IConnection {
   /** Flag indicating if client is connected */
   private connected: boolean = false;
 
-  /** Flag indicating if notification listener is active */
+  /** Abort controller of the running notification loop; null when none runs. */
   private notifyController: AbortController | null = null;
   private notifyWake = createDeferred<void>();
 
   /**
    * Refcounted state for each NOTIFY channel we want to receive events on.
    * The first subscriber to a channel triggers a LISTEN; the last unsubscribe
-   * triggers UNLISTEN. Multiple consumers on the same topic share one
-   * physical LISTEN.
+   * triggers UNLISTEN while other channels remain (when the last channel goes,
+   * the notification loop is stopped instead). Multiple consumers on the same
+   * topic share one physical LISTEN.
    */
   private channelStates: Map<string, ChannelState> = new Map();
 
   /**
-   * Cache of queue name -> topic name. Populated by createQueue (and by
-   * explicit `topic` option when consume() is called) so consume() knows
-   * which per-topic channel to subscribe to without querying the database.
+   * Cache of queue name -> topic name. Populated by createQueue, and by
+   * resolveTopic when a consumer starts (messages() or consumeHandler) with
+   * an explicit `topic` option, so a consumer knows which per-topic channel
+   * to subscribe to without querying the database.
    */
   private topicCache: Map<string, string> = new Map();
   private queueGenerations = new Map<string, string>();
 
   /**
-   * Promise used to serialise concurrent listener startup so multiple
-   * consumers don't each acquire their own notify client.
+   * Promise of the running notification loop; non-null while it runs, so all
+   * subscribers share one notify client.
    */
   private notifyStartupPromise: Promise<void> | null = null;
 
@@ -226,6 +226,9 @@ export class Connection implements IConnection {
   /**
    * Create a new connection manager
    * @param options - Connection options
+   * @throws Error if shutdownTimeoutMs or a retry policy value is not a
+   *   positive finite number <= 2147483647, retry.maxAttempts is not an
+   *   integer, or extenderBatchSize is not a positive integer
    */
   constructor(options: ConnectionOptions = {}) {
     this.telemetry = new ClientMetrics(options.meterProvider);
@@ -306,13 +309,15 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Connect to the database and start the notification listener.
+   * Connect to the database and check the installation's schema version.
+   * The notification listener starts later, when the first consumer starts
+   * consuming.
    *
    * close() is terminal — once a connection has been closed, calling
    * connect() again throws ConnectionClosedError rather than silently
    * succeeding into a half-broken state (the pool may have been .end()'d,
-   * notification machinery torn down, etc.). Callers must construct a
-   * new Connection to reconnect.
+   * notification machinery torn down, etc.). Use the package-level
+   * `connect()` to get a new connection.
    *
    * It reads `postgremq.info()` and rejects a database whose schema version
    * has an mq major not in `SUPPORTED_MQ_MAJORS`, that reports no schema
@@ -338,7 +343,21 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Close the connection and clean up resources
+   * Close the connection and clean up resources. Idempotent and terminal.
+   *
+   * Every consumer stops: fetching ends, buffered (undelivered) messages are
+   * released, and each in-flight message's `signal` fires. Close then waits
+   * up to `shutdownTimeoutMs` for in-flight messages to settle, with
+   * keep-alive and auto-extension still running, and then stops those
+   * actors. The notification listener stops once the last consumer
+   * unsubscribes, which happens as consumers start draining. It ends the pool only if this
+   * connection created it; a `pool` passed in the options stays open.
+   *
+   * Close waits for delivered messages, so awaiting it inside a message
+   * handler, or in a `for await` loop while holding an unsettled message,
+   * waits on itself until `shutdownTimeoutMs` passes. Start it without
+   * awaiting there (`void client.close()`), or call it from outside the
+   * handler.
    * @returns Promise that resolves when disconnected
    */
   close(): Promise<void> {
@@ -377,15 +396,16 @@ export class Connection implements IConnection {
     }
   }
 
-  /** Remaining drain budget; consumers use the same deadline during Close. */
+  /** Remaining drain budget; consumers use the same deadline during Close. @internal */
   getShutdownTimeoutMs(): number {
     return Math.max(0, Math.min(this.shutdownTimeoutMs, this.closeDeadline - Date.now()));
   }
 
   /**
-   * Start the notification listener
+   * Start the notification loop in the background unless one is running, the
+   * connection is closing, or no channel has subscribers. The loop restarts
+   * itself if a subscriber arrives while the previous loop is tearing down.
    * @internal
-   * @returns Promise that resolves when listener is started
    */
   private startNotificationListener(): void {
     if (this.notifyStartupPromise || this.isShuttingDown || !this.channelStates.size) return;
@@ -474,7 +494,8 @@ export class Connection implements IConnection {
   /**
    * Subscribe to NOTIFY events on a single channel. Refcounts the channel so
    * the first subscriber issues LISTEN and the last unsubscribe issues
-   * UNLISTEN. Returns an unsubscribe function.
+   * UNLISTEN (or, when no channel remains, stops the notification loop).
+   * Returns an unsubscribe function.
    * @internal
    */
   private subscribeChannel(channel: string, callback: SubscriberCallback): () => void {
@@ -500,7 +521,8 @@ export class Connection implements IConnection {
 
   /**
    * Subscribe a consumer to both the per-topic publish channel and the
-   * per-queue nack/release channel. Returns a single unsubscribe function
+   * per-queue wake channel `pmq:q:<queue>` (nack, release, DLQ requeue, and
+   * group-successor wakeups). Returns a single unsubscribe function
    * that drops both subscriptions.
    * @internal
    */
@@ -532,12 +554,6 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Handle errors from the notification client
-   * @internal
-   * @param error - The error that occurred
-   */
-
-  /**
    * Register a consumer with this connection
    * @internal
    * @param consumer - The consumer to register
@@ -565,8 +581,8 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Stop the notification listener if running.
-   * Ensures the dedicated client is unlistened, listeners removed, and released.
+   * Abort the notification loop and wait for it to exit; its client is
+   * destroyed (dropping all LISTENs) and its listeners removed.
    */
   private async stopNotificationListener(): Promise<void> {
     this.notifyController?.abort();
@@ -579,6 +595,7 @@ export class Connection implements IConnection {
    * @internal
    * @param operation - The operation to execute
    * @param retryPolicy - The retry policy to use
+   * @param retryable - Which errors are retried (default shouldRetry)
    * @returns The result of the operation
    */
   async executeWithRetry<T>(
@@ -681,11 +698,15 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Publish a message to a topic
+   * Publish a message to a topic. Under the retry policy it retries only
+   * serialization failures and deadlocks (40001 / 40P01).
    * @param topic - The topic name
    * @param payload - The message payload
    * @param options - Publishing options
    * @returns Promise resolving to the message ID
+   * @throws QueueNotFoundError if the topic does not exist
+   * @throws ValidationError for an invalid group key
+   * @throws ConnectionClosedError if not connected, or once close() has begun
    */
   async publish(topic: string, payload: any, options: PublishOptions = {}): Promise<number> {
     return this.telemetry.operation('publish', topic, false, async () => {
@@ -765,10 +786,15 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Create a consumer for a queue
+   * Create a consumer for a queue. The consumer does nothing until
+   * messages() is called. An unknown topic (no `options.topic` is given and
+   * this connection has not learned it from createQueue() or an earlier
+   * consumer's `topic`) throws from messages(), not from here.
    * @param queue - The queue name
    * @param options - Consumer options
    * @returns A new consumer instance
+   * @throws ValidationError for invalid consumer options
+   * @throws ConnectionClosedError if not connected, or once close() has begun
    */
   consume(queue: string, options: Partial<ConsumerOptions> = {}): ConsumerImpl {
     if (!this.connected || this.isShuttingDown) {
@@ -785,19 +811,23 @@ export class Connection implements IConnection {
    *
    * Each message is dispatched to `handler`. The push-based counterpart to
    * consume()'s `for await` iteration, mirroring the Go client's
-   * ConsumeHandler. Settlement rules:
-   *   - live handler returns without settlement  -> message auto-acked
-   *   - handler throws or returns cancelled       -> message auto-nacked
-   *   - handler settles the message itself        -> no automatic action
+   * ConsumeHandler. The auto-ack / auto-nack settlement rules are documented
+   * on {@link MessageHandler}.
    *
    * `options.maxInFlight` bounds how many handlers run concurrently (0 =
    * unlimited, the default). Handlers receive a message whose `signal`
-   * fires on shutdown / lease loss; long-running handlers should check it.
+   * fires on shutdown, or on lease loss detected by auto-extension or a
+   * failed setVt; long-running handlers should check it.
    *
    * @param queue - The queue name
    * @param handler - Per-message handler
    * @param options - Consumer options plus maxInFlight
    * @returns A started HandlerConsumer; call stop() to shut it down
+   * @throws Error synchronously if the queue's topic is unknown (no
+   *   `options.topic` is given and this connection has not learned it from
+   *   createQueue() or an earlier consumer's `topic`), or if maxInFlight is not a non-negative integer
+   * @throws ValidationError for invalid consumer options
+   * @throws ConnectionClosedError if not connected, or once close() has begun
    *
    * @example
    *   const hc = connection.consumeHandler('orders', async (msg) => {
@@ -828,9 +858,10 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Create a new topic
-   * @param topic - The topic name
+   * Create a new topic. Idempotent: an existing topic is left as is.
+   * @param topic - The topic name: `^[A-Za-z0-9_:.\-]+$`, at most 57 bytes
    * @returns Promise that resolves when the topic is created
+   * @throws ValidationError for an invalid or too long name
    */
   async createTopic(topic: string): Promise<void> {
     if (!this.connected || this.isShuttingDown) {
@@ -847,12 +878,22 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Create a new queue
-   * @param name - The queue name
+   * Create a new queue. Idempotent when the parameters match an existing
+   * queue (re-creating a live exclusive queue also refreshes its
+   * keep-alive). An exclusive queue is registered with this connection's
+   * keep-alive actor, which extends it until deleteQueue() is called, the
+   * queue goes fatal, or the connection closes.
+   * @param name - The queue name: `^[A-Za-z0-9_:.\-]+$`, at most 57 bytes
    * @param topic - The topic name
    * @param exclusive - Whether the queue is exclusive (temporary, kept alive by this connection)
-   * @param options - Queue options
+   * @param options - Queue options (keepAliveInterval defaults to 300 s)
    * @returns Promise that resolves when the queue is created
+   * @throws QueueNotFoundError if the topic does not exist, or the queue is an
+   *   expired exclusive queue (delete it first)
+   * @throws ValidationError for an invalid name, or if the queue already
+   *   exists with different parameters
+   * @throws Error if keepAliveInterval is below 0.001 or maxDeliveryAttempts
+   *   is not an integer in [0, 2147483647]
    */
   async createQueue(
     name: string,
@@ -887,13 +928,10 @@ export class Connection implements IConnection {
           [name, topic, maxDeliveryAttempts, exclusive, keepAliveSeconds]
         );
 
-        // Exclusive queues expire unless the client keeps refreshing
-        // keep_alive_until. Start the refresh timer on `exclusive` alone
-        // (matching Go) — gating on an explicit keepAliveInterval meant an
-        // exclusive queue created with the default interval was never
-        // refreshed client-side and got reaped after ~300s if consumption
-        // paused. Use the same default (300s) as the server-side
-        // keep_alive_until set above and as Go's 5-minute default.
+        // Exclusive queues expire unless the client keeps extending
+        // keep_alive_until; consuming does not refresh it. Register every
+        // exclusive queue with the keep-alive actor (matching Go), using the
+        // interval passed to create_queue (default 300s, matching SQL and Go).
         const generation = created.rows[0].create_queue as string;
         this.queueGenerations.set(name, generation);
         if (exclusive) {
@@ -912,9 +950,12 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Delete a topic
+   * Delete a topic and, by cascade, every queue subscribed to it. A no-op if
+   * the topic does not exist.
    * @param topic - The topic name
    * @returns Promise that resolves when the topic is deleted
+   * @throws ValidationError while any message of the topic exists (including
+   *   completed, retained ones); run cleanUpTopic() first
    */
   async deleteTopic(topic: string): Promise<void> {
     if (!this.connected) {
@@ -931,9 +972,13 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Delete a queue
+   * Delete a queue and all its deliveries, in-flight ones included. A no-op
+   * if the queue does not exist. Running consumers on the queue are not
+   * stopped here: their next fetch finds it gone and they go queue-fatal.
    * @param queue - The queue name
    * @returns Promise that resolves when the queue is deleted
+   * @throws a database error with code 'PMQ03' while the queue has DLQ
+   *   entries (requeueDLQMessages() or purgeDLQ() first)
    */
   async deleteQueue(queue: string): Promise<void> {
     if (!this.connected) {
@@ -992,7 +1037,9 @@ export class Connection implements IConnection {
 
   /**
    * Get statistics for a queue
-   * @param queue - Optional queue name (if omitted, gets stats for all queues)
+   * @param queue - Optional queue name (if omitted, totals across all
+   *   queues; an unknown queue gives zeros). Completed deliveries count until
+   *   cleanupCompletedMessages() deletes them; DLQ entries are not counted.
    * @returns Promise that resolves to queue statistics
    */
   async getQueueStatistics(queue?: string): Promise<QueueStatistics> {
@@ -1027,13 +1074,18 @@ export class Connection implements IConnection {
   /**
    * Bundle the latency-sensitive maintenance routines into one call: retire
    * crashed-final-attempt rows to DLQ + reap expired exclusive queues. Run
-   * on a 30-60 second cron (≤ ½ × the shortest keepAliveInterval in your
-   * queues so dead exclusive queues are reaped within ~1.5× their interval).
+   * it every 1–10 seconds, and at least once every 60 seconds (see the mq
+   * README, "Maintenance and retention").
    *
-   * nack_message already retires the final attempt inline; this only catches
-   * rows whose consumer crashed mid-handler. cleanup_completed_messages
-   * stays separate — it's a latency-tolerant bulk DELETE governed by
-   * retention policy.
+   * nack_message already retires the final attempt inline; this catches every
+   * final-attempt delivery still 'processing' after its lease expired,
+   * whatever the cause (e.g. a consumer that crashed mid-handler).
+   * cleanup_completed_messages stays separate — it's a latency-tolerant bulk
+   * DELETE governed by retention policy.
+   *
+   * @returns `retiredToDlq` (deliveries moved to the DLQ) and
+   *   `inactiveQueuesDropped` (expired exclusive queues deleted; queues with
+   *   DLQ entries are skipped)
    */
   async maintenanceFast(): Promise<{ retiredToDlq: number; inactiveQueuesDropped: number }> {
     if (!this.connected) {
@@ -1074,7 +1126,8 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Move messages from the Dead Letter Queue back to their original queue
+   * Move this queue's DLQ entries back into it as pending deliveries
+   * (delivery attempts reset to 0) and wake its consumers.
    * @param queue - The queue name
    * @returns Promise that resolves when messages are requeued
    */
@@ -1089,7 +1142,8 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Purge all messages from the Dead Letter Queue
+   * Purge all messages from the Dead Letter Queue, in every queue. Payloads
+   * are left for retention cleanup.
    * @returns Promise that resolves when DLQ is purged
    */
   async purgeDLQ(): Promise<void> {
@@ -1103,7 +1157,10 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Purge all messages from the system
+   * Delete every message in the system: all DLQ entries, deliveries
+   * (in-flight ones included) and payloads; the emptied groups are pruned
+   * (best-effort), so their next publish restarts at group_seq 1. Topics
+   * and queues remain.
    * @returns Promise that resolves when all messages are purged
    */
   async purgeAllMessages(): Promise<void> {
@@ -1117,7 +1174,10 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Delete a specific message from a queue
+   * Delete one message's delivery from a queue, in any state, in-flight
+   * included (its holder's ack/nack then fails with LeaseLostError). A no-op
+   * if absent. Deleting an unsettled grouped delivery wakes its group's
+   * successor. The payload and other queues' deliveries remain.
    * @param queue - The queue name
    * @param messageID - The message ID
    * @returns Promise that resolves when the message is deleted
@@ -1134,7 +1194,9 @@ export class Connection implements IConnection {
   }
 
   /**
-   * List all messages in a queue
+   * List all messages in a queue, in every status (completed deliveries
+   * included until cleanupCompletedMessages() deletes them), without
+   * payloads, ordered by when they entered the queue.
    * @param queue - The queue name
    * @returns Promise that resolves to a list of queue messages
    */
@@ -1190,12 +1252,10 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Consume messages from a queue
+   * Return the queue's generation (UUID), cached from createQueue or read
+   * from postgremq.queues.
+   * @throws QueueNotFoundError if the queue does not exist
    * @internal
-   * @param queueName - The queue name
-   * @param visibilityTimeout - Visibility timeout in seconds
-   * @param limit - Maximum number of messages to fetch
-   * @returns Promise resolving to array of raw messages
    */
   async resolveQueueGeneration(queue: string): Promise<string> {
     const cached = this.queueGenerations.get(queue);
@@ -1212,6 +1272,17 @@ export class Connection implements IConnection {
     return generation;
   }
 
+  /**
+   * Consume messages from a queue (one consume_message call, not retried;
+   * see the inline comment).
+   * @internal
+   * @param queueName - The queue name
+   * @param visibilityTimeout - Visibility timeout in seconds
+   * @param limit - Maximum number of messages to fetch
+   * @param generation - Pins the claim to that queue incarnation; a missing,
+   *   expired or replaced queue raises PMQ02, which maps to QueueNotFoundError
+   * @returns Promise resolving to array of raw messages
+   */
   async consumeMessages(
     queueName: string,
     visibilityTimeout: number,
@@ -1321,7 +1392,9 @@ export class Connection implements IConnection {
    * @param queueName - The queue name
    * @param messageId - The message ID
    * @param consumerToken - The consumer token
-   * @param delayUntil - Optional delay until the message is visible again
+   * @param delayUntil - Optional absolute time at which the message becomes
+   *   visible again (default now). On the queue's last allowed attempt the
+   *   message moves to the DLQ instead.
    * @returns Promise that resolves when the message is negative acknowledged
    */
   async nackMessage(
@@ -1394,7 +1467,8 @@ export class Connection implements IConnection {
    * @param queueName - The queue name
    * @param messageId - The message ID
    * @param consumerToken - The consumer token
-   * @param visibilityTimeout - The new visibility timeout in seconds
+   * @param visibilityTimeout - The new lease duration, in seconds from now;
+   *   raises PMQ01 (LeaseLostError) if the lease has already expired
    * @returns Promise that resolves to the new expiration date
    */
   async setMessageVt(
@@ -1447,7 +1521,9 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Clean up a queue by removing all messages
+   * Delete every delivery of the queue, in every state, including in-flight
+   * ones (their holders lose the lease). Payloads remain until retention
+   * cleanup.
    * @param queue - The queue name
    * @returns Promise that resolves when the queue is cleaned up
    */
@@ -1462,9 +1538,12 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Clean up a topic by removing all associated messages
+   * Delete every message of the topic (and so all their deliveries, in every
+   * state) and prune its group rows. Queues remain.
    * @param topic - The topic name
    * @returns Promise that resolves when the topic is cleaned up
+   * @throws a database error with code 'PMQ03' while any of the topic's
+   *   messages is in the DLQ; requeue or purge the DLQ first
    */
   async cleanUpTopic(topic: string): Promise<void> {
     if (!this.connected) {
@@ -1477,7 +1556,8 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Delete inactive (expired) exclusive queues
+   * Delete inactive (expired) exclusive queues, skipping any that still have
+   * DLQ entries
    * @returns Promise that resolves when inactive queues are deleted
    */
   async deleteInactiveQueues(): Promise<void> {
@@ -1491,9 +1571,13 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Remove completed messages older than the specified retention period.
-   * @param olderThanHours - Optional retention threshold in hours. Uses default when omitted.
-   * @returns Number of messages deleted.
+   * Delete up to 1000 completed deliveries processed more than
+   * `olderThanHours` hours ago, then up to 1000 payloads no delivery or DLQ
+   * entry references and published more than `olderThanHours` hours ago.
+   * Call repeatedly to drain a backlog.
+   * @param olderThanHours - Optional retention threshold in whole hours (default 24).
+   * @returns Number of completed deliveries deleted (payloads not counted).
+   * @throws a database error with code 'PMQ03' if olderThanHours is negative
    */
   async cleanupCompletedMessages(olderThanHours?: number): Promise<number> {
     if (!this.connected) {
@@ -1514,7 +1598,7 @@ export class Connection implements IConnection {
 
   /**
    * Check if client is shutting down
-   * @returns True if the client is in the process of shutting down
+   * @returns True once close() has been called (including after it has finished)
    */
   isClientShuttingDown(): boolean {
     return this.isShuttingDown;
@@ -1524,9 +1608,11 @@ export class Connection implements IConnection {
    * Subscribe to a connection-level event. Currently emits:
    *   - 'queueFatal' (queue: string, error: QueueFatalError): the queue is gone
    *     (deleted out-of-band, or an exclusive queue whose keep-alive permanently
-   *     failed) and any consumers on it have been torn down. Consumers also
-   *     learn via Consumer.onClose; this is the only signal for a producer-only
-   *     exclusive queue with no consumer.
+   *     failed) and teardown of every consumer on it has begun (each
+   *     consumer's onClose fires when it has drained). Consumers also learn
+   *     via Consumer.onClose; this is the only signal for a producer-only
+   *     exclusive queue with no consumer. Not part of the exported Connection
+   *     interface.
    *
    * @param event - The event name
    * @param listener - The callback
@@ -1704,9 +1790,11 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Batch keep-alive extension. Returns the queue names actually kept alive;
-   * a requested queue omitted from the result failed permanently (gone or
-   * non-exclusive). Idempotent → uses the retry policy.
+   * Batch keep-alive extension (uses the retry policy). Returns one row per
+   * requested queue that was extended (`until` = new deadline, `busy: false`)
+   * or lock-contended (`until: null`, `busy: true`). A queue omitted from the
+   * result is gone, non-exclusive, already expired, or (with `generations`) a
+   * different incarnation. Not used by the keep-alive actor.
    * @internal
    */
   async extendQueueKeepAliveMulti(
@@ -1742,8 +1830,9 @@ export class Connection implements IConnection {
   // ===================================================================
 
   /**
-   * Register an in-flight message for auto-extension. Buffered/idempotent:
-   * every (queue, id, token) has an independent lifetime.
+   * Register (upsert) an in-flight delivery for auto-extension; each
+   * (queue, id, token) is independent. No-op once close() has stopped the
+   * background actors.
    * @internal
    */
   extenderRegister(e: {
@@ -1781,7 +1870,8 @@ export class Connection implements IConnection {
   }
 
   /** (Re)arm the single extension timer to fire at the earliest pending
-   *  extension (respecting the transient-failure backoff floor). @internal */
+   *  nextExtensionTime. No-op while a flush is in flight (the flush re-arms
+   *  when done) or after the background actors have been stopped. @internal */
   private armExtender(): void {
     if (this.extenderTimer) {
       clearTimeout(this.extenderTimer);
@@ -1805,9 +1895,11 @@ export class Connection implements IConnection {
     }, wait);
   }
 
-  /** Extend every due message in one set_vt_batch_multi call (correlated by the
-   *  composite (queue, id, token) key), reschedule the extended ones, and cancel +
-   *  drop lease-lost ones. Transient failures back off ~1s. @internal */
+  /** Extend up to `extenderBatchSize` due messages in one set_vt_batch_multi
+   *  call (correlated by the composite (queue, id, token) key), reschedule the
+   *  extended ones, retry busy rows within ~100 ms until their confirmed vt,
+   *  and cancel + drop lease-lost ones. Transient failures back off ~1s.
+   *  @internal */
   private async flushExtender(): Promise<void> {
     if (this.extenderFlushing || this.backgroundStopped) return;
     const now = Date.now();
@@ -1841,9 +1933,11 @@ export class Connection implements IConnection {
           Math.min(1000, ...due.map((e) => e.expiresAt.getTime() - Date.now()))
         );
       } catch (error) {
-        // Transient (past executeWithRetry's budget): keep entries, defer ~1s.
-        // extendAt is the soft halfway deadline, so there's headroom before the
-        // real server-side lease lapses.
+        // Transient failure (setVtBatchMulti makes a single attempt, with no
+        // retry policy): cancel and drop entries whose confirmed lease has
+        // expired; retry the rest in ~1s, never later than expiresAt.
+        // nextExtensionTime sits at `threshold` of the remaining lease, which
+        // leaves headroom before the server-side lease lapses.
         for (const e of due) {
           if (this.extenderEntries.get(extKey(e.queue, e.id, e.token)) !== e) continue;
           if (e.expiresAt.getTime() <= Date.now()) {
@@ -1873,15 +1967,14 @@ export class Connection implements IConnection {
         const newVt = result?.busy ? undefined : result?.vt;
         if (newVt) {
           e.expiresAt = newVt;
-          // Only touch the CURRENT entry — it may have been deregistered or
-          // re-registered (new token) while the call was in flight.
           if (current === e) {
             const remaining = Math.max(0, newVt.getTime() - after);
             e.nextExtensionTime = new Date(after + remaining * e.threshold);
             e.onExtended(newVt);
           }
         } else {
-          // Omitted = lease lost: advise the handler and drop the entry.
+          // Omitted, or still busy at the confirmed vt: lease lost. Advise the
+          // handler and drop the entry.
           if (current === e) this.extenderEntries.delete(k);
           this.telemetry.recordRenewalLost(e.queue);
             e.cancel();
@@ -1894,9 +1987,12 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Cross-queue batch visibility-timeout extension. Returns the rows actually
-   * extended; correlate by the COMPOSITE (queue, id) pair. Idempotent → uses
-   * the retry policy.
+   * Cross-queue batch visibility-timeout extension: one attempt, no retry
+   * policy, bounded by `budgetMs`. Returns one row per requested delivery
+   * that was extended (`busy: false`, `vt` = confirmed lease end) or was
+   * lock-contended (`busy: true`, `vt` meaningless). A delivery omitted from
+   * the result has lost its lease (not owned, not processing, or expired).
+   * Correlate by (queue, id, token).
    * @internal
    */
   async setVtBatchMulti(
