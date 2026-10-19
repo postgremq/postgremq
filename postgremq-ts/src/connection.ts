@@ -236,7 +236,7 @@ export class Connection implements IConnection {
       this.ownsPool = false;
     } else {
       // Create new pool from connection string or config
-      const poolConfig: PoolConfig = options.config || {};
+      const poolConfig: PoolConfig = { ...options.config };
 
       if (options.connectionString) {
         poolConfig.connectionString = options.connectionString;
@@ -1629,7 +1629,7 @@ export class Connection implements IConnection {
               ])
             );
           },
-          Math.min(1000, ...due.map(([, e]) => e.expiresAt.getTime() - Date.now()))
+          due.reduce((min, [, e]) => Math.min(min, e.expiresAt.getTime() - Date.now()), 1000)
         );
       } catch {
         /* Retry only while the last confirmed lease remains live. */
@@ -1838,7 +1838,7 @@ export class Connection implements IConnection {
           ids,
           tokens,
           vts,
-          Math.min(1000, ...due.map((e) => e.expiresAt.getTime() - Date.now()))
+          due.reduce((min, e) => Math.min(min, e.expiresAt.getTime() - Date.now()), 1000)
         );
       } catch (error) {
         // Transient (past executeWithRetry's budget): keep entries, defer ~1s.

@@ -49,8 +49,7 @@ async function main() {
       visibilityTimeoutSec: 30,
       autoExtension: {
         enabled: true,
-        extensionThreshold: 0.5,
-        extensionSec: 30
+        extensionThreshold: 0.5
       }
     });
 
