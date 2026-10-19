@@ -29,65 +29,88 @@ CREATE SCHEMA IF NOT EXISTS postgremq;
  * Core Concepts
  * -------------
  * - Visibility Timeout (vt): When a consumer fetches a message it becomes
- *   invisible to other consumers until `vt`. Extending vt keeps the message
- *   with the current consumer without taking a heavyweight lock.
+ *   invisible to other consumers until `vt`. The lease is a timestamp, not a
+ *   held lock: extending vt keeps the message with the current consumer, and
+ *   an expired lease lets another consumer reclaim it.
  * - Queue Types: Queues can be:
  *   - Non‑exclusive (persistent): never expire.
  *   - Exclusive (temporary): expire unless a client keeps them alive by
  *     periodically extending `keep_alive_until`.
- * - Keep‑Alive: Clients of exclusive queues should periodically call
- *   `postgremq.extend_queue_keep_alive_multi()` (both clients implement automatic
- *   connection-level keep‑alive) otherwise the queue is eligible for deletion
- *   by `postgremq.delete_inactive_queues()`.
+ * - Keep‑Alive: Clients of exclusive queues must periodically call
+ *   `postgremq.extend_queue_keep_alive_multi()` (every client implements
+ *   automatic connection-level keep‑alive). At `keep_alive_until` the queue
+ *   expires: it receives no new messages, `consume_message` raises PMQ02, and
+ *   it can be neither kept alive nor re-created. `postgremq.pmq_maintenance_fast()`
+ *   (or `delete_inactive_queues()`) later deletes it unless it has DLQ entries.
  * - Delivery Attempts: Each time a message is consumed its
  *   `delivery_attempts` is incremented. When a queue has
  *   `max_delivery_attempts > 0` and a message reaches the limit, the
  *   final-attempt nack retires the message inline; `postgremq.pmq_maintenance_fast()`
- *   covers leftover crashed-final-attempt rows.
- * - DLQ (Dead Letter Queue): Failed messages are copied to
- *   `dead_letter_queue`. Use `postgremq.list_dlq_messages()`, `postgremq.requeue_dlq_messages()`
- *   and `postgremq.purge_dlq()` to manage.
+ *   covers abandoned final attempts (lease expired without settlement).
+ * - DLQ (Dead Letter Queue): A delivery that fails its final attempt is moved
+ *   to `dead_letter_queue` (its queue_messages row is deleted; the payload
+ *   stays in `messages`). Use `postgremq.list_dlq_messages()`,
+ *   `postgremq.requeue_dlq_messages()` and `postgremq.purge_dlq()` to manage.
  *
  * Event Notifications
  * -------------------
  * Several operations emit LISTEN/NOTIFY events on per-topic and per-queue
  * channels as a wake-up signal — the payload is empty; clients use the
  * channel name alone to decide what to fetch next.
- *   - publishes:           channel `pmq:t:<topic>`
- *   - nack/release/requeue: channel `pmq:q:<queue>`
+ *   - `pmq:t:<topic>`: every publish (distribute_message).
+ *   - `pmq:q:<queue>`: nack_message, release_message and requeue_dlq_messages
+ *     (once, when at least one row was requeued). A final-attempt nack of an
+ *     ungrouped row retires it to the DLQ without a NOTIFY. For grouped rows
+ *     only (to wake the group's successor): ack_message, a final-attempt
+ *     nack, pmq_maintenance_fast's DLQ retirement (once per queue) and
+ *     delete_queue_message of an unsettled row.
  * Clients LISTEN to the channels they care about; refcounted LISTEN/UNLISTEN
  * is the client's responsibility. Channel names are derived from topic and
  * queue names, which are validated at create time to be safe NOTIFY identifiers
- * (matching `^[A-Za-z0-9_:.\-]+$`).
+ * (matching `^[A-Za-z0-9_:.\-]+$`) and at most 57 bytes, so `pmq:t:`/`pmq:q:`
+ * + name fits PostgreSQL's 63-byte channel limit.
  *
  * Table Relationships and Cascade Behavior:
  * - topics: The root table containing topic names
  * - queues: References postgremq.topics.name with ON DELETE CASCADE
  * - messages: References postgremq.topics.name with ON DELETE CASCADE
+ * - message_groups: References postgremq.topics.name with ON DELETE CASCADE
  * - queue_messages: References both queues.name and messages.id with ON DELETE CASCADE
- * - dead_letter_queue: References both queues.name and messages.id with ON DELETE CASCADE
+ * - dead_letter_queue: References both queues.name and messages.id with ON DELETE RESTRICT
  *
  * This cascade behavior ensures that:
- * 1. When a topic is deleted, all related queues, messages, and queue entries are automatically removed
+ * 1. When a topic is deleted, all related queues, messages, message_groups rows
+ *    and queue entries are automatically removed
  * 2. When a message is deleted (e.g., via clean_up_topic), all related queue entries are automatically removed
- * 3. When a queue is deleted, all its message entries are automatically removed
+ * 3. When a queue is deleted, its queue_messages rows are removed (payloads in
+ *    messages remain until cleanup_unreferenced_messages)
+ *
+ * Dead-letter rows are never removed implicitly: a queue, message or topic
+ * that still has DLQ entries cannot be deleted until they are purged
+ * (purge_dlq) or requeued (requeue_dlq_messages).
  *
  * Functions (high level):
  *   - publish_message: Insert into postgremq.messages and trigger distribution to queues.
  *   - consume_message: Retrieve and mark messages as processing; sets vt.
  *   - ack_message: Mark as completed; clears consumer token; sets processed_at.
- *   - nack_message: Return to pending with optional delay; clears token; NOTIFY.
- *   - release_message: Return to pending without incrementing attempts; NOTIFY.
+ *   - nack_message: Return to pending with optional delay, or on the final attempt
+ *     move to the DLQ; clears token; NOTIFY (after a final-attempt retirement only
+ *     for grouped rows).
+ *   - release_message: Return to pending immediately, undoing the consume's
+ *     delivery_attempts increment; NOTIFY.
  *   - set_vt / set_vt_batch_multi: Extend visibility time for one or many
  *     (cross-queue) messages.
- *   - requeue_dlq_messages / purge_dlq for DLQ management.
+ *   - list_dlq_messages / requeue_dlq_messages / purge_dlq for DLQ management.
  *   - extend_queue_keep_alive_multi / delete_inactive_queues for exclusive queues.
- *   - pmq_maintenance_fast: bundled cron entry — retires crashed-final-attempt
- *     rows to DLQ, reaps expired exclusive queues; returns counters.
+ *   - pmq_maintenance_fast: bundled cron entry — retires abandoned final-attempt
+ *     rows to DLQ, reaps expired exclusive queues without DLQ entries; returns
+ *     counters.
  *   - info: discovery of the installed schema version (and the legacy protocol major).
  *   - Management: create_topic, create_queue, delete_topic, delete_queue,
- *     list_topics, list_queues, get_queue_statistics, clean_up_* helpers,
- *     list_messages, get_message, get_next_visible_time, cleanup_completed_messages.
+ *     delete_queue_message, list_topics, list_queues, get_queue_statistics,
+ *     queue_metrics, clean_up_* helpers, purge_all_messages, list_messages,
+ *     get_message, get_next_visible_time, cleanup_completed_messages,
+ *     cleanup_unreferenced_messages, prune_message_groups.
  */
 
 
@@ -133,8 +156,8 @@ CREATE TABLE postgremq.queues (
 );
 
 -- Messages table: payload stored as JSONB.
--- id is BIGSERIAL: int32 SERIAL would wrap in months at sustained high publish
--- rates and silently corrupt message identity.
+-- id is BIGSERIAL: int32 SERIAL would exhaust its 2^31 ids in months at
+-- sustained high publish rates, after which every publish fails.
 CREATE TABLE postgremq.messages (
   id BIGSERIAL PRIMARY KEY,
   topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
@@ -153,7 +176,12 @@ CREATE TABLE postgremq.messages (
 -- Per-(topic, group_key) sequence allocator. publish_message upserts the row
 -- and holds its lock until commit, which serialises publishers of one group
 -- and makes group_seq follow commit order. Rows whose group has no message
--- left are pruned by cleanup_unreferenced_messages.
+-- left are pruned by prune_message_groups, which the message-deleting
+-- functions call: cleanup_unreferenced_messages (for the groups whose
+-- messages it deleted), clean_up_topic and purge_all_messages; deleting the
+-- topic cascades. Pruning is best-effort: a row a concurrent publisher holds
+-- is skipped and can remain after its group is empty, and the group's next
+-- publish then continues from last_seq.
 CREATE TABLE postgremq.message_groups (
   topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
   group_key VARCHAR(255) NOT NULL,
@@ -168,7 +196,9 @@ CREATE TABLE postgremq.queue_messages (
   message_id BIGINT REFERENCES postgremq.messages(id) ON DELETE CASCADE,
   status VARCHAR(16) DEFAULT 'pending',  -- Allowed: 'pending', 'processing', 'completed'
   published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
-  vt TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),  -- visibility timeout (lease end)
+  -- visibility time: when the row becomes claimable (deliver_after, nack delay
+  -- or release/requeue time while pending; lease end while processing)
+  vt TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   delivery_attempts INT DEFAULT 0,
   consumer_token VARCHAR(64),
   processed_at TIMESTAMPTZ,
@@ -271,16 +301,17 @@ WHERE group_key IS NOT NULL;
  *
  * Description:
  *   Trigger function that fans a newly published message (row in `messages`)
- *   out to all queues subscribed to the message's topic. For each matching
- *   queue, it inserts a row into `queue_messages` with initial vt set to the
- *   message's `deliver_after`. It NOTIFYs once on the per-topic channel
- *   `pmq:t:<topic>` with the message id as plain text.
+ *   out to every queue of the message's topic except exclusive queues whose
+ *   keep_alive_until has passed. For each receiving queue, it inserts a row
+ *   into `queue_messages` with initial vt set to the message's
+ *   `deliver_after`. It NOTIFYs once on the per-topic channel `pmq:t:<topic>`
+ *   with an empty payload.
  *
  * Trigger:
  *   - Installed as AFTER INSERT trigger `after_message_insert` on `messages`.
  *
  * Side Effects:
- *   - Inserts multiple rows into `queue_messages`.
+ *   - Inserts one `queue_messages` row per receiving queue (possibly none).
  *   - Emits a single NOTIFY event used by clients for push-based wakeups.
  *
  * Returns:
@@ -329,7 +360,7 @@ $$ LANGUAGE plpgsql;
  *
  * Side Effects:
  *   - Multiple inserts into postgremq.queue_messages (one per subscribed queue)
- *   - NOTIFY on the per-topic channel `pmq:t:<topic>` with the message id as plain text
+ *   - NOTIFY on the per-topic channel `pmq:t:<topic>` with an empty payload
  *   - Exclusive queues with expired keep_alive_until are excluded from distribution
  */
 CREATE TRIGGER after_message_insert
@@ -351,6 +382,10 @@ EXECUTE FUNCTION postgremq.distribute_message();
  *
  * Returns:
  *   VARCHAR: The topic name (for convenience/chaining).
+ *
+ * Raises:
+ *   - PMQ03 if p_topic is NULL, does not match `^[A-Za-z0-9_:.\-]+$`, or is
+ *     longer than 57 bytes.
  */
 CREATE OR REPLACE FUNCTION postgremq.create_topic(p_topic VARCHAR(255))
 RETURNS VARCHAR(255) AS $$
@@ -382,32 +417,44 @@ $$ LANGUAGE plpgsql;
  *   queue with the same parameters is a no-op success. If the queue exists
  *   with different parameters (different topic, max_delivery_attempts,
  *   exclusive flag, or keep_alive_interval), raises PMQ03 with the existing
- *   values surfaced for diagnosis — modelled on RabbitMQ's queue.declare
- *   "passive match-or-error" semantics.
+ *   values surfaced for diagnosis — modelled on RabbitMQ's queue.declare,
+ *   which fails (PRECONDITION_FAILED) when an existing queue's properties
+ *   differ.
  *
- *   For exclusive queues, an idempotent re-create also refreshes
- *   keep_alive_until to clock_timestamp() + keep_alive_interval. This means a re-create
- *   on an expired exclusive queue effectively revives it (the caller is
- *   asserting ownership now), consistent with consume_message's implicit
- *   refresh on the same column.
+ *   For exclusive queues, an idempotent re-create of a live queue also
+ *   refreshes keep_alive_until to clock_timestamp() + keep_alive_interval.
+ *   Re-creating an expired exclusive queue raises PMQ02: delete it first.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue to create.
  *   - p_topic_name (VARCHAR): Name of the topic to subscribe to.
  *   - p_max_attempts (INTEGER): Maximum delivery attempts before moving to DLQ.
- *   - p_exclusive (BOOLEAN): If true, queue will be deleted when keep_alive expires.
- *   - p_keep_alive_interval (INTERVAL): Stored on the queue and used for both the initial
- *                                       keep_alive_until (clock_timestamp() + interval) and for the
- *                                       implicit refresh in consume_message. Defaults to
- *                                       '5 minutes'. Effectively only matters for exclusive
- *                                       queues; non-exclusive ones never expire.
+ *                               0 (default) = unlimited, never moved to the DLQ.
+ *   - p_exclusive (BOOLEAN): If true (default false), the queue is temporary: it
+ *                            expires at keep_alive_until unless extended with
+ *                            extend_queue_keep_alive_multi. An expired queue
+ *                            receives no messages and cannot be consumed; it is
+ *                            later deleted by pmq_maintenance_fast() /
+ *                            delete_inactive_queues() (not while it has DLQ entries).
+ *   - p_keep_alive_interval (INTERVAL): Stored on the queue and used for the initial
+ *                                       keep_alive_until (clock_timestamp() + interval) and for
+ *                                       the refresh on re-create. Consuming does not refresh
+ *                                       it; clients extend it with
+ *                                       extend_queue_keep_alive_multi. Defaults to
+ *                                       '5 minutes'. It sets no deadline for non-exclusive
+ *                                       queues, which never expire, but it is still
+ *                                       validated and must match on re-create.
  *
- * Returns: VOID.
+ * Returns:
+ *   UUID: The queue's generation (the existing one when the queue already exists).
  *
  * Raises:
- *   - PMQ02 if p_topic_name doesn't exist.
- *   - PMQ03 if the name fails validation, p_max_attempts is negative, or
- *     a queue with this name already exists with different parameters.
+ *   - PMQ02 if p_topic_name doesn't exist, or the queue is an expired
+ *     exclusive queue.
+ *   - PMQ03 if the name fails validation (pattern or > 57 bytes),
+ *     p_keep_alive_interval is NULL or not positive, p_max_attempts is
+ *     negative, or a queue with this name already exists with different
+ *     parameters.
  */
 CREATE OR REPLACE FUNCTION postgremq.create_queue(
     p_queue_name VARCHAR(255),
@@ -517,6 +564,7 @@ $$ LANGUAGE plpgsql;
  *   - p_topic (VARCHAR): Topic name (must exist).
  *   - p_payload (JSONB): Arbitrary JSON payload stored in `messages.payload`.
  *   - p_deliver_after (TIMESTAMPTZ, default clock_timestamp()): First visibility time.
+ *     An explicit NULL means now.
  *   - p_group_key (VARCHAR, default NULL): Message group. NULL publishes an
  *     ungrouped message. With a key, the message gets the next dense
  *     group_seq of (p_topic, p_group_key); within each queue, deliveries of
@@ -533,7 +581,9 @@ $$ LANGUAGE plpgsql;
  *     of one group are therefore serialised, and group_seq order is commit
  *     order: a lower sequence can never become visible after a higher one.
  *     A transaction that publishes to several groups can deadlock (40P01)
- *     with one that takes them in a different order; clients retry 40P01.
+ *     with one that takes them in a different order: PostgreSQL aborts one
+ *     of them and the caller must retry it (clients retry 40P01 only for
+ *     their own single-call publish, not inside a caller's transaction).
  *
  * Raises:
  *   - PMQ02 if the topic does not exist.
@@ -583,14 +633,21 @@ $$ LANGUAGE plpgsql;
 /* Function: consume_message
  *
  * Description:
- *   Retrieves one or more messages from the specified queue. For each message, it increments the 
- *   delivery_attempts field and locks the message for the provided duration. Only messages that
- *   haven't exceeded their max_delivery_attempts limit are returned.
+ *   Claims up to p_limit visible rows of the queue, in vt order: pending rows
+ *   and processing rows whose lease has expired, with vt <= now. Only rows
+ *   whose delivery_attempts is below max_delivery_attempts (when > 0)
+ *   qualify; rows another transaction has locked are skipped. Each claimed
+ *   row is set to 'processing' with vt = now + p_vt seconds,
+ *   delivery_attempts + 1 and a fresh consumer_token. Returns zero rows when
+ *   nothing is visible.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
- *   - p_vt (INTEGER): The duration for which the message is locked in seconds.
+ *   - p_vt (INTEGER): Lease duration in seconds.
  *   - p_limit (INT DEFAULT 1): Maximum number of messages to retrieve.
+ *   - p_generation (UUID, default NULL): When given, the queue must be this
+ *     incarnation (the value create_queue returned); a recreated queue raises
+ *     PMQ02.
  *
  * Message groups:
  *   A grouped row is claimable only while no row of the same (queue, group_key)
@@ -600,12 +657,15 @@ $$ LANGUAGE plpgsql;
  *
  * Returns:
  *   A table of records with fields: queue_name, message_id, payload, consumer_token,
- *   delivery_attempts, vt, published_at, group_key, group_seq.
+ *   delivery_attempts, vt, published_at, group_key, group_seq. published_at is
+ *   when the row entered this queue (distribution or DLQ requeue).
  *
  * Raises:
  *   - PMQ03 if p_vt < 0 or p_limit <= 0.
- *   - PMQ02 if the queue does not exist (deleted out-of-band). An existing but
- *     empty queue returns zero rows with no error.
+ *   - PMQ02 if the queue does not exist (deleted out-of-band), is an exclusive
+ *     queue whose keep-alive expired, or is not the incarnation named by
+ *     p_generation. An existing, live but empty queue returns zero rows with
+ *     no error.
  */
 CREATE OR REPLACE FUNCTION postgremq.consume_message(
     p_queue_name VARCHAR(255),
@@ -753,6 +813,12 @@ $$ LANGUAGE plpgsql;
  * Side Effects:
  *   - Acking a grouped row NOTIFYs `pmq:q:<queue>`: the group's successor was
  *     unclaimable until this head settled. Ungrouped acks stay silent.
+ *
+ * Raises:
+ *   - PMQ01 if the row is not 'processing' under p_consumer_token (not found,
+ *     already settled, or reclaimed by another consumer). The lease deadline
+ *     is not checked: an ack after vt has passed succeeds while no other
+ *     consumer has claimed the row.
  */
 CREATE OR REPLACE FUNCTION postgremq.ack_message(p_queue_name VARCHAR(255), p_message_id BIGINT, p_consumer_token VARCHAR(64))
 RETURNS VOID AS $$
@@ -785,17 +851,29 @@ $$ LANGUAGE plpgsql;
 /* Function: nack_message
  *
  * Description:
- *   Performs a negative acknowledgment (nack) on a message. The function resets the message status
- *   to 'pending', clears the lock and consumer token, and sends a notification event. The topic
- *   is determined by looking up the corresponding queue.
+ *   Negatively acknowledges a delivery. The attempt still counts
+ *   (delivery_attempts is not changed).
+ *   - Not the final attempt: resets status to 'pending' with
+ *     vt = p_delay_until, clears consumer_token, and NOTIFYs `pmq:q:<queue>`.
+ *   - Final attempt (the queue's max_delivery_attempts > 0 and
+ *     delivery_attempts >= it): moves the row to dead_letter_queue inline
+ *     (retry_count = delivery_attempts) and deletes the queue_messages row;
+ *     p_delay_until is ignored, and `pmq:q:<queue>` is NOTIFYed only for a
+ *     grouped row (its successor becomes claimable).
+ *   Locks the queue row FOR SHARE until the transaction ends.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
  *   - p_message_id (BIGINT): Identifier of the message.
  *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
- *   - p_delay_until (TIMESTAMPTZ): The timestamp until which the message should be delayed for redelivery.
+ *   - p_delay_until (TIMESTAMPTZ, default clock_timestamp()): Next visibility
+ *     time (non-final attempt). An explicit NULL fails with 23502.
  *
  * Returns: VOID.
+ *
+ * Raises:
+ *   - PMQ01 if the row is not 'processing' under p_consumer_token. The lease
+ *     deadline is not checked.
  */
 CREATE OR REPLACE FUNCTION postgremq.nack_message(
     p_queue_name VARCHAR(255),
@@ -862,10 +940,11 @@ $$ LANGUAGE plpgsql;
 /* Function: release_message
  *
  * Description:
- *   Releases the message back for delivery without increasing retry count. Should be used when client fetched the
- *   message but didn't make an attempt to process it, like for example buffered consumption.
- *   The function resets the message status
- *   to 'pending', clears the lock and consumer token, and sends a notification event.
+ *   Returns a claimed delivery that was never attempted, for example one a
+ *   buffering consumer fetched but did not process: status 'pending',
+ *   vt = now, consumer_token cleared, and delivery_attempts decremented
+ *   (floored at 0), which takes back the claim's attempt. Always NOTIFYs
+ *   `pmq:q:<queue>`.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
@@ -873,6 +952,10 @@ $$ LANGUAGE plpgsql;
  *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
  *
  * Returns: VOID.
+ *
+ * Raises:
+ *   - PMQ01 if the row is not 'processing' under p_consumer_token. The lease
+ *     deadline is not checked.
  */
 CREATE OR REPLACE FUNCTION postgremq.release_message(
     p_queue_name VARCHAR(255),
@@ -909,7 +992,7 @@ $$ LANGUAGE plpgsql;
 /* Function: set_vt
  *
  * Description:
- *   Extends the lock time on a particular message, giving the consumer more time to process it.
+ *   Extends the lease on a particular message, giving the consumer more time to process it.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): Name of the queue.
@@ -918,12 +1001,19 @@ $$ LANGUAGE plpgsql;
  *   - p_vt (INT): New lease duration in seconds from the current wall clock.
  *
  * Returns:
- *   TIMESTAMPTZ indicating new lock time.
+ *   TIMESTAMPTZ: the new lease end (vt).
+ *
+ * Raises:
+ *   - PMQ03 if p_vt < 0.
+ *   - PMQ01 if the row is not 'processing' under p_consumer_token or its lease
+ *     has already expired (unlike ack/nack/release, extension requires a live
+ *     lease).
+ *   - 55P03 (lock_not_available, retryable) if the row is locked; it never waits.
  *
  * Note:
- *   The visibility timeout (p_vt) parameter is not bounded by this function.
- *   Callers should ensure reasonable values are used to prevent messages from
- *   being locked for excessive periods. Recommended maximum: 43200 seconds (12 hours).
+ *   p_vt has no upper bound. Callers should ensure reasonable values are used
+ *   to prevent messages from being locked for excessive periods. Recommended
+ *   maximum: 43200 seconds (12 hours).
  */
 CREATE OR REPLACE FUNCTION postgremq.set_vt(
     p_queue_name VARCHAR(255),
@@ -959,21 +1049,25 @@ $$ LANGUAGE plpgsql;
  * Description:
  *   Bundles the latency-sensitive maintenance routines into one cron entry:
  *
- *   1. Retire crashed-final-attempt rows to DLQ. nack_message already retires
+ *   1. Retire abandoned final-attempt rows to DLQ. nack_message already retires
  *      messages inline when their delivery_attempts hit max_delivery_attempts,
- *      so this only catches rows whose consumer crashed mid-handler before
- *      acking/nacking the final attempt — those would otherwise stay stuck
- *      in 'processing' (consume_message refuses to re-pick them because
- *      delivery_attempts >= max_delivery_attempts). The retire predicate is
- *      gated on status='processing' AND vt <= clock_timestamp() so we never yank a
- *      healthy in-flight row out from under a still-running consumer.
- *      Retiring a grouped row unblocks its group's successor, so every queue
- *      that had a grouped row retired gets one NOTIFY on `pmq:q:<queue>`.
- *   2. Reap exclusive queues whose keep_alive_until has expired.
+ *      so this only catches rows whose final attempt was abandoned (the
+ *      consumer crashed, or the lease expired without settlement) — those
+ *      would otherwise stay stuck in 'processing' (consume_message refuses to
+ *      re-pick them because delivery_attempts >= max_delivery_attempts). The
+ *      retire predicate is gated on status='processing' AND vt <= clock_timestamp()
+ *      so we never yank a healthy in-flight row out from under a still-running
+ *      consumer. Retiring a grouped row unblocks its group's successor, so every
+ *      queue that had a grouped row retired gets one NOTIFY on `pmq:q:<queue>`.
+ *   2. Reap (delete) exclusive queues whose keep_alive_until is NULL or has
+ *      passed, except queues that still have dead_letter_queue entries (FK ON
+ *      DELETE RESTRICT): those stay until the DLQ is purged or requeued.
  *
- *   Intended to run every 30-60 seconds (≤ ½ × the shortest
- *   keep_alive_interval in your queues so dead exclusive queues are reaped
- *   within ~1.5× their interval).
+ *   Intended to run every 1–10 seconds, and at least once every 60 seconds.
+ *   The interval bounds how long an abandoned final attempt (and any group
+ *   blocked behind it) waits for the DLQ, and how long an expired exclusive
+ *   queue without DLQ entries stays in storage. Expiry itself takes effect at
+ *   the expiry instant, not when the queue is reaped.
  *
  *   cleanup_completed_messages stays separate because it's latency-tolerant
  *   bulk DELETE governed by retention policy, not freshness.
@@ -981,7 +1075,7 @@ $$ LANGUAGE plpgsql;
  * Returns:
  *   A single row with two counters for monitoring:
  *     retired_to_dlq          - rows moved into postgremq.dead_letter_queue
- *     inactive_queues_dropped - exclusive queues whose keep_alive_until expired
+ *     inactive_queues_dropped - exclusive queues deleted by step 2
  */
 CREATE OR REPLACE FUNCTION postgremq.pmq_maintenance_fast()
 RETURNS TABLE (
@@ -1053,9 +1147,33 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-/* Queue heartbeat outcomes: extended with deadline, busy with NULL deadline,
- * or omitted when gone/expired/wrong generation. Busy never means lease lost.
- * Pass generations to bind renewals to specific queue incarnations.
+/* Function: extend_queue_keep_alive_multi
+ *
+ * Description:
+ *   Batched keep-alive for exclusive queues. Entries are processed in
+ *   queue-name order, each in its own subtransaction; each queue row is locked
+ *   FOR UPDATE NOWAIT and, if its lease is still live, keep_alive_until is set
+ *   to clock_timestamp() + the entry's interval (not the stored
+ *   keep_alive_interval).
+ *
+ * Parameters:
+ *   - p_queue_names (VARCHAR[]): Queues to extend.
+ *   - p_intervals_ms (BIGINT[]): New lease length per queue, in milliseconds (> 0).
+ *   - p_generations (UUID[], default NULL): Optional per-queue generation, to
+ *     bind a renewal to one queue incarnation; a NULL array or element matches
+ *     whichever incarnation exists.
+ *
+ * Returns:
+ *   TABLE(queue_name, keep_alive_until, outcome), one row per entry that was:
+ *     - 'extended': keep_alive_until is the confirmed new deadline;
+ *     - 'busy': NULL keep_alive_until, lease unchanged; the row was locked.
+ *       Busy never means the lease is lost: retry before the last confirmed
+ *       deadline.
+ *   Entries for a queue that is gone, not exclusive, already expired, or of a
+ *   different generation are omitted (the lease is lost).
+ *
+ * Raises:
+ *   - PMQ03 if the array lengths differ or any interval is NULL or <= 0.
  */
 CREATE OR REPLACE FUNCTION postgremq.extend_queue_keep_alive_multi(
     p_queue_names  VARCHAR[],
@@ -1122,16 +1240,17 @@ $$ LANGUAGE plpgsql;
  *
  * Description:
  *   Retrieves a list of all queues in the system with details including the
- *   associated topic, maximum delivery attempts (max_delivery_attempts), durability,
- *   and the keep-alive expiration time.
+ *   associated topic, maximum delivery attempts (max_delivery_attempts), whether
+ *   it is exclusive, and the keep-alive expiration time.
  *
  * Returns:
  *   A TABLE with the following columns:
  *     - queue_name (VARCHAR): The name of the queue.
  *     - topic_name (VARCHAR): The associated topic name.
- *     - max_delivery_attempts (INT): Maximum delivery attempts (-1 indicates unlimited).
+ *     - max_delivery_attempts (INT): Maximum delivery attempts (0 indicates unlimited).
  *     - exclusive (BOOLEAN): Whether the queue is exclusive (temporary).
- *     - keep_alive_until (TIMESTAMPTZ): Expiration timestamp for exclusive queues.
+ *     - keep_alive_until (TIMESTAMPTZ): Expiration timestamp for exclusive queues;
+ *       NULL for non-exclusive ones.
  */
 CREATE OR REPLACE FUNCTION postgremq.list_queues()
 RETURNS TABLE(
@@ -1163,22 +1282,23 @@ $$ LANGUAGE plpgsql;
  *   - p_queue (VARCHAR, optional): The name of the queue to gather statistics for.
  *
  * Returns:
- *   A TABLE with the following columns:
+ *   A TABLE with the following columns, counting delivery rows (queue_messages)
+ *   of p_queue, or summed over all queues when p_queue is NULL (an unknown
+ *   queue gives zeros); DLQ entries are not counted:
  *     - pending_count (BIGINT): Number of messages with status 'pending'.
  *     - processing_count (BIGINT): Number of messages with status 'processing'.
  *     - completed_count (BIGINT): Number of messages with status 'completed'.
- *     - total_count (BIGINT): Total number of messages in the queue.
+ *     - total_count (BIGINT): pending_count + processing_count + completed_count.
  *
  * Performance note:
- *   pending_count and processing_count are served by the narrow partial
- *   indexes idx_queue_messages_pending / idx_queue_messages_processing as
- *   index-only/partial scans, so the common dashboard poll never touches the
- *   retained completed set. completed_count and total_count inherently require
- *   counting the completed rows (retained up to 24h) and are served by
- *   idx_queue_messages_completed_processed_at; total_count is derived as the
- *   sum of the three status counts rather than a separate full scan, so no
- *   call performs a heap seqscan. The return shape is unchanged (four BIGINT
- *   columns in the same order); Go/TS clients select all four by name.
+ *   pending_count and processing_count use the partial indexes
+ *   idx_queue_messages_pending / idx_queue_messages_processing, so they do not
+ *   read the retained completed set. completed_count must count the retained
+ *   completed rows (kept for the cleanup_completed_messages retention, 24h by
+ *   default): no index covers them per queue, so counting them needs a heap
+ *   pass over either the queue's rows or the completed set, and the
+ *   all-queues form (p_queue NULL) reads every completed row. total_count is the sum of the three counts,
+ *   not a separate scan.
  */
 CREATE OR REPLACE FUNCTION postgremq.get_queue_statistics(p_queue VARCHAR(255) DEFAULT NULL)
 RETURNS TABLE(
@@ -1217,7 +1337,7 @@ $$ LANGUAGE plpgsql;
  * Returns:
  *   A TABLE with the following columns:
  *     - queue_name (VARCHAR): Name of the queue from which the message was moved.
- *     - message_id (INT): Identifier of the message.
+ *     - message_id (BIGINT): Identifier of the message.
  *     - retry_count (INT): Number of delivery attempts made (as stored in DLQ).
  *     - published_at (TIMESTAMPTZ): Timestamp when the message was moved into the DLQ.
  */
@@ -1239,17 +1359,18 @@ $$ LANGUAGE plpgsql;
 /* Function: requeue_dlq_messages
  *
  * Description:
- *   Moves messages from the dead letter queue back to their original queues.
- *   The delivery_attempts counter is reset to 0 for these messages.
+ *   Moves every DLQ entry of p_queue_name back into that queue as 'pending'
+ *   with vt = now. The delivery_attempts counter is reset to 0 for these
+ *   messages. No entries (or no such queue) is a no-op.
  *
  *   A grouped message re-enters with its original group_key/group_seq, so it
  *   becomes the head of its group again (blocking later pending rows of the
  *   group). Rows of the group that already ran while it sat in the DLQ are not
  *   re-ordered: ordering across a DLQ detour is not promised.
  *
- *   Emits one NOTIFY per requeued message on `pmq:q:<queue>` so consumers
- *   that are LISTENing wake up immediately rather than waiting for their
- *   poll-fallback (1s in TS, 10s in Go).
+ *   Emits a single NOTIFY on `pmq:q:<queue>` (none when nothing was
+ *   requeued) so consumers that are LISTENing wake up immediately rather
+ *   than waiting for their poll fallback.
  *
  *   ON CONFLICT DO UPDATE: if a `queue_messages` row already exists for
  *   the (queue_name, message_id) pair (operator intervention, manual
@@ -1303,7 +1424,9 @@ $$ LANGUAGE plpgsql;
 /* Function: purge_dlq
  *
  * Description:
- *   Deletes all messages from the Dead Letter Queue (DLQ).
+ *   Deletes every Dead Letter Queue (DLQ) entry in every queue (there is no
+ *   per-queue form). Payloads in postgremq.messages are left for
+ *   cleanup_unreferenced_messages to collect.
  *
  * Returns: VOID.
  */
@@ -1317,8 +1440,11 @@ $$ LANGUAGE plpgsql;
 /* Function: purge_all_messages
  *
  * Description:
- *   Deletes all messages from the system. This includes messages in both the DLQ and
- *   the primary messages table.
+ *   Deletes every DLQ entry, every delivery row (queue_messages, including
+ *   in-flight ones, whose tokens then fail with PMQ01) and every payload
+ *   (messages), then prunes the message_groups rows (best-effort, see
+ *   prune_message_groups), so a pruned group's next publish starts again at
+ *   group_seq 1. Queues and topics are kept. Sends no NOTIFY.
  *
  * Returns: VOID.
  */
@@ -1337,8 +1463,11 @@ $$ LANGUAGE plpgsql;
 /* Function: delete_topic
  *
  * Description:
- *   Deletes a topic from the system. The topic cannot be deleted if any messages are associated
- *   with it. Use clean_up_topic to remove messages first if necessary.
+ *   Deletes a topic and, by cascade, every queue subscribed to it and its
+ *   message_groups rows. Refused while any payload of the topic exists in
+ *   messages, including payloads whose deliveries are completed but still
+ *   retained; run clean_up_topic first. Does nothing if the topic does not
+ *   exist.
  *
  * Parameters:
  *   - p_topic (VARCHAR): The name of the topic to be deleted.
@@ -1346,7 +1475,7 @@ $$ LANGUAGE plpgsql;
  * Returns: VOID.
  *
  * Raises:
- *   Exception if messages exist for the topic.
+ *   - PMQ03 if any message of the topic exists.
  */
 CREATE OR REPLACE FUNCTION postgremq.delete_topic(p_topic VARCHAR(255))
 RETURNS VOID AS $$
@@ -1362,12 +1491,19 @@ $$ LANGUAGE plpgsql;
 /* Function: delete_queue
  *
  * Description:
- *   Deletes a queue from the system.
+ *   Deletes a queue and, by cascade, its delivery rows (in-flight ones
+ *   included). Payloads remain, and cleanup_unreferenced_messages collects
+ *   each one once no delivery or DLQ entry references it. Does nothing if
+ *   the queue does not exist.
  *
  * Parameters:
  *   - p_queue (VARCHAR): The name of the queue to be deleted.
  *
  * Returns: VOID.
+ *
+ * Raises:
+ *   - PMQ03 while the queue has DLQ entries (requeue_dlq_messages or
+ *     purge_dlq first).
  */
 CREATE OR REPLACE FUNCTION postgremq.delete_queue(p_queue VARCHAR(255))
 RETURNS VOID AS $$
@@ -1390,9 +1526,12 @@ $$ LANGUAGE plpgsql;
 /* Function: delete_queue_message
  *
  * Description:
- *   Deletes a specific message from an active queue. Deleting an unsettled
- *   grouped row may unblock its group's successor, so that case NOTIFYs
- *   `pmq:q:<queue>`.
+ *   Deletes one delivery row (queue_messages) of a message from a queue, in
+ *   any state, including an in-flight lease, whose token then fails with
+ *   PMQ01. The payload and other queues' deliveries are kept; the payload is
+ *   collected once nothing references it. Does nothing if the row does not
+ *   exist. Deleting an unsettled grouped row may unblock its group's
+ *   successor, so that case NOTIFYs `pmq:q:<queue>`.
  *
  * Parameters:
  *   - p_queue_name (VARCHAR): The name of the queue.
@@ -1419,7 +1558,10 @@ $$ LANGUAGE plpgsql;
 /* Function: clean_up_queue
  *
  * Description:
- *   Removes all messages from a specified queue.
+ *   Deletes all of the queue's delivery rows (queue_messages), including
+ *   in-flight ones, whose tokens then fail with PMQ01. Payloads and DLQ
+ *   entries are kept; payloads are collected once unreferenced. Sends no
+ *   NOTIFY.
  *
  * Parameters:
  *   - p_queue (VARCHAR): The name of the queue to clean up.
@@ -1436,12 +1578,19 @@ $$ LANGUAGE plpgsql;
 /* Function: clean_up_topic
  *
  * Description:
- *   Deletes all messages associated with a specified topic.
+ *   Deletes all of the topic's payloads and, by cascade, their delivery rows
+ *   in every queue, in-flight ones included. Then prunes the topic's
+ *   message_groups rows (best-effort, see prune_message_groups), so a pruned
+ *   group's next publish starts again at group_seq 1. Queues are kept.
  *
  * Parameters:
  *   - p_topic (VARCHAR): The topic whose messages are to be removed.
  *
  * Returns: VOID.
+ *
+ * Raises:
+ *   - PMQ03 while any of the topic's messages is in a DLQ
+ *     (requeue_dlq_messages or purge_dlq first).
  */
 CREATE OR REPLACE FUNCTION postgremq.clean_up_topic(p_topic VARCHAR(255))
 RETURNS VOID AS $$
@@ -1469,8 +1618,10 @@ $$ LANGUAGE plpgsql;
 /* Function: delete_inactive_queues
  *
  * Description:
- *   Deletes exclusive queues that are inactive: their keep_alive_until is NULL
- *   or has already expired.
+ *   Deletes exclusive queues whose keep_alive_until is NULL or has passed
+ *   (strict, no grace window), together with their delivery rows by cascade.
+ *   Queues that still have DLQ entries are skipped and stay until the DLQ is
+ *   requeued or purged. pmq_maintenance_fast runs the same reap.
  *
  * Returns: VOID.
  */
@@ -1490,14 +1641,31 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
----------------------------
--- End of Implementation Script
--- ============================================================
-
-/* Cross-queue heartbeats, correlated by (queue, message_id, consumer_token).
- * Extended rows carry a confirmed vt. Busy rows carry NULL vt; retry within
- * the known lease budget. Omitted rows have lost ownership or expired.
- * NOWAIT prevents one contended row from delaying unrelated renewals.
+/* Function: set_vt_batch_multi
+ *
+ * Description:
+ *   Cross-queue lease extension, correlated by (queue, message_id,
+ *   consumer_token). Entries are processed in (queue_name, message_id) order,
+ *   each in its own subtransaction; each row is locked FOR UPDATE NOWAIT, so
+ *   one contended row does not delay unrelated renewals. A row the caller
+ *   still holds ('processing' under the given token, lease not yet expired)
+ *   gets vt = clock_timestamp() + the entry's seconds.
+ *
+ * Parameters:
+ *   - p_queue_names (VARCHAR[]), p_message_ids (BIGINT[]),
+ *     p_consumer_tokens (VARCHAR[]): The deliveries to extend, element-wise.
+ *   - p_vts (INTEGER[]): New lease duration per entry, in seconds from now (>= 0).
+ *
+ * Returns:
+ *   TABLE(queue_name, message_id, vt, consumer_token, outcome), in
+ *   (queue_name, message_id) order, one row per entry that was:
+ *     - 'extended': vt is the confirmed new lease end;
+ *     - 'busy': NULL vt, lease unchanged; the row was locked. Retry within
+ *       the known lease budget.
+ *   Omitted entries have lost ownership or expired.
+ *
+ * Raises:
+ *   - PMQ03 if the array lengths differ or any p_vts element is NULL or negative.
  */
 CREATE OR REPLACE FUNCTION postgremq.set_vt_batch_multi(
     p_queue_names     VARCHAR[],
@@ -1607,10 +1775,12 @@ $$ LANGUAGE plpgsql;
 /* Function: get_next_visible_time
  *
  * Description:
- *   Returns the timestamp when the next message will become visible for delivery
- *   in the specified queue. Only considers messages in 'pending' or 'processing' state
- *   that haven't exceeded their max delivery attempts.
- *   Optimized to use an index-only scan with LIMIT 1 instead of MIN() aggregation.
+ *   Returns the earliest vt among the queue's 'pending' or 'processing' rows
+ *   that have not reached max_delivery_attempts and are not blocked behind an
+ *   unsettled lower-seq row of their group. A value in the past means a row
+ *   is claimable now. Walks idx_queue_messages_next_visible in vt order and
+ *   stops at the first qualifying row (ORDER BY vt LIMIT 1) instead of a
+ *   MIN() aggregate.
  *
  *   Applies consume_message's group-head predicate: a blocked successor's vt
  *   is usually already in the past, and clients schedule their next fetch at
@@ -1622,7 +1792,7 @@ $$ LANGUAGE plpgsql;
  *   - p_queue_name (VARCHAR): Name of the queue.
  *
  * Returns:
- *   TIMESTAMPTZ indicating when the next message will be visible, or NULL if no messages.
+ *   TIMESTAMPTZ, or NULL when no row qualifies (or the queue does not exist).
  */
 CREATE OR REPLACE FUNCTION postgremq.get_next_visible_time(p_queue_name VARCHAR(255))
 RETURNS TIMESTAMPTZ AS $$
@@ -1649,30 +1819,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-/* Function: cleanup_completed_messages
- *
- * Description:
- *   Removes completed messages older than the specified retention period.
- *   This function should be called periodically (e.g., via cron or scheduled task)
- *   to prevent unbounded growth of the queue_messages table.
- *
- * Parameters:
- *   - p_older_than_hours (INTEGER): Delete completed messages processed more than this many hours ago.
- *                                   Defaults to 24 hours.
- *
- * Returns:
- *   INTEGER - number of completed messages deleted.
- *
- * Example:
- *   -- Delete messages completed more than 24 hours ago
- *   SELECT postgremq.cleanup_completed_messages();
- *
- *   -- Delete messages completed more than 7 days ago
- *   SELECT postgremq.cleanup_completed_messages(168);
- */
 -- Reference indexes make payload collection independent of queue count.
 CREATE INDEX idx_queue_messages_message_id ON postgremq.queue_messages(message_id);
 CREATE INDEX idx_dlq_message_id ON postgremq.dead_letter_queue(message_id);
+-- Retention order for cleanup_unreferenced_messages' candidate scan
+-- (published_at < cutoff, ORDER BY published_at, id).
 CREATE INDEX idx_messages_retention ON postgremq.messages(published_at, id);
 
 /* Function: prune_message_groups
@@ -1694,13 +1845,17 @@ CREATE INDEX idx_messages_retention ON postgremq.messages(published_at, id);
  *   Under REPEATABLE READ / SERIALIZABLE step 1 raises a serialization
  *   failure instead of locking a concurrently updated row, so the caller
  *   retries rather than corrupting a sequence.
+ *   Pairs without a row, or whose row a publisher has locked, are skipped.
  *
  * Parameters:
  *   - p_topics, p_keys (VARCHAR[]): Candidate (topic_name, group_key) pairs,
- *     element-wise.
+ *     element-wise. NULL or empty arrays return 0.
  *
  * Returns:
  *   INT - number of group rows deleted.
+ *
+ * Raises:
+ *   - PMQ03 if p_topics and p_keys differ in length.
  */
 CREATE OR REPLACE FUNCTION postgremq.prune_message_groups(p_topics VARCHAR[], p_keys VARCHAR[])
 RETURNS INT AS $$
@@ -1740,10 +1895,29 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- Run regularly, including when there are no completed deliveries (unrouted
--- publications and queue/DLQ deletion also leave unreferenced payloads).
--- Also prunes the message_groups rows of groups whose last message this call
--- deleted (bounded by the batch size; see prune_message_groups).
+/* Function: cleanup_unreferenced_messages
+ *
+ * Description:
+ *   Deletes payloads (messages rows) that no delivery (queue_messages) or DLQ
+ *   entry references and that were published more than p_older_than_hours
+ *   ago, oldest first, up to p_batch_size per call; candidate rows another
+ *   transaction has locked are skipped. Also prunes the message_groups rows
+ *   of groups whose last message this call deleted (see prune_message_groups).
+ *   cleanup_completed_messages calls it; run it regularly, including when
+ *   there are no completed deliveries (unrouted publications and queue/DLQ
+ *   deletion also leave unreferenced payloads).
+ *
+ * Parameters:
+ *   - p_older_than_hours (INTEGER): Minimum payload age, by messages.published_at.
+ *                                   Defaults to 24 hours.
+ *   - p_batch_size (INTEGER): Maximum payloads deleted per call. Defaults to 1000.
+ *
+ * Returns:
+ *   INT - number of payloads deleted.
+ *
+ * Raises:
+ *   - PMQ03 if p_older_than_hours < 0 or p_batch_size <= 0.
+ */
 CREATE OR REPLACE FUNCTION postgremq.cleanup_unreferenced_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
 RETURNS INT AS $$
 DECLARE
@@ -1775,6 +1949,37 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+/* Function: cleanup_completed_messages
+ *
+ * Description:
+ *   Removes completed deliveries (queue_messages rows) older than the
+ *   retention period (by processed_at), then calls
+ *   cleanup_unreferenced_messages with the same arguments to remove
+ *   unreferenced payloads published more than p_older_than_hours ago and
+ *   prune emptied message_groups rows. Each call is bounded by p_batch_size,
+ *   so it should be called periodically (e.g., via cron or scheduled task) to
+ *   prevent unbounded growth of the queue_messages and messages tables.
+ *
+ * Parameters:
+ *   - p_older_than_hours (INTEGER): Retention in hours, applied to completed
+ *                                   deliveries' processed_at and to unreferenced
+ *                                   payloads' published_at. Defaults to 24 hours.
+ *   - p_batch_size (INTEGER): Maximum rows deleted per call, separately for
+ *                             deliveries and for payloads. Defaults to 1000.
+ *
+ * Returns:
+ *   INTEGER - number of completed deliveries deleted.
+ *
+ * Raises:
+ *   - PMQ03 if p_older_than_hours < 0 or p_batch_size <= 0.
+ *
+ * Example:
+ *   -- Delete up to 1000 deliveries completed more than 24 hours ago
+ *   SELECT postgremq.cleanup_completed_messages();
+ *
+ *   -- Delete up to 1000 deliveries completed more than 7 days ago
+ *   SELECT postgremq.cleanup_completed_messages(168);
+ */
 CREATE OR REPLACE FUNCTION postgremq.cleanup_completed_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
 RETURNS INT AS $$
 DECLARE deleted INT;
@@ -1799,6 +2004,18 @@ $$ LANGUAGE plpgsql;
 -- Queue-state telemetry. One snapshot/cutoff for all queues, including empty
 -- queues. Read-only and payload-free; no counters on the publication hot path.
 -- Completed retention is intentionally excluded from this operational scan.
+-- One row per queue; the cutoff is statement_timestamp(). Columns:
+--   active: 1 for a non-exclusive queue or a live exclusive one, else 0.
+--   ready: pending/processing rows with vt <= cutoff that have not reached
+--     max_delivery_attempts; includes expired processing leases and blocked
+--     group successors. 0 for an expired exclusive queue.
+--   delayed: pending rows with vt > cutoff.
+--   processing: processing rows with vt > cutoff (live leases).
+--   exhausted: pending/processing rows with vt <= cutoff whose
+--     delivery_attempts reached a positive max_delivery_attempts.
+--   dead_letter: the queue's DLQ entries.
+--   oldest_ready_age_seconds: cutoff minus the oldest ready row's vt; 0 when
+--     nothing is ready or the exclusive queue has expired.
 CREATE OR REPLACE FUNCTION postgremq.queue_metrics()
 RETURNS TABLE (
     queue_name text, topic_name text, active bigint,

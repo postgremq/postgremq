@@ -28,8 +28,9 @@ type Stoppable interface {
 // Concurrency:
 //   - Connection methods are safe to call from multiple goroutines unless
 //     otherwise stated.
-//   - Each Consumer created from a Connection runs internal goroutines for
-//     fetching messages and (optionally) auto‑extending visibility timeouts.
+//   - Each Consumer created from a Connection runs an internal goroutine for
+//     fetching messages. Visibility-timeout auto-extension and exclusive-queue
+//     keep-alive run in connection-level goroutines shared by all consumers.
 type Connection struct {
 	meterProvider       metric.MeterProvider
 	metrics             *clientMetrics
@@ -93,7 +94,9 @@ func Dial(ctx context.Context, config *pgxpool.Config, opts ...ConnectionOption)
 
 // DialFromPool creates a new Connection using an existing Pool implementation
 // (typically *pgxpool.Pool). The Connection does not own the pool and will not
-// close it on Connection.Close().
+// close it on Connection.Close(). Close the Connection before the pool: from
+// the first Consume or ConsumeHandler, its LISTEN session holds one pooled
+// connection until Connection.Close.
 //
 // ctx bounds the schema check (see Dial) and is not retained. Lifetime is
 // owned by Close().
@@ -175,6 +178,11 @@ func newConnection(_ context.Context, pool Pool, ownPool bool, opts ...Connectio
 // Side effects:
 //   - Messages buffered by a Consumer but not yet delivered are released back
 //     to the queue without incrementing delivery attempts.
+//
+// Because Close waits for delivered messages, calling it from inside a
+// message handler, or from a consume loop while holding an unsettled message,
+// waits on itself — forever without WithShutdownTimeout. Call it from another
+// goroutine there (go conn.Close()), or set a shutdown timeout.
 func (c *Connection) Close() error {
 	// Guard the entire teardown with a sync.Once so concurrent callers (e.g. a
 	// deferred Close racing a signal handler) can't both close(c.closedFlag) —
@@ -469,12 +477,15 @@ func (c *Connection) Consume(queue string, opts ...ConsumeOption) (*Consumer, er
 //
 // The handler function is called for each message. The handler should call
 // msg.Ack() or msg.Nack() to acknowledge or reject the message. If the handler
-// returns without calling either, the message is automatically acked. If the
-// handler panics, the message is automatically nacked.
+// returns without settling the message, it is automatically acked while its
+// context is live and nacked if the context was cancelled. If the handler
+// panics, the message is automatically nacked. Explicit settlement (including
+// Release) takes precedence.
 //
 // Each handler invocation receives msg.StoppedCtx, which is cancelled when
 // the consumer begins shutting down (HandlerConsumer.Stop or
-// Connection.Close). Handlers should check ctx.Done() and return promptly.
+// Connection.Close) or, with auto-extension (the default), the message's lease
+// is lost. Handlers should check ctx.Done() and return promptly.
 //
 // No ctx parameter: this constructor performs no I/O. Consumer lifetime is
 // owned by HandlerConsumer.Stop() and Connection.Close().
@@ -967,9 +978,9 @@ type MaintenanceCounters struct {
 }
 
 // MaintenanceFast bundles the latency-sensitive maintenance routines into one
-// call: retire crashed-final-attempt rows to DLQ + reap expired exclusive
-// queues. Run on a 30-60 second cron (≤ ½ × the shortest keep_alive_interval
-// so dead exclusive queues are reaped within ~1.5× their interval).
+// call: retire abandoned final-attempt rows (the consumer crashed, or the
+// lease expired unsettled) to DLQ + reap expired exclusive queues. Run it every 1–10 seconds, and at least once every 60 seconds (see
+// the mq README, "Maintenance and retention").
 //
 // cleanup_completed_messages stays separate — it's a latency-tolerant bulk
 // DELETE governed by retention policy, not freshness.
@@ -1308,9 +1319,11 @@ func (c *Connection) DeleteInactiveQueues(ctx context.Context) error {
 }
 
 // CleanupCompletedMessages removes completed messages older than the provided retention window.
+// It then removes payloads older than the same window that no delivery or DLQ
+// entry references. The returned count covers completed deliveries only.
 //
 // This function should be called periodically (e.g., via cron or scheduled task)
-// to prevent unbounded growth of the queue_messages table.
+// to prevent unbounded growth of the queue_messages and messages tables.
 //
 // Parameters:
 //   - ctx: Context for cancellation and timeout control.

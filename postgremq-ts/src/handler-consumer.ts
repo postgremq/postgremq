@@ -11,15 +11,14 @@ import { MessageHandler } from './types';
 import { QueueFatalError } from './errors';
 
 // Re-export so callers can `import { MessageHandler } from 'postgremq'`.
-// The settlement rules (auto-ack on return, auto-nack on throw, no-op if the
-// handler settled the message itself) are documented on the type in types.ts
-// and implemented in runHandler below.
+// The auto-ack / auto-nack settlement rules are documented on MessageHandler
+// in types.ts and implemented in runHandler below.
 export { MessageHandler };
 
 /**
  * HandlerConsumer wraps a Consumer and dispatches each message to a handler
  * function with optional concurrency limiting (maxInFlight). It is the
- * push-based counterpart to the pull-based `for await (const msg of consumer)`
+ * push-based counterpart to the pull-based `for await (const msg of consumer.messages())`
  * iteration, and mirrors the Go client's ConsumeHandler.
  *
  * Create via Connection.consumeHandler — do not construct directly.
@@ -93,9 +92,10 @@ export class HandlerConsumer {
 
   /**
    * Pull messages from the underlying consumer and dispatch each to a handler.
-   * Acquires a concurrency slot BEFORE pulling a message so a message is never
-   * fetched without capacity to process it (its visibility timeout would
-   * otherwise tick while it waits) — matching the Go dispatch loop.
+   * Acquires a concurrency slot before taking the next message from the
+   * consumer's buffer, so at most maxInFlight handlers run. The consumer still
+   * prefetches up to batchSize messages; their leases are held (and
+   * auto-extended) while they wait.
    */
   private async dispatchLoop(): Promise<void> {
     const iterator = this.consumer.messages();
@@ -127,7 +127,8 @@ export class HandlerConsumer {
   }
 
   /**
-   * Run the handler for one message and apply the auto-ack / auto-nack rules.
+   * Run the handler for one message and apply the auto-ack / auto-nack rules
+   * (see MessageHandler in types.ts).
    * Never rejects — failures are handled and logged here so the dispatch loop
    * and stop() can always await the returned promise safely.
    */
@@ -152,7 +153,8 @@ export class HandlerConsumer {
 
     finishMetric(msg.signal.aborted ? 'cancelled' : '');
 
-    // Handler returned without settling — auto-ack.
+    // Handler returned without settling: ack, or nack if its signal fired
+    // (lease lost or shutdown).
     if (!msg.isSettled) {
       try {
         if (msg.signal.aborted) await msg.nack();
@@ -171,7 +173,9 @@ export class HandlerConsumer {
    * Idempotent — concurrent / repeated calls share the same shutdown.
    * Mirrors the Go HandlerConsumer.Stop() ordering: the underlying consumer
    * stop runs concurrently with the handler wait so cancelled handlers can
-   * finish acking before the consumer's release path runs.
+   * still settle (an explicit ack, or the automatic nack) before the consumer
+   * finishes. Bounded by the connection's shutdownTimeoutMs: stop() resolves
+   * then even if handlers are still running.
    */
   async stop(): Promise<void> {
     if (this.stopPromise) return this.stopPromise;
@@ -207,14 +211,20 @@ export class HandlerConsumer {
   }
 
   /**
-   * getQueueName reports the queue this handler consumer is bound to (delegates
-   * to the underlying consumer). Used by the connection's queueFatal routing.
+   * The generation (incarnation) of the queue the underlying consumer
+   * resolved; undefined before its first fetch. Used to ignore fatal signals
+   * for an older incarnation.
    * @internal
    */
   getQueueGeneration(): string | undefined {
     return this.consumer.getQueueGeneration();
   }
 
+  /**
+   * getQueueName reports the queue this handler consumer is bound to (delegates
+   * to the underlying consumer). Used by the connection's queueFatal routing.
+   * @internal
+   */
   getQueueName(): string {
     return this.consumer.getQueueName();
   }

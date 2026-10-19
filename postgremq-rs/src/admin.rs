@@ -106,9 +106,10 @@ fn non_negative(value: u32, what: &'static str) -> Result<i32> {
 }
 
 impl Connection {
-    /// Runs `pmq_maintenance_fast()`: retires crashed final attempts to the
-    /// dead letter queue and deletes expired exclusive queues. Schedule it
-    /// frequently (e.g. every second).
+    /// Runs `pmq_maintenance_fast()`: retires abandoned final attempts (the
+    /// consumer crashed, or the lease expired unsettled) to the dead letter
+    /// queue and deletes expired exclusive queues. Schedule it
+    /// every 1–10 seconds, and at least once every 60 seconds.
     ///
     /// # Errors
     ///

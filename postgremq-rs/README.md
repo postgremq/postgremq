@@ -537,8 +537,8 @@ use std::num::NonZeroU32;
 
 const BATCH: NonZeroU32 = NonZeroU32::new(1000).unwrap();
 
-// For example every second: retire crashed final attempts, drop expired
-// exclusive queues.
+// Every 1–10 seconds (at least once a minute): retire abandoned final
+// attempts, drop expired exclusive queues.
 let counters = conn.maintenance_fast().await?;
 // For example every 10 seconds: delete completed deliveries older than 24 h.
 let deleted = conn.cleanup_completed_messages(24, BATCH).await?;

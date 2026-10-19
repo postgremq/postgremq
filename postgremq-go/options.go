@@ -185,18 +185,16 @@ func WithMaxDeliveryAttempts(n int) QueueOption {
 
 // WithKeepAliveInterval sets the keep-alive interval for exclusive queues.
 //
-// Exclusive queues are automatically deleted when their keep_alive_until
-// timestamp expires. consume_message refreshes keep_alive_until on every
-// call (so an actively-polling consumer keeps its queue alive for free),
-// and the Connection runs a background timer that extends keep_alive_until
-// every (interval / 2) regardless. The interval should comfortably exceed
-// the longest expected gap between consume calls or message-handler runs.
+// Exclusive queues expire when their keep_alive_until timestamp passes, and
+// maintenance then deletes them. Consuming does not refresh keep_alive_until;
+// the Connection's keep-alive runs in the background and extends it about
+// every half interval.
 //
 // Parameters:
 //   - d: Keep-alive interval. Default is 5 minutes.
 //
-// If the Connection closes or crashes, the queue is deleted after the
-// interval elapses. Only applicable to exclusive queues.
+// If the Connection closes or crashes, the queue expires within the interval.
+// Only applicable to exclusive queues.
 func WithKeepAliveInterval(d time.Duration) QueueOption {
 	return func(o *queueOptions) {
 		o.keepAliveInterval = d
@@ -342,7 +340,8 @@ func WithCheckTimeout(d time.Duration) ConsumeOption {
 // processing the same message simultaneously.
 //
 // Parameters:
-//   - seconds: Visibility timeout in seconds. Default is 0 (must be set). Must be >= 0.
+//   - seconds: Visibility timeout in seconds. Must be >= 0. Default is 30,
+//     and 0 selects it; with WithNoAutoExtension a positive value is required.
 //
 // The visibility timeout should be longer than typical message processing time.
 // If auto-extension is enabled (default), messages are automatically extended
@@ -456,7 +455,7 @@ type messageOptions struct {
 //	msg.Nack(ctx, postgremq.WithDelayUntil(time.Now().Add(5*time.Minute)))
 //
 //	// Exponential backoff
-//	delay := time.Duration(math.Pow(2, float64(msg.DeliveryAttempts))) * time.Second
+//	delay := time.Duration(math.Pow(2, float64(msg.DeliveryAttempt))) * time.Second
 //	msg.Nack(ctx, postgremq.WithDelayUntil(time.Now().Add(delay)))
 func WithDelayUntil(t time.Time) MessageOption {
 	return func(o *messageOptions) {

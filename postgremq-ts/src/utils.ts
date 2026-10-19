@@ -19,6 +19,8 @@ const transientNodeErrorCodes = new Set([
 // Transient SQLSTATE codes for PostgreSQL errors that should trigger a retry:
 //   - 40001 (serialization_failure), 40P01 (deadlock_detected): transaction
 //     conflicts that may resolve on retry.
+//   - 55P03 (lock_not_available): a NOWAIT row lock lost to a concurrent
+//     holder (e.g. set_vt racing the auto-extender).
 //   - 57P01 (admin_shutdown), 57P02 (crash_shutdown), 57P03
 //     (cannot_connect_now): server-side restart / failover; retries succeed
 //     once the server is available.
@@ -57,7 +59,10 @@ export function shouldRetry(error: any): boolean {
 /**
  * Implements an exponential backoff retry mechanism for database operations.
  * @param operation - The async function to retry
- * @param retryPolicy - The retry policy configuration
+ * @param retryPolicy - The retry policy configuration; maxAttempts counts
+ *   every attempt, the first one included
+ * @param retryable - Which errors are retried (default shouldRetry); any
+ *   other error is thrown at once
  * @returns The result of the operation if successful
  * @throws The last error encountered if all retries fail
  */
@@ -199,6 +204,8 @@ export class EventEmitter {
   }
 }
 
+/** Unused duplicate of types.ts ConnectionOptions (nothing imports it); the
+ *  public option type is the one in types.ts. */
 export interface ConnectionOptions {
   // PostgreSQL connection string (overrides config if provided)
   connectionString?: string;
