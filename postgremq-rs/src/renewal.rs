@@ -29,7 +29,7 @@ use crate::checkout::Checkout;
 use crate::metrics::{Metrics, Operation, sqlx_error_type};
 use crate::options::RetryConfig;
 use crate::retry::{is_retryable, with_retry};
-use crate::scheduler::{Heartbeat, Schedule};
+use crate::scheduler::{Heartbeat, Schedule, heartbeat_deadline};
 use crate::types::{MessageId, millis_until};
 
 /// Retry delay after a `busy` outcome.
@@ -38,8 +38,6 @@ const BUSY_RETRY: Duration = Duration::from_millis(100);
 const MIN_RENEWAL: Duration = Duration::from_millis(100);
 /// Retry delay after a transport or database error.
 const ERROR_RETRY: Duration = Duration::from_secs(1);
-/// Upper bound for one renewal round trip.
-const FLUSH_TIMEOUT: Duration = Duration::from_secs(1);
 
 /// The identity of one delivery. (`Ord` only breaks heap ties; epochs are
 /// unique.)
@@ -458,10 +456,7 @@ pub(crate) async fn flush(
     // rows.
     let timer = metrics.operation(Operation::ExtendBatch, None, false);
     let started = Instant::now();
-    let deadline = items
-        .iter()
-        .map(|item| item.expires_at)
-        .fold(started + FLUSH_TIMEOUT, Instant::min);
+    let deadline = heartbeat_deadline(started, items.iter().map(|item| item.expires_at));
     let mut queues = Vec::with_capacity(items.len());
     let mut ids = Vec::with_capacity(items.len());
     let mut tokens = Vec::with_capacity(items.len());

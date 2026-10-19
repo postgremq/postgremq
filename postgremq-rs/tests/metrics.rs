@@ -825,13 +825,15 @@ async fn a_renewal_batch_cut_off_by_its_deadline_is_recorded() {
     let mut consumer = conn
         .consume(
             &queue,
-            ConsumeOptions::default().vt_secs(NonZeroU32::new(8).unwrap()),
+            ConsumeOptions::default()
+                .vt_secs(NonZeroU32::new(10).unwrap())
+                .extension_threshold(0.1),
         )
         .await
         .unwrap();
     let delivery = within(5, consumer.next()).await.unwrap().unwrap();
-    // The renewal (due after 4 s) blocks on the table and hits its 1 s bound;
-    // the 8 s lease leaves ample time to ack afterwards.
+    // The renewal (due after 1 s) blocks on the table and hits its 5 s bound;
+    // the 10 s lease leaves ample time to ack afterwards.
     let lock = lock_table(&db, "queue_messages").await;
     within(10, async {
         while !telemetry.collect().operations().iter().any(|point| {

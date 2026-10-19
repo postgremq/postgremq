@@ -199,3 +199,113 @@ test('unsafe IDs are rejected before destructive operations', async () => {
   await expect(c.deleteQueueMessage('q', Number.MAX_SAFE_INTEGER + 1)).rejects.toThrow(RangeError);
   await c.close();
 });
+
+/** A pool whose socket answers either heartbeat function a few milliseconds
+ *  after the query is sent, renewing every requested row for a minute except
+ *  those in `gone`, which it leaves out as the SQL does an expired lease or
+ *  queue. */
+function heartbeatClient(gone: string[], options: { onQueueFatal?: (queue: string) => void } = {}) {
+  const until = () => new Date(Date.now() + 60000);
+  const socket = {
+    release: jest.fn(),
+    query: jest.fn(async (sql: string, [names, ids, tokens]: any[]) => {
+      await sleep(5);
+      const rows = sql.includes('set_vt_batch_multi')
+        ? names.map((queue: string, i: number) => ({
+            key: `${queue}/${ids[i]}`,
+            queue_name: queue,
+            message_id: ids[i],
+            vt: until(),
+            consumer_token: tokens[i],
+            outcome: 'extended',
+          }))
+        : names.map((queue: string) => ({
+            key: queue,
+            queue_name: queue,
+            keep_alive_until: until(),
+            outcome: 'extended',
+          }));
+      return { rows: rows.filter((r: any) => !gone.includes(r.key)) };
+    }),
+  };
+  const c = new Connection({ pool: { on() {}, connect: async () => socket } as any, ...options });
+  (c as any).connected = true;
+  return { c, socket, budget: jest.spyOn(c as any, 'runDatabase') };
+}
+
+const renewal = (id: number, expiresAt: number) => ({
+  queue: 'q',
+  id,
+  token: 't',
+  vtSec: 30,
+  threshold: 0.5,
+  nextExtensionTime: new Date(),
+  expiresAt: new Date(expiresAt),
+  cancel: jest.fn(),
+  onExtended: jest.fn(),
+});
+
+test('a delivery expiring before the SQL runs does not fail its renewal batch', async () => {
+  const { c, socket } = heartbeatClient(['q/1']);
+  try {
+    const now = Date.now();
+    // Retried after busy until its deadline, which passes before the SQL runs.
+    const expiring = renewal(1, now + 2);
+    const healthy = [2, 3, 4].map((id) => renewal(id, now + 60000));
+    for (const e of [expiring, ...healthy]) (c as any).extenderEntries.set(`q\0${e.id}\0t`, e);
+    await (c as any).flushExtender();
+    expect(expiring.cancel).toHaveBeenCalled();
+    for (const e of healthy) {
+      expect(e.onExtended).toHaveBeenCalled();
+      expect(e.cancel).not.toHaveBeenCalled();
+    }
+    expect(socket.release).not.toHaveBeenCalledWith(true);
+  } finally {
+    await c.close();
+  }
+});
+
+test('a queue expiring before the SQL runs does not fail its keep-alive batch', async () => {
+  const fatal: string[] = [];
+  const { c, socket } = heartbeatClient(['expiring'], { onQueueFatal: (queue) => fatal.push(queue) });
+  try {
+    const now = Date.now();
+    const entry = (expiresAt: number) => ({
+      generation: 'g',
+      intervalSec: 60,
+      nextAt: new Date(now),
+      expiresAt: new Date(expiresAt),
+    });
+    (c as any).keepAliveEntries.set('expiring', entry(now + 2));
+    const healthy = ['a', 'b', 'c'];
+    for (const queue of healthy) (c as any).keepAliveEntries.set(queue, entry(now + 1000));
+    await (c as any).flushKeepAlive();
+    expect(fatal).toEqual(['expiring']);
+    for (const queue of healthy)
+      expect((c as any).keepAliveEntries.get(queue).expiresAt.getTime()).toBeGreaterThan(now + 30000);
+    expect(socket.release).not.toHaveBeenCalledWith(true);
+  } finally {
+    await c.close();
+  }
+});
+
+test('a heartbeat call waits for the earliest deadline, between one and five seconds', async () => {
+  const { c, budget } = heartbeatClient([]);
+  try {
+    const flush = async (expiresIn: number) => {
+      const e = renewal(1, Date.now() + expiresIn);
+      (c as any).extenderEntries.set('q\x001\x00t', e);
+      await (c as any).flushExtender();
+      (c as any).extenderEntries.clear();
+      return budget.mock.calls.pop()![1] as number;
+    };
+    expect(await flush(-1000)).toBe(1000);
+    expect(await flush(2)).toBe(1000);
+    const within = await flush(3000);
+    expect(within).toBeGreaterThan(2900);
+    expect(within).toBeLessThanOrEqual(3000);
+    expect(await flush(60000)).toBe(5000);
+  } finally {
+    await c.close();
+  }
+});

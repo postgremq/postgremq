@@ -10,6 +10,7 @@
 
 use std::future::Future;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
@@ -67,6 +68,27 @@ impl Heartbeat {
             ))),
         }
     }
+}
+
+/// The least time one heartbeat call is given.
+const MIN_HEARTBEAT_BUDGET: Duration = Duration::from_secs(1);
+/// The most time one heartbeat call is given.
+const MAX_HEARTBEAT_BUDGET: Duration = Duration::from_secs(5);
+
+/// When a heartbeat call started at `started` is abandoned: at the earliest
+/// confirmed deadline in its batch, between [`MIN_HEARTBEAT_BUDGET`] and
+/// [`MAX_HEARTBEAT_BUDGET`], so an entry about to expire cannot fail the call
+/// for the rest of the batch.
+/// The SQL leaves out a row whose deadline has passed, so it is reported lost
+/// from the result.
+pub(crate) fn heartbeat_deadline(
+    started: Instant,
+    deadlines: impl IntoIterator<Item = Instant>,
+) -> Instant {
+    deadlines
+        .into_iter()
+        .fold(started + MAX_HEARTBEAT_BUDGET, Instant::min)
+        .max(started + MIN_HEARTBEAT_BUDGET)
 }
 
 /// A running scheduler: its shared schedule plus the handles to wake and stop it.
@@ -215,5 +237,30 @@ async fn sleep_until(at: Option<Instant>) {
     match at {
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_heartbeat_call_waits_for_the_earliest_deadline_between_one_and_five_seconds() {
+        let now = Instant::now();
+        let secs = Duration::from_secs;
+        let at = |deadlines: &[Instant]| heartbeat_deadline(now, deadlines.iter().copied());
+        assert_eq!(at(&[]), now + secs(5), "no deadline");
+        assert_eq!(at(&[now + secs(60)]), now + secs(5), "far away");
+        assert_eq!(
+            at(&[now + secs(60), now + secs(3)]),
+            now + secs(3),
+            "within bounds"
+        );
+        assert_eq!(
+            at(&[now + secs(60), now + Duration::from_millis(1)]),
+            now + secs(1),
+            "about to expire"
+        );
+        assert_eq!(at(&[now, now + secs(60)]), now + secs(1), "expired");
     }
 }
