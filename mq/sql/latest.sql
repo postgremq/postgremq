@@ -451,8 +451,8 @@ $$ LANGUAGE plpgsql;
  * Raises:
  *   - PMQ02 if p_topic_name doesn't exist, or the queue is an expired
  *     exclusive queue.
- *   - PMQ03 if the name fails validation (pattern or > 57 bytes),
- *     p_keep_alive_interval is NULL or not positive, p_max_attempts is
+ *   - PMQ03 if any argument is NULL, the name fails validation (pattern or
+ *     > 57 bytes), p_keep_alive_interval is not positive, p_max_attempts is
  *     negative, or a queue with this name already exists with different
  *     parameters.
  */
@@ -486,9 +486,12 @@ BEGIN
     IF p_keep_alive_interval IS NULL OR p_keep_alive_interval <= interval '0' THEN
         RAISE EXCEPTION 'keep alive interval must be positive' USING ERRCODE = 'PMQ03';
     END IF;
-    IF p_max_attempts < 0 THEN
+    IF p_max_attempts IS NULL OR p_max_attempts < 0 THEN
         RAISE EXCEPTION 'p_max_attempts must be >= 0 (got %)', p_max_attempts
           USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_topic_name IS NULL OR p_exclusive IS NULL THEN
+        RAISE EXCEPTION 'p_topic_name and p_exclusive must not be NULL' USING ERRCODE = 'PMQ03';
     END IF;
     -- Surface a missing topic as PMQ02 (parity with publish_message). Without
     -- this check the INSERT below would still fail, but with a raw 23503 FK
@@ -587,7 +590,8 @@ $$ LANGUAGE plpgsql;
  *
  * Raises:
  *   - PMQ02 if the topic does not exist.
- *   - PMQ03 if p_group_key is empty or longer than 255 characters.
+ *   - PMQ03 if p_topic or p_payload is NULL (a JSON null payload is 'null'::jsonb),
+ *     or p_group_key is empty or longer than 255 characters.
  */
 CREATE OR REPLACE FUNCTION postgremq.publish_message(
     p_topic VARCHAR(255),
@@ -599,6 +603,9 @@ DECLARE
     v_message_id BIGINT;
     v_group_seq BIGINT;
 BEGIN
+    IF p_topic IS NULL OR p_payload IS NULL THEN
+        RAISE EXCEPTION 'p_topic and p_payload must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
     IF NOT EXISTS (SELECT 1 FROM postgremq.topics WHERE name = p_topic) THEN
         RAISE EXCEPTION 'Topic "%" does not exist', p_topic
           USING ERRCODE = 'PMQ02';
@@ -661,7 +668,7 @@ $$ LANGUAGE plpgsql;
  *   when the row entered this queue (distribution or DLQ requeue).
  *
  * Raises:
- *   - PMQ03 if p_vt < 0 or p_limit <= 0.
+ *   - PMQ03 if p_queue_name, p_vt or p_limit is NULL, p_vt < 0 or p_limit <= 0.
  *   - PMQ02 if the queue does not exist (deleted out-of-band), is an exclusive
  *     queue whose keep-alive expired, or is not the incarnation named by
  *     p_generation. An existing, live but empty queue returns zero rows with
@@ -688,11 +695,16 @@ DECLARE
     v_generation   UUID;
     v_now          TIMESTAMPTZ;
 BEGIN
-    IF p_vt < 0 THEN
-        RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
+    -- NULL must be rejected explicitly: it passes the range checks, and a
+    -- NULL p_limit would reach LIMIT NULL (no limit) and lease the whole queue.
+    IF p_queue_name IS NULL THEN
+        RAISE EXCEPTION 'p_queue_name must not be NULL' USING ERRCODE = 'PMQ03';
     END IF;
-    IF p_limit <= 0 THEN
-        RAISE EXCEPTION 'p_limit must be > 0' USING ERRCODE = 'PMQ03';
+    IF p_vt IS NULL OR p_vt < 0 THEN
+        RAISE EXCEPTION 'p_vt must be >= 0 (got %)', p_vt USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_limit IS NULL OR p_limit <= 0 THEN
+        RAISE EXCEPTION 'p_limit must be > 0 (got %)', p_limit USING ERRCODE = 'PMQ03';
     END IF;
 
     -- Consuming a queue that no longer exists is fatal for the caller's consumer:
@@ -815,6 +827,7 @@ $$ LANGUAGE plpgsql;
  *     unclaimable until this head settled. Ungrouped acks stay silent.
  *
  * Raises:
+ *   - PMQ03 if any argument is NULL.
  *   - PMQ01 if the row is not 'processing' under p_consumer_token (not found,
  *     already settled, or reclaimed by another consumer). The lease deadline
  *     is not checked: an ack after vt has passed succeeds while no other
@@ -825,6 +838,10 @@ RETURNS VOID AS $$
 DECLARE
   v_group_key VARCHAR(255);
 BEGIN
+  IF p_queue_name IS NULL OR p_message_id IS NULL OR p_consumer_token IS NULL THEN
+    RAISE EXCEPTION 'Ack failed: queue name, message id and consumer token must not be NULL'
+      USING ERRCODE = 'PMQ03';
+  END IF;
   UPDATE postgremq.queue_messages
   SET status = 'completed',
       processed_at = clock_timestamp(),
@@ -867,11 +884,12 @@ $$ LANGUAGE plpgsql;
  *   - p_message_id (BIGINT): Identifier of the message.
  *   - p_consumer_token (VARCHAR): The consumer token to verify the consumer.
  *   - p_delay_until (TIMESTAMPTZ, default clock_timestamp()): Next visibility
- *     time (non-final attempt). An explicit NULL fails with 23502.
+ *     time (non-final attempt).
  *
  * Returns: VOID.
  *
  * Raises:
+ *   - PMQ03 if any argument is NULL, including an explicit NULL p_delay_until.
  *   - PMQ01 if the row is not 'processing' under p_consumer_token. The lease
  *     deadline is not checked.
  */
@@ -886,6 +904,13 @@ DECLARE
     v_max_attempts INT;
     v_group_key    VARCHAR(255);
 BEGIN
+    IF p_queue_name IS NULL OR p_message_id IS NULL OR p_consumer_token IS NULL THEN
+        RAISE EXCEPTION 'Nack failed: queue name, message id and consumer token must not be NULL'
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_delay_until IS NULL THEN
+        RAISE EXCEPTION 'Nack failed: p_delay_until must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
     -- Look up the queue's retry limit. We need this to decide between the
     -- "reset to pending" path and the "inline DLQ retirement" path.
     -- FOR SHARE pins the queue row for the rest of the function: without it
@@ -954,6 +979,7 @@ $$ LANGUAGE plpgsql;
  * Returns: VOID.
  *
  * Raises:
+ *   - PMQ03 if any argument is NULL.
  *   - PMQ01 if the row is not 'processing' under p_consumer_token. The lease
  *     deadline is not checked.
  */
@@ -964,6 +990,10 @@ CREATE OR REPLACE FUNCTION postgremq.release_message(
 )
     RETURNS VOID AS $$
 BEGIN
+    IF p_queue_name IS NULL OR p_message_id IS NULL OR p_consumer_token IS NULL THEN
+        RAISE EXCEPTION 'Release message failed: queue name, message id and consumer token must not be NULL'
+          USING ERRCODE = 'PMQ03';
+    END IF;
     UPDATE postgremq.queue_messages
     SET status = 'pending',
         vt = clock_timestamp(),
@@ -1004,7 +1034,7 @@ $$ LANGUAGE plpgsql;
  *   TIMESTAMPTZ: the new lease end (vt).
  *
  * Raises:
- *   - PMQ03 if p_vt < 0.
+ *   - PMQ03 if any argument is NULL or p_vt < 0.
  *   - PMQ01 if the row is not 'processing' under p_consumer_token or its lease
  *     has already expired (unlike ack/nack/release, extension requires a live
  *     lease).
@@ -1024,8 +1054,12 @@ CREATE OR REPLACE FUNCTION postgremq.set_vt(
 DECLARE
     v_vt TIMESTAMPTZ;
 BEGIN
-    IF p_vt < 0 THEN
-        RAISE EXCEPTION 'p_vt must be >= 0' USING ERRCODE = 'PMQ03';
+    IF p_queue_name IS NULL OR p_message_id IS NULL OR p_consumer_token IS NULL THEN
+        RAISE EXCEPTION 'Extend lock failed: queue name, message id and consumer token must not be NULL'
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_vt IS NULL OR p_vt < 0 THEN
+        RAISE EXCEPTION 'p_vt must be >= 0 (got %)', p_vt USING ERRCODE = 'PMQ03';
     END IF;
 
     SELECT qm.vt INTO v_vt FROM postgremq.queue_messages qm
@@ -1173,7 +1207,8 @@ $$ LANGUAGE plpgsql;
  *   different generation are omitted (the lease is lost).
  *
  * Raises:
- *   - PMQ03 if the array lengths differ or any interval is NULL or <= 0.
+ *   - PMQ03 if p_queue_names or p_intervals_ms is NULL, the array lengths
+ *     differ, or any interval is NULL or <= 0.
  */
 CREATE OR REPLACE FUNCTION postgremq.extend_queue_keep_alive_multi(
     p_queue_names  VARCHAR[],
@@ -1182,7 +1217,9 @@ CREATE OR REPLACE FUNCTION postgremq.extend_queue_keep_alive_multi(
 ) RETURNS TABLE (queue_name VARCHAR, keep_alive_until TIMESTAMPTZ, outcome TEXT) AS $$
 DECLARE r RECORD; deadline TIMESTAMPTZ;
 BEGIN
-    IF cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_intervals_ms)
+    -- Both arrays NULL would pass the length check (equal NULL cardinalities).
+    IF p_queue_names IS NULL OR p_intervals_ms IS NULL
+       OR cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_intervals_ms)
        OR (p_generations IS NOT NULL AND cardinality(p_generations) IS DISTINCT FROM cardinality(p_queue_names))
        OR EXISTS (SELECT 1 FROM unnest(p_intervals_ms) v WHERE v IS NULL OR v <= 0) THEN
         RAISE EXCEPTION 'invalid keep alive batch' USING ERRCODE = 'PMQ03';
@@ -1382,12 +1419,18 @@ $$ LANGUAGE plpgsql;
  *   - p_queue_name (VARCHAR): Name of the queue to requeue messages for.
  *
  * Returns: VOID.
+ *
+ * Raises:
+ *   - PMQ03 if p_queue_name is NULL.
  */
 CREATE OR REPLACE FUNCTION postgremq.requeue_dlq_messages(p_queue_name VARCHAR(255))
 RETURNS VOID AS $$
 DECLARE
     v_requeued INT;
 BEGIN
+    IF p_queue_name IS NULL THEN
+        RAISE EXCEPTION 'p_queue_name must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
     WITH moved_messages AS (
         DELETE FROM postgremq.dead_letter_queue dlq
         WHERE dlq.queue_name = p_queue_name
@@ -1475,11 +1518,14 @@ $$ LANGUAGE plpgsql;
  * Returns: VOID.
  *
  * Raises:
- *   - PMQ03 if any message of the topic exists.
+ *   - PMQ03 if p_topic is NULL or any message of the topic exists.
  */
 CREATE OR REPLACE FUNCTION postgremq.delete_topic(p_topic VARCHAR(255))
 RETURNS VOID AS $$
 BEGIN
+  IF p_topic IS NULL THEN
+    RAISE EXCEPTION 'p_topic must not be NULL' USING ERRCODE = 'PMQ03';
+  END IF;
   IF EXISTS (SELECT 1 FROM postgremq.messages WHERE topic_name = p_topic) THEN
     RAISE EXCEPTION 'Cannot delete topic "%" because messages exist. Clean up the topic first.', p_topic
       USING ERRCODE = 'PMQ03';
@@ -1502,14 +1548,17 @@ $$ LANGUAGE plpgsql;
  * Returns: VOID.
  *
  * Raises:
- *   - PMQ03 while the queue has DLQ entries (requeue_dlq_messages or
- *     purge_dlq first).
+ *   - PMQ03 if p_queue is NULL, or while the queue has DLQ entries
+ *     (requeue_dlq_messages or purge_dlq first).
  */
 CREATE OR REPLACE FUNCTION postgremq.delete_queue(p_queue VARCHAR(255))
 RETURNS VOID AS $$
 DECLARE
   v_dlq_count INT;
 BEGIN
+  IF p_queue IS NULL THEN
+    RAISE EXCEPTION 'p_queue must not be NULL' USING ERRCODE = 'PMQ03';
+  END IF;
   -- Refuse if the queue has DLQ entries. Same reasoning as clean_up_topic:
   -- forensic data the operator may want to keep. Force an explicit
   -- decision (postgremq.purge_dlq() or postgremq.requeue_dlq_messages()) before deletion.
@@ -1538,6 +1587,9 @@ $$ LANGUAGE plpgsql;
  *   - p_message_id (BIGINT): The identifier of the message to be deleted.
  *
  * Returns: VOID.
+ *
+ * Raises:
+ *   - PMQ03 if any argument is NULL.
  */
 CREATE OR REPLACE FUNCTION postgremq.delete_queue_message(p_queue_name VARCHAR(255), p_message_id BIGINT)
 RETURNS VOID AS $$
@@ -1545,6 +1597,9 @@ DECLARE
   v_group_key VARCHAR(255);
   v_status    VARCHAR(16);
 BEGIN
+  IF p_queue_name IS NULL OR p_message_id IS NULL THEN
+    RAISE EXCEPTION 'p_queue_name and p_message_id must not be NULL' USING ERRCODE = 'PMQ03';
+  END IF;
   DELETE FROM postgremq.queue_messages
   WHERE queue_name = p_queue_name
     AND message_id = p_message_id
@@ -1567,10 +1622,16 @@ $$ LANGUAGE plpgsql;
  *   - p_queue (VARCHAR): The name of the queue to clean up.
  *
  * Returns: VOID.
+ *
+ * Raises:
+ *   - PMQ03 if p_queue is NULL.
  */
 CREATE OR REPLACE FUNCTION postgremq.clean_up_queue(p_queue VARCHAR(255))
 RETURNS VOID AS $$
 BEGIN
+  IF p_queue IS NULL THEN
+    RAISE EXCEPTION 'p_queue must not be NULL' USING ERRCODE = 'PMQ03';
+  END IF;
   DELETE FROM postgremq.queue_messages WHERE queue_name = p_queue;
 END;
 $$ LANGUAGE plpgsql;
@@ -1589,14 +1650,17 @@ $$ LANGUAGE plpgsql;
  * Returns: VOID.
  *
  * Raises:
- *   - PMQ03 while any of the topic's messages is in a DLQ
- *     (requeue_dlq_messages or purge_dlq first).
+ *   - PMQ03 if p_topic is NULL, or while any of the topic's messages is in a
+ *     DLQ (requeue_dlq_messages or purge_dlq first).
  */
 CREATE OR REPLACE FUNCTION postgremq.clean_up_topic(p_topic VARCHAR(255))
 RETURNS VOID AS $$
 DECLARE
   v_dlq_count INT;
 BEGIN
+  IF p_topic IS NULL THEN
+    RAISE EXCEPTION 'p_topic must not be NULL' USING ERRCODE = 'PMQ03';
+  END IF;
   -- Refuse if any messages of this topic are in a DLQ — those entries
   -- are forensic data the operator may want to keep. Force an explicit
   -- decision (postgremq.purge_dlq() or postgremq.requeue_dlq_messages()) before clean_up.
@@ -1665,7 +1729,8 @@ $$ LANGUAGE plpgsql;
  *   Omitted entries have lost ownership or expired.
  *
  * Raises:
- *   - PMQ03 if the array lengths differ or any p_vts element is NULL or negative.
+ *   - PMQ03 if any array is NULL, the array lengths differ, or any p_vts
+ *     element is NULL or negative.
  */
 CREATE OR REPLACE FUNCTION postgremq.set_vt_batch_multi(
     p_queue_names     VARCHAR[],
@@ -1675,7 +1740,9 @@ CREATE OR REPLACE FUNCTION postgremq.set_vt_batch_multi(
 ) RETURNS TABLE (queue_name VARCHAR, message_id BIGINT, vt TIMESTAMPTZ, consumer_token VARCHAR, outcome TEXT) AS $$
 DECLARE r RECORD; owned postgremq.queue_messages%ROWTYPE;
 BEGIN
-    IF cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_message_ids)
+    -- All four arrays NULL would pass the length checks (equal NULL cardinalities).
+    IF p_queue_names IS NULL OR p_message_ids IS NULL OR p_consumer_tokens IS NULL OR p_vts IS NULL
+       OR cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_message_ids)
        OR cardinality(p_message_ids) IS DISTINCT FROM cardinality(p_consumer_tokens)
        OR cardinality(p_consumer_tokens) IS DISTINCT FROM cardinality(p_vts)
        OR EXISTS (SELECT 1 FROM unnest(p_vts) v WHERE v IS NULL OR v < 0) THEN
@@ -1709,6 +1776,9 @@ $$ LANGUAGE plpgsql;
  *
  * Returns:
  *   A TABLE with message details (excluding payload).
+ *
+ * Raises:
+ *   - PMQ03 if p_queue_name is NULL.
  */
 CREATE OR REPLACE FUNCTION postgremq.list_messages(p_queue_name VARCHAR(255))
 RETURNS TABLE(
@@ -1722,6 +1792,9 @@ RETURNS TABLE(
     group_seq BIGINT
 ) AS $$
 BEGIN
+    IF p_queue_name IS NULL THEN
+        RAISE EXCEPTION 'p_queue_name must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
     RETURN QUERY
     SELECT 
         qm.message_id,
@@ -1748,6 +1821,9 @@ $$ LANGUAGE plpgsql;
  *
  * Returns:
  *   A TABLE with message details and payload.
+ *
+ * Raises:
+ *   - PMQ03 if p_message_id is NULL.
  */
 CREATE OR REPLACE FUNCTION postgremq.get_message(p_message_id BIGINT)
 RETURNS TABLE(
@@ -1759,6 +1835,9 @@ RETURNS TABLE(
     group_seq BIGINT
 ) AS $$
 BEGIN
+    IF p_message_id IS NULL THEN
+        RAISE EXCEPTION 'p_message_id must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
     RETURN QUERY
     SELECT 
         m.id,
@@ -1793,12 +1872,18 @@ $$ LANGUAGE plpgsql;
  *
  * Returns:
  *   TIMESTAMPTZ, or NULL when no row qualifies (or the queue does not exist).
+ *
+ * Raises:
+ *   - PMQ03 if p_queue_name is NULL.
  */
 CREATE OR REPLACE FUNCTION postgremq.get_next_visible_time(p_queue_name VARCHAR(255))
 RETURNS TIMESTAMPTZ AS $$
 DECLARE
     v_next_vt TIMESTAMPTZ;
 BEGIN
+    IF p_queue_name IS NULL THEN
+        RAISE EXCEPTION 'p_queue_name must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
     SELECT qm.vt INTO v_next_vt
     FROM postgremq.queue_messages qm
     JOIN postgremq.queues q ON q.name = qm.queue_name
@@ -1849,7 +1934,7 @@ CREATE INDEX idx_messages_retention ON postgremq.messages(published_at, id);
  *
  * Parameters:
  *   - p_topics, p_keys (VARCHAR[]): Candidate (topic_name, group_key) pairs,
- *     element-wise. NULL or empty arrays return 0.
+ *     element-wise. Both NULL or both empty return 0.
  *
  * Returns:
  *   INT - number of group rows deleted.
@@ -1916,7 +2001,8 @@ $$ LANGUAGE plpgsql;
  *   INT - number of payloads deleted.
  *
  * Raises:
- *   - PMQ03 if p_older_than_hours < 0 or p_batch_size <= 0.
+ *   - PMQ03 if p_older_than_hours or p_batch_size is NULL, p_older_than_hours < 0
+ *     or p_batch_size <= 0.
  */
 CREATE OR REPLACE FUNCTION postgremq.cleanup_unreferenced_messages(p_older_than_hours INT DEFAULT 24, p_batch_size INT DEFAULT 1000)
 RETURNS INT AS $$
@@ -1925,7 +2011,10 @@ DECLARE
     v_topics VARCHAR[];
     v_keys   VARCHAR[];
 BEGIN
-    IF p_older_than_hours < 0 OR p_batch_size <= 0 THEN
+    -- NULL must be rejected explicitly: a NULL p_batch_size would reach
+    -- LIMIT NULL (no limit).
+    IF p_older_than_hours IS NULL OR p_batch_size IS NULL
+       OR p_older_than_hours < 0 OR p_batch_size <= 0 THEN
         RAISE EXCEPTION 'invalid retention or batch size' USING ERRCODE = 'PMQ03';
     END IF;
     WITH candidates AS (
@@ -1971,7 +2060,8 @@ $$ LANGUAGE plpgsql;
  *   INTEGER - number of completed deliveries deleted.
  *
  * Raises:
- *   - PMQ03 if p_older_than_hours < 0 or p_batch_size <= 0.
+ *   - PMQ03 if p_older_than_hours or p_batch_size is NULL, p_older_than_hours < 0
+ *     or p_batch_size <= 0.
  *
  * Example:
  *   -- Delete up to 1000 deliveries completed more than 24 hours ago
@@ -1984,7 +2074,10 @@ CREATE OR REPLACE FUNCTION postgremq.cleanup_completed_messages(p_older_than_hou
 RETURNS INT AS $$
 DECLARE deleted INT;
 BEGIN
-    IF p_older_than_hours < 0 OR p_batch_size <= 0 THEN
+    -- NULL must be rejected explicitly: a NULL p_batch_size would reach
+    -- LIMIT NULL (no limit).
+    IF p_older_than_hours IS NULL OR p_batch_size IS NULL
+       OR p_older_than_hours < 0 OR p_batch_size <= 0 THEN
         RAISE EXCEPTION 'invalid retention or batch size' USING ERRCODE = 'PMQ03';
     END IF;
     WITH candidates AS (
@@ -2068,4 +2161,4 @@ $$;
  */
 CREATE TABLE postgremq.postgremq_migrations (version bigint not null primary key, dirty boolean not null);
 
-INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (10001, false);
+INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (10002, false);
