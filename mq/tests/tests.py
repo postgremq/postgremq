@@ -1467,6 +1467,146 @@ def test_sqlstate_codes_pmq03_validation(cur: psycopg2.extensions.cursor) -> Non
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
 
+# Every public function with arguments: a valid call (placeholders {topic},
+# {queue}, {id}, {token}) and the argument positions where NULL has a
+# documented meaning. Every other position is required, and a NULL there must
+# raise PMQ03.
+NULL_ARGUMENT_CALLS = {
+    'create_topic': (["'{topic}_new'"], set()),
+    'create_queue': (["'{queue}_new'", "'{topic}'", '0', 'false', "'5 minutes'::interval"], set()),
+    # deliver_after NULL = now, group_key NULL = ungrouped
+    'publish_message': (["'{topic}'", "'{{}}'::jsonb", 'clock_timestamp()', "'g'"], {2, 3}),
+    # generation NULL = any incarnation
+    'consume_message': (["'{queue}'", '30', '1', 'NULL'], {3}),
+    'ack_message': (["'{queue}'", '{id}', "'{token}'"], set()),
+    'nack_message': (["'{queue}'", '{id}', "'{token}'", 'clock_timestamp()'], set()),
+    'release_message': (["'{queue}'", '{id}', "'{token}'"], set()),
+    'set_vt': (["'{queue}'", '{id}', "'{token}'", '30'], set()),
+    'set_vt_batch_multi': (["ARRAY['{queue}']::varchar[]", 'ARRAY[{id}]::bigint[]',
+                            "ARRAY['{token}']::varchar[]", 'ARRAY[30]::int[]'], set()),
+    # generations NULL = any incarnation
+    'extend_queue_keep_alive_multi': (["ARRAY['{queue}']::varchar[]", 'ARRAY[60000]::bigint[]', 'NULL'], {2}),
+    # NULL = all queues
+    'get_queue_statistics': (['NULL'], {0}),
+    'requeue_dlq_messages': (["'{queue}'"], set()),
+    'delete_topic': (["'{topic}_none'"], set()),
+    'delete_queue': (["'{queue}'"], set()),
+    'delete_queue_message': (["'{queue}'", '{id}'], set()),
+    'clean_up_queue': (["'{queue}'"], set()),
+    'clean_up_topic': (["'{topic}'"], set()),
+    'list_messages': (["'{queue}'"], set()),
+    'get_message': (['{id}'], set()),
+    'get_next_visible_time': (["'{queue}'"], set()),
+    # NULL arrays = an empty batch
+    'prune_message_groups': (['NULL', 'NULL'], {0, 1}),
+    'cleanup_unreferenced_messages': (['24', '1000'], set()),
+    'cleanup_completed_messages': (['24', '1000'], set()),
+}
+
+NULL_ARGUMENT_CASES = [
+    (name, position)
+    for name, (args, optional) in NULL_ARGUMENT_CALLS.items()
+    for position in range(len(args)) if position not in optional
+]
+
+
+def test_null_argument_calls_cover_every_public_function(cur):
+    """NULL_ARGUMENT_CALLS lists every postgremq function that takes arguments,
+    with all of them, so a new function or argument is not left unchecked."""
+    cur.execute("""
+        SELECT p.proname, p.pronargs FROM pg_proc p
+        JOIN pg_namespace n ON n.oid = p.pronamespace
+        WHERE n.nspname = 'postgremq' AND p.pronargs > 0
+        ORDER BY 1, 2""")
+    # A list, not a dict: an overload would be a second row for its name.
+    assert [tuple(r) for r in cur.fetchall()] == \
+        sorted((name, len(args)) for name, (args, _) in NULL_ARGUMENT_CALLS.items())
+
+
+def _null_argument_call(cur, name, null_position=None):
+    """NULL_ARGUMENT_CALLS[name] as SQL, against a fresh topic and queue with
+    a live lease (the {id}/{token} placeholders) and one visible message, so
+    the call has something to act on. null_position replaces that argument
+    with NULL."""
+    suffix = uuid.uuid4().hex[:8]
+    topic, queue = f'NullArgT_{suffix}', f'NullArgQ_{suffix}'
+    cur.execute("SELECT postgremq.create_topic(%s)", (topic,))
+    cur.execute("SELECT postgremq.create_queue(%s, %s)", (queue, topic))
+    cur.execute("SELECT postgremq.publish_message(%s, '{}'::jsonb)", (topic,))
+    cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message(%s, 300)", (queue,))
+    msg_id, token = cur.fetchone()
+    cur.execute("SELECT postgremq.publish_message(%s, '{}'::jsonb)", (topic,))
+    args = [a.format(topic=topic, queue=queue, id=msg_id, token=token)
+            for a in NULL_ARGUMENT_CALLS[name][0]]
+    if null_position is not None:
+        args[null_position] = 'NULL'
+    return f"SELECT * FROM postgremq.{name}({', '.join(args)})"
+
+
+@pytest.mark.parametrize('name', NULL_ARGUMENT_CALLS)
+def test_null_argument_calls_are_valid(cur, name):
+    """Without a NULL, each call in NULL_ARGUMENT_CALLS succeeds, so the PMQ03
+    in test_null_required_argument_raises_pmq03 comes from the NULL alone."""
+    cur.execute(_null_argument_call(cur, name))
+
+
+@pytest.mark.parametrize('name,position', NULL_ARGUMENT_CASES,
+                         ids=[f'{n}-arg{p + 1}' for n, p in NULL_ARGUMENT_CASES])
+def test_null_required_argument_raises_pmq03(cur, name, position):
+    """A NULL in a required argument raises PMQ03 (issue #14)."""
+    sql = _null_argument_call(cur, name, position)
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute(sql)
+    assert exc_info.value.pgcode == 'PMQ03', f'{sql}: {exc_info.value.pgcode} {exc_info.value.pgerror}'
+
+
+@pytest.mark.parametrize('sql', [
+    "SELECT * FROM postgremq.set_vt_batch_multi(NULL, NULL, NULL, NULL)",
+    "SELECT * FROM postgremq.extend_queue_keep_alive_multi(NULL, NULL)",
+    "SELECT * FROM postgremq.extend_queue_keep_alive_multi(NULL, NULL, NULL)",
+])
+def test_null_batch_arrays_raise_pmq03(cur, sql):
+    """All-NULL arrays pass the length checks (equal NULL cardinalities), so
+    they are rejected explicitly rather than read as an empty batch."""
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute(sql)
+    assert exc_info.value.pgcode == 'PMQ03', f'{sql}: {exc_info.value.pgcode} {exc_info.value.pgerror}'
+
+
+def test_consume_null_limit_claims_nothing(cur):
+    """consume_message with a NULL p_limit raises PMQ03 and leases nothing,
+    instead of claiming every visible message (LIMIT NULL is no limit)."""
+    cur.execute("SELECT postgremq.create_topic('NullLimitTopic')")
+    cur.execute("SELECT postgremq.create_queue('NullLimitQueue', 'NullLimitTopic')")
+    for _ in range(5):
+        cur.execute("SELECT postgremq.publish_message('NullLimitTopic', '{}'::jsonb)")
+    with pytest.raises(psycopg2.Error) as exc_info:
+        cur.execute("SELECT * FROM postgremq.consume_message('NullLimitQueue', 30, NULL)")
+    assert exc_info.value.pgcode == 'PMQ03'
+    cur.execute("SELECT pending_count, processing_count FROM postgremq.get_queue_statistics('NullLimitQueue')")
+    assert tuple(cur.fetchone()) == (5, 0)
+
+
+def test_null_keeps_its_documented_meaning(cur):
+    """The arguments where NULL means something still accept it."""
+    cur.execute("SELECT postgremq.create_topic('NullMeaningTopic')")
+    cur.execute("SELECT postgremq.create_queue('NullMeaningQueue', 'NullMeaningTopic', 0, true)")
+    # deliver_after NULL = now, group_key NULL = ungrouped.
+    cur.execute("SELECT postgremq.publish_message('NullMeaningTopic', '{}'::jsonb, NULL, NULL)")
+    # generation NULL = whichever incarnation exists.
+    cur.execute("SELECT message_id, group_key FROM postgremq.consume_message('NullMeaningQueue', 30, 1, NULL)")
+    rows = cur.fetchall()
+    assert len(rows) == 1 and rows[0][1] is None
+    cur.execute("SELECT outcome FROM postgremq.extend_queue_keep_alive_multi("
+                "ARRAY['NullMeaningQueue']::varchar[], ARRAY[60000]::bigint[], NULL)")
+    assert [r[0] for r in cur.fetchall()] == ['extended']
+    # NULL = every queue.
+    cur.execute("SELECT total_count FROM postgremq.get_queue_statistics(NULL)")
+    assert cur.fetchone()[0] >= 1
+    # NULL arrays = an empty batch.
+    cur.execute("SELECT postgremq.prune_message_groups(NULL, NULL)")
+    assert cur.fetchone()[0] == 0
+
 def test_nack_final_attempt_inline_dlq(cur: psycopg2.extensions.cursor) -> None:
     """Final-attempt nack moves the row to DLQ inline (no maintenance call needed)."""
     cur.execute("SELECT postgremq.create_topic('TestTopic')")

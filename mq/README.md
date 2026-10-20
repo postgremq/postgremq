@@ -281,9 +281,8 @@ publishes to the topic, nacks and redeclarations of the queue wait for it.
   `delivery_attempts`, `vt`, `published_at`, `group_key` and `group_seq`.
 - If the queue is missing, expired or of a different generation, the call raises
   `PMQ02`. A queue that exists but is empty returns zero rows.
-- A negative `vt_seconds` or a `batch_size` ≤ 0 raises `PMQ03`. NULL is not
-  rejected: a NULL `batch_size` claims every claimable row, and a NULL
-  `vt_seconds` fails with `23502` as soon as a row is claimed.
+- A NULL queue name, `vt_seconds` or `batch_size`, a negative `vt_seconds`, or a
+  `batch_size` ≤ 0 raises `PMQ03`.
 
 ### Delivery tokens and settlement
 
@@ -294,7 +293,7 @@ and raises `PMQ01` if the row is not `processing` under that token.
 | Function | Effect |
 |---|---|
 | `ack_message(queue, id, token)` | Sets status to `completed`, sets `processed_at`, and clears the token. |
-| `nack_message(queue, id, token, delay_until DEFAULT now)` | Not the final attempt: sets status back to `pending` with `vt = delay_until`. The attempt still counts. Final attempt (`max_delivery_attempts > 0` and attempts ≥ max): moves the row to the DLQ. Locks the queue row `FOR SHARE` until the transaction ends. An explicit NULL `delay_until` fails with `23502`. |
+| `nack_message(queue, id, token, delay_until DEFAULT now)` | Not the final attempt: sets status back to `pending` with `vt = delay_until`. The attempt still counts. Final attempt (`max_delivery_attempts > 0` and attempts ≥ max): moves the row to the DLQ. Locks the queue row `FOR SHARE` until the transaction ends. An explicit NULL `delay_until` raises `PMQ03`. |
 | `release_message(queue, id, token)` | Sets status back to `pending` with `vt = now` and decrements `delivery_attempts` (floored at 0). Use it for work that was claimed but never attempted. |
 | `set_vt(queue, id, token, seconds)` | Sets `vt = now + seconds` and returns the new deadline. Requires an unexpired lease (`PMQ01` otherwise). Raises `55P03` (retryable) rather than waiting if the row is locked. |
 | `set_vt_batch_multi(queues[], ids[], tokens[], seconds[])` | Batched, cross-queue form of `set_vt`; see [Heartbeat batches](#heartbeat-batches). |
@@ -486,12 +485,13 @@ not check whether an exclusive queue has expired.
 | `extend_queue_keep_alive_multi(p_queue_names VARCHAR[], p_intervals_ms BIGINT[], p_generations UUID[] DEFAULT NULL)` | `queue_name, keep_alive_until, outcome` |
 
 Both functions take element-wise parallel arrays and process the entries in key
-order, each in its own subtransaction. The arrays must have equal lengths, every
-`p_vts` element must be non-NULL and ≥ 0, and every `p_intervals_ms` element must
-be non-NULL and > 0; any violation raises `PMQ03`. A NULL queue name, message ID or
-token element is not rejected: it matches no row, so the entry is omitted.
-`p_generations` itself, or any of its elements, may be NULL, meaning whichever
-incarnation exists. Each entry produces one of three results:
+order, each in its own subtransaction. The arrays must be non-NULL and of equal
+lengths, every `p_vts` element must be non-NULL and ≥ 0, and every
+`p_intervals_ms` element must be non-NULL and > 0; any violation raises `PMQ03`.
+A NULL queue name, message ID or token element is not rejected: the entry is
+omitted, or reported `busy` while its row is locked. `p_generations` itself, or
+any of its elements, may be NULL, meaning whichever incarnation exists. Each
+entry produces one of three results:
 
 - **`outcome = 'extended'`:** the entry carries the confirmed new deadline.
 - **`outcome = 'busy'`:** the row was locked (`NOWAIT`), so the deadline is NULL
@@ -610,8 +610,7 @@ installed in another database, use `cron.schedule_in_database`.
     `processed_at` is older than `hours`.
   - Then calls `cleanup_unreferenced_messages(hours, batch)`.
   - Returns only the delivery-row count.
-  - Raises `PMQ03` if `hours` < 0 or `batch` ≤ 0. NULL is not rejected: a NULL
-    `hours` deletes nothing, and a NULL `batch` removes the batch limit.
+  - Raises `PMQ03` if `hours` or `batch` is NULL, `hours` < 0 or `batch` ≤ 0.
 - **`cleanup_unreferenced_messages(hours, batch)`**
   - Deletes up to `batch` payloads that are older than `hours` (by
     `published_at`) and are referenced by no queue and no DLQ entry.
@@ -620,8 +619,7 @@ installed in another database, use `cron.schedule_in_database`.
   - Prunes the group rows of the groups whose payloads it deleted.
   - It runs inside `cleanup_completed_messages`. Call it on its own only if you
     want a different batch size.
-  - Validates and treats NULL arguments the same way as
-    `cleanup_completed_messages`.
+  - Validates its arguments the same way as `cleanup_completed_messages`.
 - **`prune_message_groups(topics[], keys[])`**
   - Runs automatically through the functions above. You do not need to schedule
     it.
@@ -630,7 +628,7 @@ installed in another database, use `cron.schedule_in_database`.
   - Performs the same reaping as `pmq_maintenance_fast`, without the DLQ
     retirement step.
 
-Both cleanup functions work in bounded batches (given a non-NULL batch size) and
+Both cleanup functions work in bounded batches and
 use `SKIP LOCKED`, so they never wait on live work.
 
 **Sizing the batch.** At 10 publications per second with five queues per topic,
@@ -681,25 +679,16 @@ PostgreMQ raises three custom SQLSTATEs:
 |---|---|---|
 | `PMQ01` | The delivery is not held under this token: unknown message, already settled, reclaimed by another consumer, or (for extension) the lease has expired | `ack_message`, `nack_message`, `release_message`, `set_vt` |
 | `PMQ02` | Target does not exist or is gone | `publish_message` and `create_queue` (topic missing); `consume_message` (queue missing, expired, or generation mismatch); `create_queue` (redeclaring an expired exclusive queue) |
-| `PMQ03` | Invalid argument or refused operation | NULL, invalid or too-long name (`create_topic`, `create_queue`); negative `max_attempts`; NULL or non-positive `keep_alive_interval`; redeclaration with different parameters (or of a queue deleted concurrently, see [Topics, queues and publishing](#topics-queues-and-publishing)); empty or over-255-character group key; negative `vt` (`consume_message`, `set_vt`); non-positive batch size (`consume_message`); mismatched heartbeat or prune array lengths; NULL or negative `p_vts` element; NULL or non-positive `p_intervals_ms` element; negative retention or non-positive batch size in cleanup; `delete_topic` with messages; `delete_queue` or `clean_up_topic` with DLQ entries |
+| `PMQ03` | Invalid argument or refused operation | NULL in a required argument (any function; see below); invalid or too-long name (`create_topic`, `create_queue`); negative `max_attempts`; non-positive `keep_alive_interval`; redeclaration with different parameters (or of a queue deleted concurrently, see [Topics, queues and publishing](#topics-queues-and-publishing)); empty or over-255-character group key; negative `vt` (`consume_message`, `set_vt`); non-positive batch size (`consume_message`); NULL heartbeat array; mismatched heartbeat or prune array lengths; NULL or negative `p_vts` element; NULL or non-positive `p_intervals_ms` element; negative retention or non-positive batch size in cleanup; `delete_topic` with messages; `delete_queue` or `clean_up_topic` with DLQ entries |
 
-NULL arguments are validated only where listed above. Elsewhere a NULL is passed
-through to the SQL:
-
-- **Lookups match nothing.** Settle and extend calls raise `PMQ01`;
-  `publish_message`, `create_queue` (topic) and `consume_message` raise `PMQ02`;
-  heartbeat entries are omitted; management and inspection functions do nothing
-  or return no rows.
-- **NOT NULL columns raise `23502`.** This applies to `publish_message`'s payload,
-  `create_queue`'s `max_attempts` and `exclusive`, an explicit NULL
-  `nack_message` delay, and a NULL `vt` in `set_vt` or `consume_message` (when a
-  row is claimed).
-- **Limits become unbounded.** A NULL `batch_size` in `consume_message`, or a NULL
-  batch size in the cleanup functions, removes the limit.
-
-NULL is meaningful for `publish_message`'s `deliver_after` (now) and `group_key`
-(ungrouped), the `consume_message` and keep-alive generations (any incarnation),
-and `get_queue_statistics(NULL)` (all queues).
+Every argument is required unless NULL has a meaning, and a NULL in a required
+argument raises `PMQ03` before the function does anything. NULL is meaningful
+for `publish_message`'s `deliver_after` (now) and `group_key` (ungrouped), the
+`consume_message` and keep-alive generations (any incarnation),
+`get_queue_statistics(NULL)` (all queues) and `prune_message_groups(NULL, NULL)`
+(an empty batch). In the heartbeat batches a NULL array raises `PMQ03`, but a NULL
+element of the queue, message ID or token arrays is not rejected (see
+[Heartbeat batches](#heartbeat-batches)).
 
 Standard SQLSTATEs callers should expect:
 
@@ -710,7 +699,6 @@ Standard SQLSTATEs callers should expect:
 | `40001` (serialization failure) | Grouped publish or group pruning under `REPEATABLE READ`/`SERIALIZABLE` | Retry the transaction |
 | `23503` (foreign-key violation) | Direct deletes of a queue, message or topic still referenced by the DLQ | Requeue or purge the DLQ first |
 | | `create_queue` whose topic is deleted between its topic check and its insert | Create the topic again before retrying |
-| `23502` (not-null violation) | A NULL argument written to a NOT NULL column (see above) | Fix the caller |
 
 ## Validation
 
@@ -726,5 +714,6 @@ The tests need Docker: they start a PostgreSQL container. They cover:
 - queue expiry and recreation;
 - row-lock contention and fresh lease clocks;
 - bounded payload collection;
+- a NULL in every required argument of every function;
 - message-group ordering under concurrent publishers and consumers, including a
   guard on the claim's query plan.
