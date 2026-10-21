@@ -3,7 +3,7 @@
 // published declarations, then run: migrate a fresh database, connect
 // (schema check), publish, consume and ack one message.
 import { Pool } from 'pg';
-import { connect, migrate, getMigrationStatus, formatSchemaVersion, SUPPORTED_MQ_MAJORS, CompatibilityError } from 'postgremq';
+import { connect, migrate, getMigrationStatus, formatSchemaVersion, SUPPORTED_MQ_VERSIONS, CompatibilityError } from 'postgremq';
 
 async function main(): Promise<void> {
   const url = process.env.SMOKE_DATABASE_URL;
@@ -27,7 +27,7 @@ async function main(): Promise<void> {
       await connection.close();
     }
     const unused: typeof CompatibilityError = CompatibilityError;
-    console.log(`npm smoke ok: mq majors ${SUPPORTED_MQ_MAJORS.join(',')}, mq ${formatSchemaVersion(status.currentVersion)}`, unused.name);
+    console.log(`npm smoke ok: mq lines ${SUPPORTED_MQ_VERSIONS.join(',')}, mq ${formatSchemaVersion(status.currentVersion)}`, unused.name);
   } finally {
     await pool.end();
   }

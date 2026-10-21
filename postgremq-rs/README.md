@@ -89,14 +89,17 @@ existing `PgPool`, which it never closes; it must be called inside a Tokio
 runtime.
 
 Both read `postgremq.info()` and check that the installation's schema version
-has an mq major this client implements (`postgremq::SUPPORTED_MQ_MAJORS`,
-currently `[0]`). Otherwise they return `Error::Incompatible` with the schema
-version (the message also shows its mq version and the supported majors). A
+is on an mq compatibility line this client implements
+(`postgremq::SUPPORTED_MQ_VERSIONS`, currently `["0.1"]`). A line is an mq
+major, or before 1.0 a major and minor: a breaking schema change bumps the
+major, or before 1.0 the minor, so a client built for mq 0.1 accepts 0.1.x and
+rejects 0.2.0. Otherwise they return `Error::Incompatible` with the schema
+version (the message also shows its mq version and the supported lines). A
 database without `info()` (not installed, or older than discovery), or whose
 `info()` reports no schema version, gets it too, meaning it needs an
 installation or upgrade; when `info()` is missing, its source is the database
 error. Connection and permission errors are returned as they are. Within a
-supported major, a function the installation lacks fails with the database's
+supported line, a function the installation lacks fails with the database's
 error (SQLSTATE `42883`, `Error::Sqlx`) like any other.
 `Connection` is cheap to clone: clones share the pool, one `LISTEN` session and
 the two background schedulers (lease renewal and queue keep-alive).

@@ -20,15 +20,23 @@ postgremq.info() reports as schema_version.
 Released and pending. A migration is released once it is part of the newest
 mq/v* release in HEAD's history; released migrations never change. At most
 one migration is pending (not in that release; `sync` renames it above the
-release): the next mq release. Each schema change appends a section to it, opened by a header that
-names the change and its level:
+release): the next mq release. Each schema change appends a section to it,
+opened by a header that names the change and its level:
 
     -- ── change: add_priority · minor ───────────────────────────────────
 
-The pending migration's version is the last release bumped by the highest
-level among its sections. `new` creates it, joins it, or renames it to a
-higher version; `sync` merges two pending migrations (two branches each
-started one) and renames it when its sections call for another version.
+Levels say what kind of change a section is: patch a fix, minor an additive
+change, major a breaking one (clients already deployed stop working against
+the migrated database). The pending migration's version is the last release
+bumped by the highest level among its sections. From 1.0 a level bumps its
+own position; before 1.0, as Cargo reads 0.x versions, `major` bumps the
+minor (0.1.2 -> 0.2.0) and `minor` and `patch` the patch. `new` creates the
+pending migration, joins it, or renames it to a higher version; `sync` merges
+two pending migrations (two branches each started one) and renames it when
+its sections call for another version.
+
+A version's compatibility line (`Version.line`) is what clients accept: its
+major, or before 1.0 its major and minor (0.1 for 0.1.x).
 
 Clients. `sync` copies mq/migrations/*.up.sql into postgremq-go/migrations,
 postgremq-rs/migrations and postgremq-ts/migrations under numbered names
@@ -110,15 +118,18 @@ class Version:
         return cls(number // 100_000_000, number // 10_000 % 10_000, number % 10_000)
 
     def bump(self, level: str) -> Version:
+        if self.major == 0:
+            # Before 1.0 a breaking change bumps the minor, anything else the patch.
+            level = {'major': 'minor', 'minor': 'patch'}.get(level, level)
         if level == 'major':
             return Version(self.major + 1, 0, 0)
         if level == 'minor':
             return Version(self.major, self.minor + 1, 0)
         return Version(self.major, self.minor, self.patch + 1)
 
-    def level_from(self, released: Version) -> str | None:
-        """The level this version is a valid bump of `released` by, if any."""
-        return next((level for level in LEVELS if released.bump(level) == self), None)
+    def line(self) -> str:
+        """The compatibility line clients accept: the major, or 0.minor before 1.0."""
+        return str(self.major) if self.major else f'0.{self.minor}'
 
 
 ZERO = Version(0, 0, 0)

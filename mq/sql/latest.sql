@@ -118,8 +118,9 @@ CREATE SCHEMA IF NOT EXISTS postgremq;
 -- connect. schema_version is the version of the last migration applied, an
 -- mq version stored as one number (major*10^8 + minor*10^4 + patch; 0.1.0 is
 -- 10000), read from the version table the migrators and latest.sql maintain
--- (NULL without it). Clients accept the mq majors they implement: a breaking
--- schema change bumps the major. protocol_major is for the clients that check
+-- (NULL without it). Clients accept the mq lines they implement (the major,
+-- or before 1.0 the major and minor): a breaking schema change starts a new
+-- line. protocol_major is for the clients that check
 -- it instead (up to 0.3.0): the mq major + 1. The signature and these fields
 -- stay stable; fields may be added.
 -- SECURITY DEFINER, unlike every other function, so that runtime roles need

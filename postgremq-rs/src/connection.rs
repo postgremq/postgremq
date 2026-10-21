@@ -293,8 +293,8 @@ impl Connection {
     ///
     /// [`Error::Validation`] for invalid options; [`Error::Sqlx`] if the pool
     /// cannot connect; [`Error::Incompatible`] if the database's
-    /// `postgremq.info()` reports a schema version whose mq major is not in
-    /// [`SUPPORTED_MQ_MAJORS`](crate::SUPPORTED_MQ_MAJORS), reports none, or is
+    /// `postgremq.info()` reports a schema version whose mq line is not in
+    /// [`SUPPORTED_MQ_VERSIONS`](crate::SUPPORTED_MQ_VERSIONS), reports none, or is
     /// missing (the database needs a PostgreMQ installation or upgrade).
     pub async fn connect(url: &str, options: ConnectionOptions) -> Result<Self> {
         options.retry.validate()?;

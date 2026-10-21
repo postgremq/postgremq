@@ -7,24 +7,36 @@ import (
 	"fmt"
 	"slices"
 	"strconv"
+	"strings"
 
 	"github.com/jackc/pgx/v5/pgconn"
 )
 
-// supportedMQMajors are the mq (schema) majors this client implements and is
-// tested against. A breaking schema change bumps the mq major.
-var supportedMQMajors = []int{0}
+// supportedMQVersions are the mq (schema) compatibility lines this client
+// implements and is tested against. A breaking schema change starts a new
+// line: it bumps the mq major, or before 1.0 the minor.
+var supportedMQVersions = []string{"0.1"}
 
-// SupportedMQMajors returns the mq (schema) majors this client implements.
+// SupportedMQVersions returns the mq (schema) compatibility lines this client
+// implements: an mq major ("1"), or before 1.0 a major and minor ("0.1").
 // Dial and DialFromPool reject a database whose schema version, as
-// postgremq.info() reports it, has any other major.
-func SupportedMQMajors() []int { return slices.Clone(supportedMQMajors) }
+// postgremq.info() reports it, is on any other line.
+func SupportedMQVersions() []string { return slices.Clone(supportedMQVersions) }
+
+// mqLine is the compatibility line of a stored schema version: its mq major,
+// or before 1.0 its major and minor.
+func mqLine(version int64) string {
+	if major := version / 100_000_000; major > 0 {
+		return strconv.FormatInt(major, 10)
+	}
+	return "0." + strconv.FormatInt(version/10_000%10_000, 10)
+}
 
 // ErrIncompatibleSchema matches every *CompatibilityError.
 var ErrIncompatibleSchema = errors.New("postgremq: incompatible database installation")
 
 // CompatibilityError is returned by Dial and DialFromPool when the database's
-// PostgreMQ schema has an mq major this client does not support, reports no
+// PostgreMQ schema is on an mq line this client does not support, reports no
 // schema version, or has no discovery function (postgremq.info()) and needs
 // an installation or upgrade. It matches errors.Is(err, ErrIncompatibleSchema).
 type CompatibilityError struct {
@@ -32,23 +44,24 @@ type CompatibilityError struct {
 	// applied; FormatSchemaVersion gives its mq version); 0 when discovery is
 	// missing or reports none.
 	SchemaVersion int64
-	// SupportedMajors are the mq majors this client supports.
-	SupportedMajors []int
+	// SupportedVersions are the mq lines this client supports
+	// (SupportedMQVersions).
+	SupportedVersions []string
 	// Err is the database error when discovery is missing.
 	Err error
 }
 
 func (e *CompatibilityError) Error() string {
 	if e.Err != nil {
-		return fmt.Sprintf("postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports mq majors %v): %v",
-			e.SupportedMajors, e.Err)
+		return fmt.Sprintf("postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports mq [%s]): %v",
+			strings.Join(e.SupportedVersions, ", "), e.Err)
 	}
 	if e.SchemaVersion <= 0 {
-		return fmt.Sprintf("postgremq: the database's PostgreMQ installation reports no schema version; it needs an installation or upgrade (client supports mq majors %v)",
-			e.SupportedMajors)
+		return fmt.Sprintf("postgremq: the database's PostgreMQ installation reports no schema version; it needs an installation or upgrade (client supports mq [%s])",
+			strings.Join(e.SupportedVersions, ", "))
 	}
-	return fmt.Sprintf("postgremq: the database's PostgreMQ schema is mq %s (schema version %d); this client supports mq majors %v",
-		formatSchemaVersion(uint64(e.SchemaVersion)), e.SchemaVersion, e.SupportedMajors)
+	return fmt.Sprintf("postgremq: the database's PostgreMQ schema is mq %s (schema version %d); this client supports mq [%s]",
+		formatSchemaVersion(uint64(e.SchemaVersion)), e.SchemaVersion, strings.Join(e.SupportedVersions, ", "))
 }
 
 // Unwrap exposes the database error when discovery is missing.
@@ -64,23 +77,23 @@ const (
 	sqlStateInvalidSchemaName = "3F000"
 )
 
-// checkSchema reads postgremq.info() and rejects a schema whose mq major is
+// checkSchema reads postgremq.info() and rejects a schema whose mq line is
 // not supported. Connection and permission errors are returned as they are.
 func checkSchema(ctx context.Context, pool Pool) error {
 	var raw []byte
 	if err := pool.QueryRow(ctx, "SELECT postgremq.info()").Scan(&raw); err != nil {
 		var pgErr *pgconn.PgError
 		if errors.As(err, &pgErr) && (pgErr.Code == sqlStateUndefinedFunction || pgErr.Code == sqlStateInvalidSchemaName) {
-			return &CompatibilityError{SupportedMajors: SupportedMQMajors(), Err: err}
+			return &CompatibilityError{SupportedVersions: SupportedMQVersions(), Err: err}
 		}
 		return fmt.Errorf("postgremq: read postgremq.info(): %w", err)
 	}
 	version, ok := schemaVersion(raw)
 	if !ok {
-		return &CompatibilityError{SupportedMajors: SupportedMQMajors()}
+		return &CompatibilityError{SupportedVersions: SupportedMQVersions()}
 	}
-	if !slices.Contains(supportedMQMajors, int(version/100_000_000)) {
-		return &CompatibilityError{SchemaVersion: version, SupportedMajors: SupportedMQMajors()}
+	if !slices.Contains(supportedMQVersions, mqLine(version)) {
+		return &CompatibilityError{SchemaVersion: version, SupportedVersions: SupportedMQVersions()}
 	}
 	return nil
 }

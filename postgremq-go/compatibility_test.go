@@ -13,18 +13,22 @@ import (
 	"postgremq.dev/postgremq-go"
 )
 
-func TestCompatibility_SupportedMajors(t *testing.T) {
-	majors := postgremq.SupportedMQMajors()
-	assert.Equal(t, []int{0}, majors)
-	majors[0] = 99
-	assert.Equal(t, []int{0}, postgremq.SupportedMQMajors(), "callers get a copy")
+func TestCompatibility_SupportedVersions(t *testing.T) {
+	versions := postgremq.SupportedMQVersions()
+	assert.Equal(t, []string{"0.1"}, versions)
+	versions[0] = "99"
+	assert.Equal(t, []string{"0.1"}, postgremq.SupportedMQVersions(), "callers get a copy")
 }
 
 func TestCompatibility_InstalledSchemaIsSupported(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	var version int64
 	require.NoError(t, pool.QueryRow(ctx, "SELECT (postgremq.info()->>'schema_version')::bigint").Scan(&version))
-	assert.Contains(t, postgremq.SupportedMQMajors(), int(version/100_000_000))
+	line := fmt.Sprint(version / 100_000_000)
+	if version < 100_000_000 {
+		line = fmt.Sprintf("0.%d", version/10_000)
+	}
+	assert.Contains(t, postgremq.SupportedMQVersions(), line)
 
 	conn, err := postgremq.DialFromPool(ctx, pool)
 	require.NoError(t, err)
@@ -39,12 +43,12 @@ func fakeInfo(t *testing.T, ctx context.Context, pool *pgxpool.Pool, info string
 	require.NoError(t, err)
 }
 
-func TestCompatibility_OtherVersionsOfTheSameMajorAreAccepted(t *testing.T) {
+func TestCompatibility_OtherVersionsOfTheSameLineAreAccepted(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	// protocol_major is only for older clients: it is ignored.
 	for _, info := range []string{
-		`{"schema_version": 1, "protocol_major": 1}`,
-		`{"schema_version": 99999999, "protocol_major": 99}`,
+		`{"schema_version": 10000, "protocol_major": 99}`,
+		`{"schema_version": 19999}`,
 		`{"schema_version": 10001}`,
 	} {
 		fakeInfo(t, ctx, pool, info)
@@ -64,9 +68,25 @@ func TestCompatibility_UnsupportedMajorIsRejected(t *testing.T) {
 	var compat *postgremq.CompatibilityError
 	require.ErrorAs(t, err, &compat)
 	assert.Equal(t, int64(100_020_003), compat.SchemaVersion)
-	assert.Equal(t, []int{0}, compat.SupportedMajors)
+	assert.Equal(t, []string{"0.1"}, compat.SupportedVersions)
 	assert.Contains(t, err.Error(), "mq 1.2.3 (schema version 100020003)")
-	assert.Contains(t, err.Error(), "mq majors [0]")
+	assert.Contains(t, err.Error(), "supports mq [0.1]")
+}
+
+// Before 1.0 a breaking schema change bumps the minor, so another 0.y is
+// another contract.
+func TestCompatibility_OtherMinorBefore1IsRejected(t *testing.T) {
+	pool, ctx := setupTestConnection(t)
+	for _, version := range []int64{20_000, 1, 99_999_999} {
+		fakeInfo(t, ctx, pool, fmt.Sprintf(`{"schema_version": %d, "protocol_major": 1}`, version))
+
+		_, err := postgremq.DialFromPool(ctx, pool)
+
+		require.ErrorIs(t, err, postgremq.ErrIncompatibleSchema, version)
+		var compat *postgremq.CompatibilityError
+		require.ErrorAs(t, err, &compat)
+		assert.Equal(t, version, compat.SchemaVersion)
+	}
 }
 
 func TestCompatibility_NoSchemaVersionNeedsUpgrade(t *testing.T) {

@@ -61,6 +61,6 @@ func main() {
 	case <-ctx.Done():
 		log.Fatal("no message")
 	}
-	fmt.Printf("go smoke ok: mq majors %v, mq %s\n",
-		postgremq.SupportedMQMajors(), postgremq.FormatSchemaVersion(status.CurrentVersion))
+	fmt.Printf("go smoke ok: mq lines %v, mq %s\n",
+		postgremq.SupportedMQVersions(), postgremq.FormatSchemaVersion(status.CurrentVersion))
 }

@@ -436,11 +436,13 @@ schemas. The mq release `mq/v0.1.0` is schema version 10000. `info()` is
 the one `SECURITY DEFINER` function, so runtime roles need no privilege on the
 version table to call it.
 
-The mq major is the contract clients rely on: function signatures, result
-types, error codes, ownership rules and delivery semantics. Additive changes
-keep the major; incompatible changes get a new one. Each client checks the
-major of `schema_version` when connecting and rejects a major it does not
-implement. `protocol_major` is for clients up to 0.3.0, which check it
+The compatibility line is the contract clients rely on: function signatures,
+result types, error codes, ownership rules and delivery semantics. It is the
+mq major, or before 1.0 the major and minor (`0.1` for 0.1.x): before 1.0 a
+breaking change bumps the minor, and additive changes and fixes the patch;
+after 1.0 a breaking change bumps the major. Each client checks the line of
+`schema_version` when connecting and rejects a line it does not implement.
+`protocol_major` is for clients up to 0.3.0, which check it
 instead: the mq major + 1. `info()` and these fields stay stable; fields may
 be added.
 

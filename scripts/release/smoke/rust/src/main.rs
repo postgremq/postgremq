@@ -24,8 +24,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     delivery.ack().await?;
     conn.close().await;
     println!(
-        "rust smoke ok: mq majors {:?}, mq {}",
-        postgremq::SUPPORTED_MQ_MAJORS,
+        "rust smoke ok: mq lines {:?}, mq {}",
+        postgremq::SUPPORTED_MQ_VERSIONS,
         postgremq::format_schema_version(status.current_version)
     );
     Ok(())

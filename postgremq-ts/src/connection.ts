@@ -329,7 +329,7 @@ export class Connection implements IConnection {
    * `connect()` to get a new connection.
    *
    * It reads `postgremq.info()` and rejects a database whose schema version
-   * has an mq major not in `SUPPORTED_MQ_MAJORS`, that reports no schema
+   * is on an mq line not in `SUPPORTED_MQ_VERSIONS`, that reports no schema
    * version, or that has no discovery function (it needs a PostgreMQ
    * installation or upgrade).
    *

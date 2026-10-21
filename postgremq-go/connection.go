@@ -73,8 +73,8 @@ type Connection struct {
 // The returned Connection owns the pool and will Close() it during shutdown.
 //
 // Dial reads postgremq.info() and returns a *CompatibilityError (matching
-// ErrIncompatibleSchema) when the installation's schema version has an mq
-// major not in SupportedMQMajors(), or when discovery is missing and the
+// ErrIncompatibleSchema) when the installation's schema version is on an mq
+// line not in SupportedMQVersions(), or when discovery is missing and the
 // database needs a PostgreMQ installation or upgrade.
 //
 // ctx is bootstrap-only: it bounds pgxpool.NewWithConfig and the schema
