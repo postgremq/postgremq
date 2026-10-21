@@ -41,6 +41,10 @@ import {
 import { mapDbError, ConnectionClosedError, QueueFatalError, ValidationError } from './errors';
 import { checkSchema } from './compatibility';
 
+/** The longest delay nack_message accepts (100 years); a later delayUntil is
+ *  capped to it rather than failing the settlement. */
+const MAX_NACK_DELAY_MS = 3_155_760_000_000;
+
 /** Anything the connection can shut down during close(). Both ConsumerImpl
  *  and HandlerConsumer satisfy this. */
 interface Stoppable {
@@ -932,6 +936,7 @@ export class Connection implements IConnection {
         // Scale seconds to INTERVAL via "$5 * interval '1 sec'" so the SQL
         // function can stay typed as INTERVAL without us needing a per-driver
         // serializer for it.
+        const sent = Date.now(); // the keep-alive deadline is counted from it
         const created = await client.query(
           "SELECT postgremq.create_queue($1, $2, $3, $4, $5 * interval '1 sec')",
           [name, topic, maxDeliveryAttempts, exclusive, keepAliveSeconds]
@@ -944,7 +949,7 @@ export class Connection implements IConnection {
         const generation = created.rows[0].create_queue as string;
         this.queueGenerations.set(name, generation);
         if (exclusive) {
-          this.keepAliveRegister(name, keepAliveSeconds, generation);
+          this.keepAliveRegister(name, keepAliveSeconds, generation, sent);
         }
       });
     } catch (err) {
@@ -1325,8 +1330,9 @@ export class Connection implements IConnection {
       try {
         const messages = await this.runDatabase(
           async (client) => {
+            const sent = Date.now(); // vt is sent plus the time left by the database clock
             const result = await client.query(
-              'SELECT * FROM postgremq.consume_message($1, $2, $3, $4)',
+              'SELECT queue_name, message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq FROM postgremq.consume_message($1, $2, $3, $4)',
               [queueName, visibilityTimeout, limit, generation ?? null]
             );
             // message_id is BIGINT; convert at the read boundary so callers see a
@@ -1335,6 +1341,7 @@ export class Connection implements IConnection {
               ...row,
               message_id: checkedMessageId(row.message_id),
               group_seq: checkedGroupSeq(row.group_seq),
+              vt: new Date(sent + Number(row.vt_remaining_ms)),
             }));
           },
           Math.max(1000, visibilityTimeout * 500)
@@ -1420,20 +1427,17 @@ export class Connection implements IConnection {
 
       try {
         await this.executeWithRetry(async (client) => {
-          if (delayUntil) {
-            await client.query('SELECT postgremq.nack_message($1, $2, $3, $4)', [
-              queueName,
-              messageId,
-              consumerToken,
-              delayUntil,
-            ]);
-          } else {
-            await client.query('SELECT postgremq.nack_message($1, $2, $3)', [
-              queueName,
-              messageId,
-              consumerToken,
-            ]);
-          }
+          // Sent as the time remaining on the local clock, which the database
+          // adds to its own, so the clocks need not agree.
+          const delayMs = delayUntil
+            ? Math.min(Math.max(delayUntil.getTime() - Date.now(), 0), MAX_NACK_DELAY_MS)
+            : 0;
+          await client.query('SELECT postgremq.nack_message($1, $2, $3, $4)', [
+            queueName,
+            messageId,
+            consumerToken,
+            delayMs,
+          ]);
         });
       } catch (err) {
         throw mapDbError(err);
@@ -1494,13 +1498,14 @@ export class Connection implements IConnection {
 
       try {
         return await this.executeWithRetry(async (client) => {
-          const result = await client.query('SELECT postgremq.set_vt($1, $2, $3, $4) AS new_vt', [
-            queueName,
-            messageId,
-            consumerToken,
-            visibilityTimeout,
-          ]);
-          return new Date(result.rows[0].new_vt);
+          // set_vt returns the time left by the database clock; vt is sent
+          // plus it, as for consumed messages.
+          const sent = Date.now();
+          const result = await client.query(
+            'SELECT postgremq.set_vt($1, $2, $3, $4) AS remaining_ms',
+            [queueName, messageId, consumerToken, visibilityTimeout]
+          );
+          return new Date(sent + Number(result.rows[0].remaining_ms));
         });
       } catch (err) {
         throw mapDbError(err);
@@ -1509,23 +1514,26 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Get the next time a message will become visible
+   * How long until the queue's next row becomes visible, measured by the
+   * database's clock
    * @internal
    * @param queueName - The queue name
-   * @returns Promise that resolves to the next visible time or null if no messages
+   * @returns Promise that resolves to the milliseconds until then (zero or
+   *   negative if one is already due), or null if there is none
    */
-  async getNextVisibleTime(queueName: string): Promise<Date | null> {
+  async getNextVisibleInMs(queueName: string): Promise<number | null> {
     if (!this.connected) {
       throw new ConnectionClosedError('Client is not connected');
     }
 
     return this.executeWithRetry(async (client) => {
-      const result = await client.query('SELECT postgremq.get_next_visible_time($1) AS next_time', [
-        queueName,
-      ]);
+      const result = await client.query(
+        'SELECT postgremq.get_next_visible_in_ms($1) AS next_ms',
+        [queueName]
+      );
 
-      const nextTime = result.rows[0].next_time;
-      return nextTime ? new Date(nextTime) : null;
+      const nextMs = result.rows[0].next_ms;
+      return nextMs === null ? null : Number(nextMs);
     });
   }
 
@@ -1647,15 +1655,22 @@ export class Connection implements IConnection {
   /**
    * Upsert an exclusive queue into the keep-alive schedule. Called by
    * createQueue. Dedupes by queue name (createQueue may be called twice).
+   * `sent` is the Date.now() read before the create_queue statement that set
+   * keep_alive_until.
    * @internal
    */
-  private keepAliveRegister(queueName: string, intervalSec: number, generation: string): void {
-    const nextAt = new Date(Date.now() + Math.floor((intervalSec * 1000) / 2));
+  private keepAliveRegister(
+    queueName: string,
+    intervalSec: number,
+    generation: string,
+    sent: number
+  ): void {
+    const nextAt = new Date(sent + Math.floor((intervalSec * 1000) / 2));
     this.keepAliveEntries.set(queueName, {
       generation,
       intervalSec,
       nextAt,
-      expiresAt: new Date(Date.now() + intervalSec * 1000),
+      expiresAt: new Date(sent + intervalSec * 1000),
     });
     this.armKeepAlive();
   }
@@ -1709,8 +1724,11 @@ export class Connection implements IConnection {
       try {
         leases = await this.runDatabase(
           async (client) => {
+            // Deadlines are the time left by the database clock, counted from
+            // before the call, so they never depend on the two clocks agreeing.
+            const sent = Date.now();
             const result = await client.query(
-              'SELECT queue_name, keep_alive_until, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
+              'SELECT queue_name, keep_alive_remaining_ms, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
               [
                 due.map(([n]) => n),
                 due.map(([, e]) => Math.floor(e.intervalSec * 1000)),
@@ -1720,7 +1738,10 @@ export class Connection implements IConnection {
             return new Map(
               result.rows.map((r) => [
                 r.queue_name,
-                { until: new Date(r.keep_alive_until), busy: r.outcome === 'busy' },
+                {
+                  until: new Date(sent + Number(r.keep_alive_remaining_ms)),
+                  busy: r.outcome === 'busy',
+                },
               ])
             );
           },
@@ -1818,13 +1839,17 @@ export class Connection implements IConnection {
       if (names.length === 0) return [];
       try {
         return await this.executeWithRetry(async (client) => {
+          const sent = Date.now(); // until is sent plus the time left by the database clock
           const result = await client.query(
-            'SELECT queue_name, keep_alive_until, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
+            'SELECT queue_name, keep_alive_remaining_ms, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
             [names, intervalsMs, generations ?? null]
           );
           return result.rows.map((row: any) => ({
             queue: row.queue_name as string,
-            until: row.keep_alive_until ? new Date(row.keep_alive_until) : null,
+            until:
+              row.keep_alive_remaining_ms === null
+                ? null
+                : new Date(sent + Number(row.keep_alive_remaining_ms)),
             busy: row.outcome === 'busy',
           }));
         });
@@ -2019,14 +2044,15 @@ export class Connection implements IConnection {
       if (queues.length === 0) return [];
       try {
         return await this.runDatabase(async (client) => {
+          const sent = Date.now(); // vt is sent plus the time left by the database clock
           const result = await client.query(
-            'SELECT queue_name, message_id, vt, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)',
+            'SELECT queue_name, message_id, vt_remaining_ms, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)',
             [queues, ids, tokens, vts]
           );
           return result.rows.map((row: any) => ({
             queue: row.queue_name as string,
             id: checkedMessageId(row.message_id),
-            vt: new Date(row.vt),
+            vt: new Date(sent + Number(row.vt_remaining_ms)),
             token: row.consumer_token,
             busy: row.outcome === 'busy',
           }));

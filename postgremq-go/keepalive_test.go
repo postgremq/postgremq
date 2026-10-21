@@ -67,8 +67,7 @@ func (p *keepAliveSpyPool) Query(ctx context.Context, sql string, args ...interf
 						ms = args[1].([]int64)[j]
 					}
 				}
-				until := time.Now().Add(time.Duration(ms) * time.Millisecond)
-				*(dest[1].(**time.Time)) = &until
+				*(dest[1].(**int64)) = &ms
 				*(dest[2].(*string)) = "extended"
 			}
 			return nil

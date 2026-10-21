@@ -33,17 +33,17 @@ func (p heartbeatPool) Query(ctx context.Context, sql string, args ...any) (pgx.
 	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
-	until := time.Now().Add(time.Minute)
+	remainingMs := time.Minute.Milliseconds()
 	names := args[0].([]string)
 	rows := &heartbeatRows{}
 	for i, name := range names {
 		if strings.Contains(sql, "set_vt_batch_multi") {
 			id := args[1].([]int64)[i]
 			if !p.gone[fmt.Sprintf("%s/%d", name, id)] {
-				rows.values = append(rows.values, []any{name, id, &until, args[2].([]string)[i], "extended"})
+				rows.values = append(rows.values, []any{name, id, &remainingMs, args[2].([]string)[i], "extended"})
 			}
 		} else if !p.gone[name] {
-			rows.values = append(rows.values, []any{name, &until, "extended"})
+			rows.values = append(rows.values, []any{name, &remainingMs, "extended"})
 		}
 	}
 	return rows, nil
@@ -56,7 +56,7 @@ func (heartbeatPool) Close()                                           {}
 type infoRow struct{}
 
 func (infoRow) Scan(dest ...any) error {
-	*(dest[0].(*[]byte)) = []byte(`{"schema_version": 10001, "protocol_major": 1}`)
+	*(dest[0].(*[]byte)) = []byte(`{"schema_version": 20000, "protocol_major": 1}`)
 	return nil
 }
 

@@ -91,7 +91,7 @@ main().catch(console.error);
 
 `connect(options)` creates a connection, checks the installation's schema version, and returns it.
 
-The check reads `postgremq.info()`: the installation's schema version must be on an mq compatibility line this client implements (`SUPPORTED_MQ_VERSIONS`, currently `['0.1']`). A line is an mq major, or before 1.0 a major and minor: a breaking schema change bumps the major, or before 1.0 the minor, so a client built for mq 0.1 accepts 0.1.x and rejects 0.2.0. Otherwise `connect` throws a `CompatibilityError` with `schemaVersion` and `supportedVersions`; a database without `info()` (not installed, or older than discovery), or whose `info()` reports no schema version, throws it too, meaning it needs an installation or upgrade; when `info()` is missing, `cause` is the database error. Connection and permission errors are thrown as they are. Within a supported line, a function the installation lacks fails with the database's error (`code` `42883`) like any other.
+The check reads `postgremq.info()`: the installation's schema version must be on an mq compatibility line this client implements (`SUPPORTED_MQ_VERSIONS`, currently `['0.2']`). A line is an mq major, or before 1.0 a major and minor: a breaking schema change bumps the major, or before 1.0 the minor, so a client built for mq 0.2 accepts 0.2.x and rejects 0.1.x and 0.3.0. Otherwise `connect` throws a `CompatibilityError` with `schemaVersion` and `supportedVersions`; a database without `info()` (not installed, or older than discovery), or whose `info()` reports no schema version, throws it too, meaning it needs an installation or upgrade; when `info()` is missing, `cause` is the database error. Connection and permission errors are thrown as they are. Within a supported line, a function the installation lacks fails with the database's error (`code` `42883`) like any other.
 
 ```typescript
 import { connect } from 'postgremq';
@@ -130,7 +130,7 @@ While at least one consumer is running, the connection holds one pool client for
 // Payload is any JSON-serializable value; it is stored as JSONB.
 const id = await client.publish('orders', { orderId: '12345' });
 
-// Delayed delivery
+// Delayed delivery (the time is compared with the database's clock)
 await client.publish('orders', { orderId: '67890' }, {
   deliverAfter: new Date(Date.now() + 60_000),
 });
@@ -165,7 +165,7 @@ try {
 
 ## Consuming
 
-A consumer claims up to `batchSize` messages at a time with `consume_message`, which marks them as processing, increments their delivery attempt count, and gives each claim a new consumer token and a visibility timeout (`vt`). Until the message is settled or its lease expires, no other consumer can claim it. The consumer is woken by `NOTIFY` when messages are published to the queue's topic or returned to the queue, and polls as a fallback. After an empty or partial claim it asks the database when the next row becomes visible and waits until then (measured against the local clock), at most `pollingIntervalMs`; if a row is already due but could not be claimed, it waits 100 ms. A failed fetch is logged and retried after one second. If the `LISTEN` session drops, the connection reconnects with a backoff that starts at 500 ms and doubles up to 30 s, and resets once a new session is listening. Notifications sent while the session is down are not replayed; consumers pick those messages up on their next poll.
+A consumer claims up to `batchSize` messages at a time with `consume_message`, which marks them as processing, increments their delivery attempt count, and gives each claim a new consumer token and a visibility timeout (`vt`). Until the message is settled or its lease expires, no other consumer can claim it. The consumer is woken by `NOTIFY` when messages are published to the queue's topic or returned to the queue, and polls as a fallback. After an empty or partial claim it asks the database how long until the next row becomes visible and waits that long, at most `pollingIntervalMs`; if a row is already due but could not be claimed, it waits 100 ms. A failed fetch is logged and retried after one second. If the `LISTEN` session drops, the connection reconnects with a backoff that starts at 500 ms and doubles up to 30 s, and resets once a new session is listening. Notifications sent while the session is down are not replayed; consumers pick those messages up on their next poll.
 
 ### Iterator consumer
 
@@ -249,7 +249,7 @@ Auto-settlement failures are logged, not thrown.
 | `isSettled` | `true` once a settlement has been attempted. |
 | `ack()` | Mark the message completed. |
 | `ackWithTransaction(tx)` | Ack inside your transaction; the ack commits or rolls back with it. |
-| `nack({ delaySeconds }?)` | Return the message for another attempt, optionally after a delay (the redelivery time is computed from the local clock). On the final attempt of a queue with `maxDeliveryAttempts` set, the message moves to the dead letter queue instead. |
+| `nack({ delaySeconds }?)` | Return the message for another attempt, optionally after a delay (added to the database's clock, so the clocks need not agree). On the final attempt of a queue with `maxDeliveryAttempts` set, the message moves to the dead letter queue instead. |
 | `release()` | Return the message without counting the attempt (the attempt count is decremented). |
 | `setVt(seconds)` | Set the lease to `seconds` from now; resolves with the new deadline. |
 
@@ -259,7 +259,7 @@ A message can be settled once. After the first `ack`, `nack`, `release` or `ackW
 
 ### Lease renewal
 
-With auto-extension enabled, each message is registered with a single renewal scheduler owned by the connection as soon as it is claimed, including messages still waiting in the consumer's buffer. When a message's renewal is due (`extensionThreshold` of its remaining lease has elapsed), the scheduler renews it to `visibilityTimeoutSec` from now. The messages due at a tick, across all consumers and queues of the connection, are renewed in one `set_vt_batch_multi` call of at most `extenderBatchSize` messages. Each call is a single attempt bounded by the earliest lease deadline among them, but by no less than one second and no more than five; the connection's retry policy is not applied. A message leaves the schedule when its settlement call returns, successfully or not. Renewal times are computed by comparing the database's lease deadline with the local clock; `message.vt` shows the database's timestamp.
+With auto-extension enabled, each message is registered with a single renewal scheduler owned by the connection as soon as it is claimed, including messages still waiting in the consumer's buffer. When a message's renewal is due (`extensionThreshold` of its remaining lease has elapsed), the scheduler renews it to `visibilityTimeoutSec` from now. The messages due at a tick, across all consumers and queues of the connection, are renewed in one `set_vt_batch_multi` call of at most `extenderBatchSize` messages. Each call is a single attempt bounded by the earliest lease deadline among them, but by no less than one second and no more than five; the connection's retry policy is not applied. A message leaves the schedule when its settlement call returns, successfully or not. A lease's deadline is the local time read before the claim or renewal call plus the time left that the database reports, so renewal does not depend on the client and database clocks agreeing; `message.vt` is this deadline, on the local clock.
 
 If a message is missing from the result (its claim is no longer current or its lease has already expired), the scheduler drops it and aborts `message.signal`. A message whose row is locked by another transaction is retried after 100 ms. If the call fails, the due messages are retried about one second later until their last confirmed lease deadline passes on the local clock; after that they are treated as lost the same way. Because a message stays scheduled until its settlement call returns, a renewal that overlaps a successful settlement can also abort its signal. Check `message.signal.aborted` (or listen for `abort`) in long-running work, since settling a lost message throws `LeaseLostError`.
 

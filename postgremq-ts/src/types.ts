@@ -308,7 +308,8 @@ export interface RetryPolicy {
  * Options for publishing a message
  */
 export interface PublishOptions {
-  /** Time at which the message should be delivered (defaults to immediate) */
+  /** Time at which the message should be delivered (defaults to immediate),
+   *  compared with the database's clock */
   deliverAfter?: Date;
   /**
    * Message group (1..255 characters; empty is rejected with ValidationError).

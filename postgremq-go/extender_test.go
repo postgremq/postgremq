@@ -69,14 +69,14 @@ func (p *extenderSpyPool) Query(ctx context.Context, sql string, args ...interfa
 	if horizon == 0 {
 		horizon = time.Hour
 	}
-	vt := time.Now().Add(horizon)
+	remainingMs := horizon.Milliseconds()
 	scans := make([]func(dest ...any) error, len(kept))
 	for i := range kept {
 		k := kept[i]
 		scans[i] = func(dest ...any) error {
 			*(dest[0].(*string)) = k.queue
 			*(dest[1].(*int64)) = k.id
-			*(dest[2].(**time.Time)) = &vt
+			*(dest[2].(**int64)) = &remainingMs
 			for j, pair := range pairs {
 				if pair == k {
 					*(dest[3].(*string)) = args[2].([]string)[j]

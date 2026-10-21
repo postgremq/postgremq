@@ -791,3 +791,656 @@ BEGIN
     RETURN deleted;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ── change: report_lease_remaining · major ─────────────────────────────────
+
+-- Lease and wait times are reported and taken as durations by the database
+-- clock, so clients never compare their own clock with the database's:
+--   - consume_message, set_vt_batch_multi and extend_queue_keep_alive_multi
+--     return the time left on each lease (vt_remaining_ms,
+--     keep_alive_remaining_ms) instead of its end (vt, keep_alive_until);
+--   - set_vt returns the time left (BIGINT milliseconds) instead of vt;
+--   - get_next_visible_in_ms replaces get_next_visible_time: milliseconds
+--     until the next row becomes visible, instead of that time;
+--   - nack_message takes the redelivery delay (p_delay_ms) instead of a
+--     timestamp (p_delay_until).
+-- A changed signature or result type needs a new function, which gets the
+-- current default owner and privileges. The old ones are renamed aside, their
+-- owner and privileges copied to the new ones exactly (a NULL acl is the
+-- default, EXECUTE for PUBLIC), and then dropped: a runtime role granted
+-- EXECUTE keeps it and nobody gains it.
+ALTER FUNCTION postgremq.consume_message(VARCHAR, INTEGER, INT, UUID) RENAME TO pmq_replaced_consume_message;
+ALTER FUNCTION postgremq.nack_message(VARCHAR, BIGINT, VARCHAR, TIMESTAMPTZ) RENAME TO pmq_replaced_nack_message;
+ALTER FUNCTION postgremq.set_vt(VARCHAR, BIGINT, VARCHAR, INTEGER) RENAME TO pmq_replaced_set_vt;
+ALTER FUNCTION postgremq.extend_queue_keep_alive_multi(VARCHAR[], BIGINT[], UUID[]) RENAME TO pmq_replaced_extend_queue_keep_alive_multi;
+ALTER FUNCTION postgremq.set_vt_batch_multi(VARCHAR[], BIGINT[], VARCHAR[], INTEGER[]) RENAME TO pmq_replaced_set_vt_batch_multi;
+ALTER FUNCTION postgremq.get_next_visible_time(VARCHAR) RENAME TO pmq_replaced_get_next_visible_time;
+
+CREATE OR REPLACE FUNCTION postgremq.consume_message(
+    p_queue_name VARCHAR(255),
+    p_vt INTEGER,
+    p_limit INT DEFAULT 1,
+    p_generation UUID DEFAULT NULL
+) RETURNS TABLE(
+    queue_name VARCHAR(255),
+    message_id BIGINT,
+    payload JSONB,
+    consumer_token VARCHAR(64),
+    delivery_attempts INT,
+    vt_remaining_ms BIGINT,
+    published_at TIMESTAMPTZ,
+    group_key VARCHAR(255),
+    group_seq BIGINT
+) AS $$
+DECLARE
+    v_max_attempts INT;
+    v_generation   UUID;
+    v_now          TIMESTAMPTZ;
+BEGIN
+    -- NULL must be rejected explicitly: it passes the range checks, and a
+    -- NULL p_limit would reach LIMIT NULL (no limit) and lease the whole queue.
+    IF p_queue_name IS NULL THEN
+        RAISE EXCEPTION 'p_queue_name must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_vt IS NULL OR p_vt < 0 THEN
+        RAISE EXCEPTION 'p_vt must be >= 0 (got %)', p_vt USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_limit IS NULL OR p_limit <= 0 THEN
+        RAISE EXCEPTION 'p_limit must be > 0 (got %)', p_limit USING ERRCODE = 'PMQ03';
+    END IF;
+
+    -- Consuming a queue that no longer exists is fatal for the caller's consumer:
+    -- RabbitMQ surfaces queue deletion to active consumers as a cancel / channel
+    -- exception. Raise PMQ02 so the client can tear the consumer down instead of
+    -- silently polling an empty result forever. An existing-but-empty queue still
+    -- returns zero rows with no error (the common idle case). PMQ02 is raised
+    -- for an absent queue row, an expired exclusive queue, and a generation
+    -- mismatch.
+    -- The generation is captured with the limit and pinned in the claim below,
+    -- so a queue deleted and recreated in between (possible when the caller
+    -- passes no generation) cannot be served with the old incarnation's limit.
+    SELECT q.max_delivery_attempts, q.generation INTO v_max_attempts, v_generation
+    FROM postgremq.queues q
+    WHERE q.name = p_queue_name AND (p_generation IS NULL OR q.generation = p_generation)
+      AND (NOT q.exclusive OR q.keep_alive_until > clock_timestamp());
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Queue "%" does not exist', p_queue_name
+          USING ERRCODE = 'PMQ02';
+    END IF;
+    v_now := clock_timestamp();
+
+    -- Queue lifetime belongs to the keep-alive protocol, not message polling.
+    -- Consumption never locks the shared queue row to refresh its lease.
+    --
+    -- Plan shape matters here. The queue filter is the parameter itself
+    -- (qm.queue_name = p_queue_name), so it is an index condition and
+    -- idx_queue_messages_consume yields rows in vt order: the LIMIT stops the
+    -- walk early and there is no Sort. (Joining a CTE that calls the volatile
+    -- clock_timestamp() instead materialises the CTE, turns the queue match
+    -- into a join filter, and degrades every consume to a Seq Scan over all
+    -- queues' rows plus a Sort of the whole visible backlog.) The queue's
+    -- liveness/generation guard stays in this statement as an uncorrelated
+    -- one-time filter, so a queue deleted or replaced after the check above
+    -- still serves nothing.
+    RETURN QUERY
+    WITH next_msg AS (
+        SELECT qm.queue_name,
+               qm.message_id,
+               qm.status,
+               qm.delivery_attempts,
+               qm.published_at
+        FROM postgremq.queue_messages qm
+        WHERE qm.queue_name = p_queue_name
+            AND EXISTS (
+                SELECT 1 FROM postgremq.queues q
+                WHERE q.name = p_queue_name
+                  AND q.generation = v_generation
+                  -- Strict clock_timestamp() cutoff, symmetric with distribute_message and the
+                  -- reaper: an expired exclusive queue serves nothing. No grace window.
+                  AND (NOT q.exclusive OR q.keep_alive_until > clock_timestamp()))
+            AND (v_max_attempts = 0 OR qm.delivery_attempts < v_max_attempts)
+            AND (qm.status = 'pending' OR qm.status = 'processing' )
+            -- A captured cutoff (not clock_timestamp() itself, which is
+            -- volatile and cannot be an index condition) bounds the index
+            -- range to rows that are already visible, so an under-filled
+            -- batch never walks the queue's future-vt rows.
+            AND qm.vt <= v_now
+            -- Group head only. A head another consumer has locked (and is
+            -- claiming right now) is still 'pending' in this snapshot, so its
+            -- successor stays blocked: SKIP LOCKED never falls through to the
+            -- next row of a group. Two rows of one group cannot both pass in
+            -- one statement (the lower one is unsettled in the snapshot).
+            AND (qm.group_key IS NULL OR NOT EXISTS (
+                SELECT 1 FROM postgremq.queue_messages h
+                WHERE h.queue_name = qm.queue_name
+                  AND h.group_key = qm.group_key
+                  AND h.group_key IS NOT NULL
+                  AND h.group_seq < qm.group_seq
+                  AND h.status IN ('pending', 'processing')))
+        -- Order by vt, not published_at, to match idx_queue_messages_consume
+        -- (queue_name, vt, published_at). The `qm.queue_name = p_queue_name` /
+        -- `vt <= v_now` range scan already walks the index in vt order, so ordering by vt eliminates the
+        -- Sort node that ORDER BY published_at forced over the whole visible set
+        -- (an O(n log n) cliff on a deep backlog). At distribution vt is the
+        -- message's deliver_after, about published_at for an undelayed message,
+        -- so fresh messages keep roughly FIFO order. Tradeoff: REDELIVERED
+        -- messages (nack/release resets vt but not published_at) are ordered by
+        -- their reset vt rather than original publish time — acceptable for
+        -- visibility-timeout semantics.
+        ORDER BY qm.vt
+        FOR UPDATE SKIP LOCKED
+        LIMIT p_limit
+    )
+    UPDATE postgremq.queue_messages
+    SET status = 'processing',
+        vt = clock_timestamp() + make_interval(secs => p_vt),
+        delivery_attempts = qm.delivery_attempts + 1,
+        -- Per-lease ownership token: a random v4 UUID, fresh per claim.
+        consumer_token = gen_random_uuid()::text
+    FROM next_msg qm
+    WHERE queue_messages.queue_name = qm.queue_name
+        AND queue_messages.message_id = qm.message_id
+    RETURNING queue_messages.queue_name,
+              queue_messages.message_id,
+              (SELECT m.payload FROM postgremq.messages m WHERE m.id = queue_messages.message_id) AS payload,
+              queue_messages.consumer_token,
+              queue_messages.delivery_attempts,
+              floor(extract(epoch FROM queue_messages.vt - clock_timestamp()) * 1000)::BIGINT,
+              queue_messages.published_at,
+              queue_messages.group_key,
+              queue_messages.group_seq;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.nack_message(
+    p_queue_name VARCHAR(255),
+    p_message_id BIGINT,
+    p_consumer_token VARCHAR(64),
+    p_delay_ms BIGINT DEFAULT 0
+) RETURNS VOID AS $$
+DECLARE
+    v_attempts     INT;
+    v_max_attempts INT;
+    v_group_key    VARCHAR(255);
+BEGIN
+    IF p_queue_name IS NULL OR p_message_id IS NULL OR p_consumer_token IS NULL THEN
+        RAISE EXCEPTION 'Nack failed: queue name, message id and consumer token must not be NULL'
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_delay_ms IS NULL OR p_delay_ms < 0 OR p_delay_ms > 3155760000000 THEN
+        RAISE EXCEPTION 'Nack failed: p_delay_ms must be between 0 and 100 years (got %)', p_delay_ms
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    -- Look up the queue's retry limit. We need this to decide between the
+    -- "reset to pending" path and the "inline DLQ retirement" path.
+    -- FOR SHARE locks the queue row until the transaction ends: without it
+    -- a concurrent delete_queue cascade could drop the queue (and its
+    -- queue_messages) between this read and the UPDATE/INSERT below,
+    -- leaving a stale v_max_attempts and a NOTIFY on a dropped channel.
+    SELECT max_delivery_attempts INTO v_max_attempts
+    FROM postgremq.queues WHERE name = p_queue_name
+    FOR SHARE;
+
+    -- Reset to pending. RETURNING gives us the (post-consume-increment)
+    -- delivery_attempts so we can decide whether this was the final attempt.
+    UPDATE postgremq.queue_messages
+    SET status = 'pending',
+        vt = clock_timestamp() + make_interval(secs => p_delay_ms / 1000.0),
+        consumer_token = NULL
+    WHERE queue_name = p_queue_name
+        AND message_id = p_message_id
+        AND status = 'processing'
+        AND consumer_token = p_consumer_token
+    RETURNING delivery_attempts, group_key INTO v_attempts, v_group_key;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Nack failed: message not in processing state or token mismatch'
+          USING ERRCODE = 'PMQ01';
+    END IF;
+
+    IF v_max_attempts > 0 AND v_attempts >= v_max_attempts THEN
+        -- Final attempt: retire to DLQ inline.
+        INSERT INTO postgremq.dead_letter_queue(queue_name, message_id, retry_count)
+        VALUES (p_queue_name, p_message_id, v_attempts)
+        ON CONFLICT (queue_name, message_id) DO NOTHING;
+
+        DELETE FROM postgremq.queue_messages
+        WHERE queue_name = p_queue_name
+          AND message_id = p_message_id;
+        -- An ungrouped retirement leaves nothing new to consume. A grouped one
+        -- retires its group's head, which unblocks the successor: wake it.
+        IF v_group_key IS NOT NULL THEN
+            PERFORM pg_notify('pmq:q:' || p_queue_name, '');
+        END IF;
+    ELSE
+        -- Wake up consumers of this queue so redelivery is prompt.
+        -- Payload empty; channel name is the signal.
+        PERFORM pg_notify('pmq:q:' || p_queue_name, '');
+    END IF;
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.set_vt(
+    p_queue_name VARCHAR(255),
+    p_message_id BIGINT,
+    p_consumer_token VARCHAR(64),
+    p_vt INTEGER
+) RETURNS BIGINT AS $$
+DECLARE
+    v_vt TIMESTAMPTZ;
+BEGIN
+    IF p_queue_name IS NULL OR p_message_id IS NULL OR p_consumer_token IS NULL THEN
+        RAISE EXCEPTION 'Extend lock failed: queue name, message id and consumer token must not be NULL'
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_vt IS NULL OR p_vt < 0 THEN
+        RAISE EXCEPTION 'p_vt must be >= 0 (got %)', p_vt USING ERRCODE = 'PMQ03';
+    END IF;
+
+    SELECT qm.vt INTO v_vt FROM postgremq.queue_messages qm
+    WHERE qm.queue_name = p_queue_name AND qm.message_id = p_message_id
+      AND qm.consumer_token = p_consumer_token AND qm.status = 'processing'
+    FOR UPDATE NOWAIT;
+    IF NOT FOUND OR v_vt <= clock_timestamp() THEN
+        RAISE EXCEPTION 'Extend lock failed: message not in processing state, expired, or token mismatch'
+          USING ERRCODE = 'PMQ01';
+    END IF;
+    UPDATE postgremq.queue_messages qm SET vt = clock_timestamp() + make_interval(secs => p_vt)
+    WHERE qm.queue_name = p_queue_name AND qm.message_id = p_message_id
+    RETURNING qm.vt INTO v_vt;
+
+    RETURN floor(extract(epoch FROM v_vt - clock_timestamp()) * 1000)::BIGINT;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.extend_queue_keep_alive_multi(
+    p_queue_names  VARCHAR[],
+    p_intervals_ms BIGINT[],
+    p_generations UUID[] DEFAULT NULL
+) RETURNS TABLE (queue_name VARCHAR, keep_alive_remaining_ms BIGINT, outcome TEXT) AS $$
+DECLARE r RECORD; deadline TIMESTAMPTZ;
+BEGIN
+    -- Both arrays NULL would pass the length check (equal NULL cardinalities).
+    IF p_queue_names IS NULL OR p_intervals_ms IS NULL
+       OR cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_intervals_ms)
+       OR (p_generations IS NOT NULL AND cardinality(p_generations) IS DISTINCT FROM cardinality(p_queue_names))
+       OR EXISTS (SELECT 1 FROM unnest(p_intervals_ms) v WHERE v IS NULL OR v <= 0) THEN
+        RAISE EXCEPTION 'invalid keep alive batch' USING ERRCODE = 'PMQ03';
+    END IF;
+    FOR r IN SELECT * FROM unnest(p_queue_names, p_intervals_ms, COALESCE(p_generations, array_fill(NULL::UUID, ARRAY[cardinality(p_queue_names)]))) AS t(name, ms, generation) ORDER BY name LOOP
+        BEGIN
+            SELECT q.keep_alive_until INTO deadline FROM postgremq.queues q
+            WHERE q.name = r.name AND q.exclusive AND (r.generation IS NULL OR q.generation = r.generation) FOR UPDATE NOWAIT;
+            IF FOUND AND deadline > clock_timestamp() THEN
+                UPDATE postgremq.queues q SET keep_alive_until = clock_timestamp() + make_interval(secs => r.ms / 1000.0)
+                WHERE q.name = r.name RETURNING q.keep_alive_until INTO deadline;
+                RETURN QUERY SELECT r.name, floor(extract(epoch FROM deadline - clock_timestamp()) * 1000)::BIGINT,
+                    'extended'::TEXT;
+            END IF;
+        EXCEPTION WHEN lock_not_available THEN
+            -- Contention says nothing about ownership. Retry before the known deadline.
+            RETURN QUERY SELECT r.name, NULL::BIGINT, 'busy'::TEXT;
+        END;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.set_vt_batch_multi(
+    p_queue_names     VARCHAR[],
+    p_message_ids     BIGINT[],
+    p_consumer_tokens VARCHAR[],
+    p_vts             INTEGER[]
+) RETURNS TABLE (queue_name VARCHAR, message_id BIGINT, vt_remaining_ms BIGINT, consumer_token VARCHAR, outcome TEXT) AS $$
+DECLARE r RECORD; owned postgremq.queue_messages%ROWTYPE;
+BEGIN
+    -- All four arrays NULL would pass the length checks (equal NULL cardinalities).
+    IF p_queue_names IS NULL OR p_message_ids IS NULL OR p_consumer_tokens IS NULL OR p_vts IS NULL
+       OR cardinality(p_queue_names) IS DISTINCT FROM cardinality(p_message_ids)
+       OR cardinality(p_message_ids) IS DISTINCT FROM cardinality(p_consumer_tokens)
+       OR cardinality(p_consumer_tokens) IS DISTINCT FROM cardinality(p_vts)
+       OR EXISTS (SELECT 1 FROM unnest(p_vts) v WHERE v IS NULL OR v < 0) THEN
+        RAISE EXCEPTION 'invalid visibility timeout batch' USING ERRCODE = 'PMQ03';
+    END IF;
+    FOR r IN SELECT * FROM unnest(p_queue_names, p_message_ids, p_consumer_tokens, p_vts)
+        AS t(qname, id, token, seconds) ORDER BY qname, id LOOP
+        BEGIN
+            SELECT qm.* INTO owned FROM postgremq.queue_messages qm
+            WHERE qm.queue_name = r.qname AND qm.message_id = r.id FOR UPDATE NOWAIT;
+            IF FOUND AND owned.status = 'processing' AND owned.consumer_token = r.token
+               AND owned.vt > clock_timestamp() THEN
+                UPDATE postgremq.queue_messages qm SET vt = clock_timestamp() + make_interval(secs => r.seconds)
+                WHERE qm.queue_name = r.qname AND qm.message_id = r.id RETURNING qm.vt INTO owned.vt;
+                RETURN QUERY SELECT r.qname, r.id, floor(extract(epoch FROM owned.vt - clock_timestamp()) * 1000)::BIGINT,
+                    r.token, 'extended'::TEXT;
+            END IF;
+        EXCEPTION WHEN lock_not_available THEN
+            RETURN QUERY SELECT r.qname, r.id, NULL::BIGINT, r.token, 'busy'::TEXT;
+        END;
+    END LOOP;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.get_next_visible_in_ms(p_queue_name VARCHAR(255))
+RETURNS BIGINT AS $$
+DECLARE
+    v_next_vt TIMESTAMPTZ;
+BEGIN
+    IF p_queue_name IS NULL THEN
+        RAISE EXCEPTION 'p_queue_name must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
+    SELECT qm.vt INTO v_next_vt
+    FROM postgremq.queue_messages qm
+    JOIN postgremq.queues q ON q.name = qm.queue_name
+    WHERE qm.queue_name = p_queue_name
+      AND (qm.status = 'pending' OR qm.status = 'processing')
+      AND (q.max_delivery_attempts = 0 OR qm.delivery_attempts < q.max_delivery_attempts)
+      AND (qm.group_key IS NULL OR NOT EXISTS (
+          SELECT 1 FROM postgremq.queue_messages h
+          WHERE h.queue_name = qm.queue_name
+            AND h.group_key = qm.group_key
+            AND h.group_key IS NOT NULL
+            AND h.group_seq < qm.group_seq
+            AND h.status IN ('pending', 'processing')))
+    ORDER BY qm.vt ASC
+    LIMIT 1;
+
+    -- An infinite vt (deliver_after => 'infinity') never becomes visible.
+    IF v_next_vt = 'infinity' THEN
+        RETURN NULL;
+    END IF;
+    RETURN ceil(extract(epoch FROM v_next_vt - clock_timestamp()) * 1000)::BIGINT;
+END;
+$$ LANGUAGE plpgsql;
+
+DO $$
+DECLARE f RECORD; g RECORD;
+BEGIN
+    FOR f IN SELECT t.old_signature, t.new_signature, pg_get_userbyid(p.proowner) AS owner,
+                    coalesce(p.proacl, acldefault('f', p.proowner)) AS acl
+             FROM (VALUES ('postgremq.pmq_replaced_consume_message(VARCHAR, INTEGER, INT, UUID)', 'postgremq.consume_message(VARCHAR, INTEGER, INT, UUID)'),
+        ('postgremq.pmq_replaced_nack_message(VARCHAR, BIGINT, VARCHAR, TIMESTAMPTZ)', 'postgremq.nack_message(VARCHAR, BIGINT, VARCHAR, BIGINT)'),
+        ('postgremq.pmq_replaced_set_vt(VARCHAR, BIGINT, VARCHAR, INTEGER)', 'postgremq.set_vt(VARCHAR, BIGINT, VARCHAR, INTEGER)'),
+        ('postgremq.pmq_replaced_extend_queue_keep_alive_multi(VARCHAR[], BIGINT[], UUID[])', 'postgremq.extend_queue_keep_alive_multi(VARCHAR[], BIGINT[], UUID[])'),
+        ('postgremq.pmq_replaced_set_vt_batch_multi(VARCHAR[], BIGINT[], VARCHAR[], INTEGER[])', 'postgremq.set_vt_batch_multi(VARCHAR[], BIGINT[], VARCHAR[], INTEGER[])'),
+        ('postgremq.pmq_replaced_get_next_visible_time(VARCHAR)', 'postgremq.get_next_visible_in_ms(VARCHAR)')) AS t(old_signature, new_signature)
+             JOIN pg_proc p ON p.oid = t.old_signature::regprocedure LOOP
+        EXECUTE format('ALTER FUNCTION %s OWNER TO %I', f.new_signature, f.owner);
+        -- Clear what CREATE gave (the current defaults), then grant the old acl.
+        FOR g IN SELECT * FROM aclexplode((SELECT coalesce(p.proacl, acldefault('f', p.proowner))
+                                           FROM pg_proc p WHERE p.oid = f.new_signature::regprocedure)) LOOP
+            EXECUTE format('REVOKE ALL ON FUNCTION %s FROM %s', f.new_signature,
+                           CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END);
+        END LOOP;
+        FOR g IN SELECT * FROM aclexplode(f.acl) LOOP
+            EXECUTE format('GRANT %s ON FUNCTION %s TO %s%s', g.privilege_type, f.new_signature,
+                           CASE WHEN g.grantee = 0 THEN 'PUBLIC' ELSE quote_ident(pg_get_userbyid(g.grantee)) END,
+                           CASE WHEN g.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END);
+        END LOOP;
+        EXECUTE format('DROP FUNCTION %s', f.old_signature);
+    END LOOP;
+END;
+$$;
+
+-- ── change: correct_function_comments · patch ──────────────────────────────
+
+-- Comments inside these function bodies contradicted the code (issue #24): the
+-- NOTIFY channel length rationale, the scope of the queue-expiry cutoff, the
+-- negative max-attempts rationale and the release_message floor. Bodies are
+-- otherwise unchanged; consume_message and nack_message got their corrected
+-- comments above.
+CREATE OR REPLACE FUNCTION postgremq.create_topic(p_topic VARCHAR(255))
+RETURNS VARCHAR(255) AS $$
+BEGIN
+  IF p_topic IS NULL OR p_topic !~ '^[A-Za-z0-9_:.\-]+$' THEN
+    RAISE EXCEPTION 'Invalid topic name "%": must match ^[A-Za-z0-9_:.\-]+$', p_topic
+      USING ERRCODE = 'PMQ03';
+  END IF;
+  -- NOTIFY channel names are limited to NAMEDATALEN-1 = 63 bytes:
+  -- pg_notify raises "channel name too long" above that, and LISTEN
+  -- truncates the identifier (with a NOTICE). The publish trigger emits on
+  -- 'pmq:t:'||topic_name (6 bytes of prefix), so a topic name longer than
+  -- 57 bytes would make every publish fail and its listeners wait on a
+  -- truncated channel. Reject it up front instead.
+  IF octet_length(p_topic) > 57 THEN
+    RAISE EXCEPTION 'Topic name "%" is too long: maximum 57 bytes (limit imposed by NOTIFY channel length: 63 bytes minus the "pmq:t:" prefix)', p_topic
+      USING ERRCODE = 'PMQ03';
+  END IF;
+  INSERT INTO postgremq.topics(name) VALUES (p_topic)
+  ON CONFLICT (name) DO NOTHING;
+  RETURN p_topic;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.create_queue(
+    p_queue_name VARCHAR(255),
+    p_topic_name VARCHAR(255),
+    p_max_attempts INTEGER DEFAULT 0,  -- 0 = unlimited retries
+    p_exclusive BOOLEAN DEFAULT false,
+    p_keep_alive_interval INTERVAL DEFAULT '5 minutes'
+) RETURNS UUID AS $$
+DECLARE
+    v_existing postgremq.queues%ROWTYPE;
+    v_generation UUID;
+BEGIN
+    IF p_queue_name IS NULL OR p_queue_name !~ '^[A-Za-z0-9_:.\-]+$' THEN
+        RAISE EXCEPTION 'Invalid queue name "%": must match ^[A-Za-z0-9_:.\-]+$', p_queue_name
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    -- Same length cap as create_topic: NOTIFY channel names are limited to
+    -- 63 bytes; the settle and requeue paths emit on 'pmq:q:'||queue_name, leaving
+    -- 57 bytes for the queue name.
+    IF octet_length(p_queue_name) > 57 THEN
+        RAISE EXCEPTION 'Queue name "%" is too long: maximum 57 bytes (limit imposed by NOTIFY channel length: 63 bytes minus the "pmq:q:" prefix)', p_queue_name
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_keep_alive_interval IS NULL OR p_keep_alive_interval <= interval '0' THEN
+        RAISE EXCEPTION 'keep alive interval must be positive' USING ERRCODE = 'PMQ03';
+    END IF;
+    -- A negative max_delivery_attempts would silently break consume_message's
+    -- filter (qm.delivery_attempts < v_max_attempts is never true, as
+    -- delivery_attempts is never negative) and never retire to the DLQ
+    -- (nack_message and pmq_maintenance_fast both gate on max_attempts > 0).
+    -- Reject it up front so callers see PMQ03 instead of a silently broken queue.
+    IF p_max_attempts IS NULL OR p_max_attempts < 0 THEN
+        RAISE EXCEPTION 'p_max_attempts must be >= 0 (got %)', p_max_attempts
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    IF p_topic_name IS NULL OR p_exclusive IS NULL THEN
+        RAISE EXCEPTION 'p_topic_name and p_exclusive must not be NULL' USING ERRCODE = 'PMQ03';
+    END IF;
+    -- Surface a missing topic as PMQ02 (parity with publish_message). Without
+    -- this check the INSERT below would still fail, but with a raw 23503 FK
+    -- violation that doesn't map to ErrQueueNotFound on the client side.
+    IF NOT EXISTS (SELECT 1 FROM postgremq.topics WHERE name = p_topic_name) THEN
+        RAISE EXCEPTION 'Topic "%" does not exist', p_topic_name
+          USING ERRCODE = 'PMQ02';
+    END IF;
+    INSERT INTO postgremq.queues (
+        name,
+        topic_name,
+        max_delivery_attempts,
+        exclusive,
+        keep_alive_interval,
+        keep_alive_until
+    ) VALUES (
+        p_queue_name,
+        p_topic_name,
+        p_max_attempts,
+        p_exclusive,
+        p_keep_alive_interval,
+        CASE
+            WHEN p_exclusive THEN clock_timestamp() + p_keep_alive_interval
+            ELSE NULL
+        END
+    )
+    ON CONFLICT (name) DO NOTHING RETURNING generation INTO v_generation;
+
+    IF FOUND THEN
+        RETURN v_generation;  -- inserted on the fast path
+    END IF;
+
+    -- Conflict path: queue with this name already exists. Verify the caller's
+    -- parameters match the existing row; otherwise raise so accidental config
+    -- drift is caught loudly rather than silently ignored.
+    SELECT * INTO v_existing FROM postgremq.queues WHERE name = p_queue_name FOR UPDATE;
+    IF v_existing.exclusive AND v_existing.keep_alive_until <= clock_timestamp() THEN
+        RAISE EXCEPTION 'Queue "%" expired; delete it before recreating it', p_queue_name USING ERRCODE = 'PMQ02';
+    END IF;
+    IF v_existing.topic_name IS DISTINCT FROM p_topic_name
+       OR v_existing.max_delivery_attempts IS DISTINCT FROM p_max_attempts
+       OR v_existing.exclusive IS DISTINCT FROM p_exclusive
+       OR v_existing.keep_alive_interval IS DISTINCT FROM p_keep_alive_interval THEN
+        RAISE EXCEPTION 'Queue "%" already exists with different parameters '
+                        '(existing: topic=%, max_attempts=%, exclusive=%, keep_alive_interval=%)',
+            p_queue_name,
+            v_existing.topic_name,
+            v_existing.max_delivery_attempts,
+            v_existing.exclusive,
+            v_existing.keep_alive_interval
+          USING ERRCODE = 'PMQ03';
+    END IF;
+
+    -- Redeclaration is idempotent only while this lease is live.
+    IF p_exclusive THEN
+        UPDATE postgremq.queues SET keep_alive_until = clock_timestamp() + keep_alive_interval
+        WHERE name = p_queue_name;
+    END IF;
+    RETURN v_existing.generation;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.distribute_message()
+RETURNS trigger AS $$
+BEGIN
+   -- Distribute to an exclusive queue only while its keep-alive is still live
+   -- (keep_alive_until > clock_timestamp()). There is no grace window:
+   -- distribution, consume_message, the keep-alive renewal and the reaper share
+   -- the same strict clock_timestamp() cutoff. Settling or extending an
+   -- already-leased row (ack, nack, release, set_vt, set_vt_batch_multi) does
+   -- not check queue expiry. Clients are responsible for sending keep-alive
+   -- well before expiry (with their own safety margin) so a queue is never
+   -- considered expired while still in use.
+   -- group_key/group_seq are copied so each queue orders its own copy of a
+   -- group independently, without joining messages on the consume path.
+   INSERT INTO postgremq.queue_messages(queue_name, message_id, vt, group_key, group_seq)
+   SELECT q.name, NEW.id, NEW.deliver_after, NEW.group_key, NEW.group_seq
+   FROM postgremq.queues q
+   WHERE q.topic_name = NEW.topic_name
+     AND (NOT q.exclusive OR q.keep_alive_until > clock_timestamp());
+
+   -- Wake-up signal only; payload is empty. Clients use the channel name
+   -- alone to decide what to fetch next.
+   PERFORM pg_notify('pmq:t:' || NEW.topic_name, '');
+
+   RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.release_message(
+    p_queue_name VARCHAR(255),
+    p_message_id BIGINT,
+    p_consumer_token VARCHAR(64)
+)
+    RETURNS VOID AS $$
+BEGIN
+    IF p_queue_name IS NULL OR p_message_id IS NULL OR p_consumer_token IS NULL THEN
+        RAISE EXCEPTION 'Release message failed: queue name, message id and consumer token must not be NULL'
+          USING ERRCODE = 'PMQ03';
+    END IF;
+    UPDATE postgremq.queue_messages
+    SET status = 'pending',
+        vt = clock_timestamp(),
+        consumer_token = NULL,
+        -- Every lease comes from a claim that incremented delivery_attempts,
+        -- so this never goes below 0; GREATEST only guards against
+        -- out-of-band writes (the column's CHECK constraint is the backstop).
+        delivery_attempts = GREATEST(delivery_attempts - 1, 0)
+    WHERE queue_name = p_queue_name
+      AND message_id = p_message_id
+      AND status = 'processing'
+      AND consumer_token = p_consumer_token;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'Release message failed: message not in processing state or token mismatch'
+          USING ERRCODE = 'PMQ01';
+    END IF;
+
+    -- Wake-up signal only; payload empty.
+    PERFORM pg_notify('pmq:q:' || p_queue_name, '');
+
+    RETURN;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION postgremq.pmq_maintenance_fast()
+RETURNS TABLE (
+    retired_to_dlq          BIGINT,
+    inactive_queues_dropped BIGINT
+) AS $$
+DECLARE
+    v_retired BIGINT;
+    v_dropped BIGINT;
+    v_grouped_queues VARCHAR[];
+BEGIN
+    WITH deleted_messages AS (
+        DELETE FROM postgremq.queue_messages qm
+        USING postgremq.queues q
+        WHERE qm.queue_name = q.name
+          AND q.max_delivery_attempts > 0
+          AND qm.delivery_attempts >= q.max_delivery_attempts
+          -- Only retire rows that are genuinely abandoned: a consumer
+          -- holding a still-valid lease (status='processing' AND vt > clock_timestamp())
+          -- might be mid-handler on its final attempt; yanking the row out
+          -- from under it would let its side-effects commit while the
+          -- message also lands in DLQ. Restrict to expired processing rows.
+          AND qm.status = 'processing'
+          AND qm.vt <= clock_timestamp()
+        RETURNING qm.queue_name, qm.message_id, qm.delivery_attempts, qm.group_key
+    ),
+    inserted AS (
+        -- ON CONFLICT for parity with nack_message's inline retirement.
+        -- The predicate already makes a double-insert impossible (nack flips
+        -- status to 'pending' before deleting; maintenance only matches
+        -- 'processing' rows); the guard is defence in depth.
+        INSERT INTO postgremq.dead_letter_queue(queue_name, message_id, retry_count)
+        SELECT queue_name, message_id, delivery_attempts
+        FROM deleted_messages
+        ON CONFLICT (queue_name, message_id) DO NOTHING
+        RETURNING 1
+    )
+    SELECT (SELECT count(*) FROM inserted),
+           (SELECT array_agg(DISTINCT d.queue_name) FROM deleted_messages d
+             WHERE d.group_key IS NOT NULL)
+    INTO v_retired, v_grouped_queues;
+
+    -- Once per queue that had a grouped head retired (its successor is now
+    -- claimable). Ungrouped retirements leave nothing new to consume.
+    PERFORM pg_notify('pmq:q:' || gq, '')
+    FROM unnest(v_grouped_queues) AS gq;
+
+    -- Skip queues that have DLQ entries. dead_letter_queue.queue_name
+    -- has ON DELETE RESTRICT so deleting them would error and abort
+    -- the maintenance call. Operators can postgremq.purge_dlq() or
+    -- postgremq.requeue_dlq_messages() to release the queue, OR leave it as
+    -- forensic data — the queue stays until the operator decides.
+    WITH dropped AS (
+        DELETE FROM postgremq.queues q
+        WHERE q.exclusive = true
+          -- Strict expiry: reap as soon as keep_alive_until has passed. No
+          -- grace window: the same cutoff as distribution, consume_message and
+          -- the keep-alive renewal (settling or extending an already-leased row
+          -- does not check expiry). Clients must send keep-alive before expiry
+          -- (with their own margin).
+          AND (q.keep_alive_until IS NULL OR q.keep_alive_until <= clock_timestamp())
+          AND NOT EXISTS (
+              SELECT 1 FROM postgremq.dead_letter_queue dlq WHERE dlq.queue_name = q.name
+          )
+        RETURNING name
+    )
+    SELECT count(*) INTO v_dropped FROM dropped;
+
+    RETURN QUERY SELECT v_retired, v_dropped;
+END;
+$$ LANGUAGE plpgsql;

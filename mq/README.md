@@ -148,7 +148,7 @@ emits `NOTIFY pmq:t:<topic>`.
 | Index | Definition | Serves |
 |---|---|---|
 | `idx_queue_messages_consume` | `queue_messages(queue_name, vt, published_at) WHERE status IN ('pending','processing')` | Claim scan in `vt` order |
-| `idx_queue_messages_next_visible` | `queue_messages(queue_name, vt) WHERE status IN ('pending','processing')` | `get_next_visible_time` |
+| `idx_queue_messages_next_visible` | `queue_messages(queue_name, vt) WHERE status IN ('pending','processing')` | `get_next_visible_in_ms` |
 | `idx_queue_messages_group_head` | `queue_messages(queue_name, group_key, group_seq) WHERE status IN ('pending','processing') AND group_key IS NOT NULL` | Group-head check |
 | `idx_queue_messages_pending` / `_processing` | `queue_messages(queue_name) WHERE status = …` | `get_queue_statistics` |
 | `idx_queue_messages_completed_processed_at` | `queue_messages(processed_at) WHERE status = 'completed'` | Completed-row retention |
@@ -167,8 +167,9 @@ statement runs, not when the transaction started.
 ### Topics, queues and publishing
 
 Topic and queue names must match `^[A-Za-z0-9_:.\-]+$` and be at most 57 bytes.
-The limit exists because PostgreSQL truncates NOTIFY channel names at 63 bytes, and
-the `pmq:t:`/`pmq:q:` prefixes take 6 of them. `create_topic` is idempotent.
+The limit exists because PostgreSQL limits NOTIFY channel names to 63 bytes
+(`pg_notify` raises an error above that, and `LISTEN` truncates), and the
+`pmq:t:`/`pmq:q:` prefixes take 6 of them. `create_topic` is idempotent.
 
 `create_queue(name, topic, max_attempts, exclusive, keep_alive_interval)`
 subscribes a queue to a topic and returns its generation.
@@ -278,7 +279,11 @@ publishes to the topic, nacks and redeclarations of the queue wait for it.
   `vt = now + vt_seconds`. Its `delivery_attempts` increases by 1, and it gets a
   new **delivery token**, `consumer_token = gen_random_uuid()::text`.
 - The result columns are `queue_name`, `message_id`, `payload`, `consumer_token`,
-  `delivery_attempts`, `vt`, `published_at`, `group_key` and `group_seq`.
+  `delivery_attempts`, `vt_remaining_ms`, `published_at`, `group_key` and
+  `group_seq`. `vt_remaining_ms` is the time left on the lease by the database
+  clock as the row is returned, in whole milliseconds rounded down. A client
+  adds it to its own clock reading taken before the call, so its deadline never
+  depends on the two clocks agreeing.
 - If the queue is missing, expired or of a different generation, the call raises
   `PMQ02`. A queue that exists but is empty returns zero rows.
 - A NULL queue name, `vt_seconds` or `batch_size`, a negative `vt_seconds`, or a
@@ -293,9 +298,9 @@ and raises `PMQ01` if the row is not `processing` under that token.
 | Function | Effect |
 |---|---|
 | `ack_message(queue, id, token)` | Sets status to `completed`, sets `processed_at`, and clears the token. |
-| `nack_message(queue, id, token, delay_until DEFAULT now)` | Not the final attempt: sets status back to `pending` with `vt = delay_until`. The attempt still counts. Final attempt (`max_delivery_attempts > 0` and attempts ≥ max): moves the row to the DLQ. Locks the queue row `FOR SHARE` until the transaction ends. An explicit NULL `delay_until` raises `PMQ03`. |
+| `nack_message(queue, id, token, delay_ms DEFAULT 0)` | Not the final attempt: sets status back to `pending` with `vt = now + delay_ms`. The attempt still counts. Final attempt (`max_delivery_attempts > 0` and attempts ≥ max): moves the row to the DLQ. Locks the queue row `FOR SHARE` until the transaction ends. A NULL, negative or over-100-year `delay_ms` raises `PMQ03`. |
 | `release_message(queue, id, token)` | Sets status back to `pending` with `vt = now` and decrements `delivery_attempts` (floored at 0). Use it for work that was claimed but never attempted. |
-| `set_vt(queue, id, token, seconds)` | Sets `vt = now + seconds` and returns the new deadline. Requires an unexpired lease (`PMQ01` otherwise). Raises `55P03` (retryable) rather than waiting if the row is locked. |
+| `set_vt(queue, id, token, seconds)` | Sets `vt = now + seconds` and returns the milliseconds left on the new lease (rounded down). Requires an unexpired lease (`PMQ01` otherwise). Raises `55P03` (retryable) rather than waiting if the row is locked. |
 | `set_vt_batch_multi(queues[], ids[], tokens[], seconds[])` | Batched, cross-queue form of `set_vt`; see [Heartbeat batches](#heartbeat-batches). |
 
 Ack, nack and release do not check the lease deadline. They succeed after `vt` has
@@ -394,13 +399,13 @@ row.
 - **Wake-ups.** Settling or removing an unsettled grouped row emits
   `NOTIFY pmq:q:<queue>`, because the group's successor has just become claimable
   (see [Notifications](#notifications)).
-- **Polling.** `get_next_visible_time` applies the same group-head rule, so a
+- **Polling.** `get_next_visible_in_ms` applies the same group-head rule, so a
   consumer waiting behind a leased head is scheduled for the head's lease end
   instead of spinning.
 - **Claim cost.** The claim scan walks the queue's visible rows in `vt` order and
   checks each grouped row against `idx_queue_messages_group_head` until the batch
   is full. Every visible row queued behind a leased or delayed head is stepped
-  over on every claim, and again by `get_next_visible_time` when a client
+  over on every claim, and again by `get_next_visible_in_ms` when a client
   schedules its next fetch.
   That costs roughly 5 µs per blocked row: about 50 ms per claim with 10,000 rows
   waiting behind in-flight heads. Do not let a group build a deep backlog behind a
@@ -466,25 +471,31 @@ All functions live in the `postgremq` schema. "now" means `clock_timestamp()`.
 | Function | Returns |
 |---|---|
 | `publish_message(p_topic, p_payload JSONB, p_deliver_after TIMESTAMPTZ DEFAULT now, p_group_key VARCHAR DEFAULT NULL)` | `BIGINT` message ID |
-| `consume_message(p_queue_name, p_vt INT, p_limit INT DEFAULT 1, p_generation UUID DEFAULT NULL)` | `queue_name, message_id, payload, consumer_token, delivery_attempts, vt, published_at, group_key, group_seq` |
+| `consume_message(p_queue_name, p_vt INT, p_limit INT DEFAULT 1, p_generation UUID DEFAULT NULL)` | `queue_name, message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq` |
 | `ack_message(p_queue_name, p_message_id, p_consumer_token)` | `VOID` |
-| `nack_message(p_queue_name, p_message_id, p_consumer_token, p_delay_until TIMESTAMPTZ DEFAULT now)` | `VOID` |
+| `nack_message(p_queue_name, p_message_id, p_consumer_token, p_delay_ms BIGINT DEFAULT 0)` | `VOID` |
 | `release_message(p_queue_name, p_message_id, p_consumer_token)` | `VOID` |
-| `set_vt(p_queue_name, p_message_id, p_consumer_token, p_vt INT)` | `TIMESTAMPTZ` new deadline |
-| `get_next_visible_time(p_queue_name)` | `TIMESTAMPTZ`, or NULL |
+| `set_vt(p_queue_name, p_message_id, p_consumer_token, p_vt INT)` | `BIGINT` milliseconds left on the new lease |
+| `get_next_visible_in_ms(p_queue_name)` | `BIGINT` milliseconds, or NULL |
 
-`get_next_visible_time` returns the smallest `vt` among the queue's unsettled rows
-that are under the attempt limit and at the head of their group. The result can
-be in the past, meaning work is visible now. It includes the lease end of rows
-that are `processing`. It returns NULL for a queue that does not exist, and does
-not check whether an exclusive queue has expired.
+Times in and out of these functions are durations by the database clock, so a
+client never compares a database timestamp with its own clock: `vt_remaining_ms`
+and `set_vt`'s result are the time left on the lease (whole milliseconds,
+rounded down), and `nack_message`'s `p_delay_ms` (≥ 0) is how long the row
+stays invisible. `get_next_visible_in_ms` returns the milliseconds (rounded up)
+until the smallest `vt` among the queue's unsettled rows that are under the
+attempt limit and at the head of their group. Zero or negative means work is
+visible now. It includes the lease end of rows
+that are `processing`. It returns NULL for a queue that does not exist or when
+the earliest row is delayed forever (`vt = 'infinity'`), and does not check
+whether an exclusive queue has expired.
 
 ### Heartbeat batches
 
 | Function | Returns |
 |---|---|
-| `set_vt_batch_multi(p_queue_names VARCHAR[], p_message_ids BIGINT[], p_consumer_tokens VARCHAR[], p_vts INT[])` | `queue_name, message_id, vt, consumer_token, outcome` |
-| `extend_queue_keep_alive_multi(p_queue_names VARCHAR[], p_intervals_ms BIGINT[], p_generations UUID[] DEFAULT NULL)` | `queue_name, keep_alive_until, outcome` |
+| `set_vt_batch_multi(p_queue_names VARCHAR[], p_message_ids BIGINT[], p_consumer_tokens VARCHAR[], p_vts INT[])` | `queue_name, message_id, vt_remaining_ms, consumer_token, outcome` |
+| `extend_queue_keep_alive_multi(p_queue_names VARCHAR[], p_intervals_ms BIGINT[], p_generations UUID[] DEFAULT NULL)` | `queue_name, keep_alive_remaining_ms, outcome` |
 
 Both functions take element-wise parallel arrays and process the entries in key
 order, each in its own subtransaction. The arrays must be non-NULL and of equal
@@ -495,9 +506,12 @@ omitted, or reported `busy` while its row is locked. `p_generations` itself, or
 any of its elements, may be NULL, meaning whichever incarnation exists. Each
 entry produces one of three results:
 
-- **`outcome = 'extended'`:** the entry carries the confirmed new deadline.
-- **`outcome = 'busy'`:** the row was locked (`NOWAIT`), so the deadline is NULL
-  and the lease is unchanged. Being busy does not mean ownership was lost. Retry
+- **`outcome = 'extended'`:** the entry carries the time left until the
+  confirmed new deadline by the database clock (`vt_remaining_ms`,
+  `keep_alive_remaining_ms`; whole milliseconds, rounded down), which clients
+  add to their own clock reading taken before the call.
+- **`outcome = 'busy'`:** the row was locked (`NOWAIT`), so the time left is
+  NULL and the lease is unchanged. Being busy does not mean ownership was lost. Retry
   before the last confirmed deadline.
 - **Omitted:** the lease is lost.
   - For messages: the row is gone, not `processing`, under another token, or
@@ -681,7 +695,7 @@ PostgreMQ raises three custom SQLSTATEs:
 |---|---|---|
 | `PMQ01` | The delivery is not held under this token: unknown message, already settled, reclaimed by another consumer, or (for extension) the lease has expired | `ack_message`, `nack_message`, `release_message`, `set_vt` |
 | `PMQ02` | Target does not exist or is gone | `publish_message` and `create_queue` (topic missing); `consume_message` (queue missing, expired, or generation mismatch); `create_queue` (redeclaring an expired exclusive queue) |
-| `PMQ03` | Invalid argument or refused operation | NULL in a required argument (any function; see below); invalid or too-long name (`create_topic`, `create_queue`); negative `max_attempts`; non-positive `keep_alive_interval`; redeclaration with different parameters (or of a queue deleted concurrently, see [Topics, queues and publishing](#topics-queues-and-publishing)); empty or over-255-character group key; negative `vt` (`consume_message`, `set_vt`); non-positive batch size (`consume_message`); NULL heartbeat array; mismatched heartbeat or prune array lengths; NULL or negative `p_vts` element; NULL or non-positive `p_intervals_ms` element; negative retention or non-positive batch size in cleanup; `delete_topic` with messages; `delete_queue` or `clean_up_topic` with DLQ entries |
+| `PMQ03` | Invalid argument or refused operation | NULL in a required argument (any function; see below); invalid or too-long name (`create_topic`, `create_queue`); negative `max_attempts`; non-positive `keep_alive_interval`; redeclaration with different parameters (or of a queue deleted concurrently, see [Topics, queues and publishing](#topics-queues-and-publishing)); empty or over-255-character group key; negative `vt` (`consume_message`, `set_vt`); negative or over-100-year `delay_ms` (`nack_message`); non-positive batch size (`consume_message`); NULL heartbeat array; mismatched heartbeat or prune array lengths; NULL or negative `p_vts` element; NULL or non-positive `p_intervals_ms` element; negative retention or non-positive batch size in cleanup; `delete_topic` with messages; `delete_queue` or `clean_up_topic` with DLQ entries |
 
 Every argument is required unless NULL has a meaning, and a NULL in a required
 argument raises `PMQ03` before the function does anything. NULL is meaningful

@@ -59,7 +59,7 @@ export function validateConsumerOptions(options: Partial<ConsumerOptions>): void
   }
 }
 
-/** How soon an empty fetch is retried when get_next_visible_time reports a
+/** How soon an empty fetch is retried when get_next_visible_in_ms reports a
  *  row that is already due (see scheduleNextFetch). */
 const DUE_HINT_BACKOFF_MS = 100;
 
@@ -413,16 +413,15 @@ export class Consumer {
    */
   private async scheduleNextFetch(): Promise<void> {
     try {
-      // Get the next visible time from the database
-      const nextVisibleTime = await this.connection.getNextVisibleTime(this.queueName);
+      // How long until the next row is visible, on the database's clock
+      const nextVisibleInMs = await this.connection.getNextVisibleInMs(this.queueName);
 
       if (!this.running) return;
 
       let waitTime = this.options.pollingIntervalMs;
 
-      if (nextVisibleTime) {
-        const now = new Date();
-        const timeUntilNextVisible = Math.max(0, nextVisibleTime.getTime() - now.getTime());
+      if (nextVisibleInMs !== null) {
+        const timeUntilNextVisible = Math.max(0, nextVisibleInMs);
 
         // Use the shorter of the two wait times
         waitTime = Math.min(timeUntilNextVisible, this.options.pollingIntervalMs);

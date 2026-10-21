@@ -356,7 +356,7 @@ func (c *Consumer) fetchInto() {
 }
 
 // dueHintBackoff bounds how soon an empty fetch is retried when
-// get_next_visible_time reports a row that is already due.
+// get_next_visible_in_ms reports a row that is already due.
 const dueHintBackoff = 100 * time.Millisecond
 
 // computeNextAt mirrors the old fetch-loop scheduling: retry soon on error,
@@ -370,20 +370,29 @@ func (c *Consumer) computeNextAt(n int, err error) time.Time {
 		return time.Now() // consumed max available; try for more immediately
 	}
 	if n == 0 {
-		nextVisible, err := c.conn.getNextVisibleTime(c.ctx, c.queue)
+		inMs, err := c.conn.getNextVisibleInMs(c.ctx, c.queue)
 		if err != nil {
 			c.logger.Errorf("Failed to get next visible time: %v", err)
 			return time.Now().Add(1 * time.Second)
 		}
-		c.logger.Debugf("Consumer - next available message in %d ms", time.Until(nextVisible).Milliseconds())
-		if !nextVisible.IsZero() && !nextVisible.After(time.Now()) {
+		if inMs == nil {
+			return time.Time{}
+		}
+		c.logger.Debugf("Consumer - next available message in %d ms", *inMs)
+		if *inMs <= 0 {
 			// A visible-but-unclaimable row: locked by another transaction
 			// (a claim in progress, or an AckWithTx whose transaction is
 			// still open past the lease). Refetching at once would spin;
 			// back off briefly. NOTIFYs still wake the loop immediately.
 			return time.Now().Add(dueHintBackoff)
 		}
-		return nextVisible
+		// The run loop waits at most checkTimeout anyway; capping first keeps
+		// a time centuries away from overflowing the Duration.
+		wait := c.checkTimeout
+		if *inMs < wait.Milliseconds() {
+			wait = time.Duration(*inMs) * time.Millisecond
+		}
+		return time.Now().Add(wait)
 	}
 	return time.Time{} // partial batch → no specific time; checkTimeout governs
 }

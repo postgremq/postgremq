@@ -69,7 +69,7 @@ test('forced stop abandons an active delivery without releasing it', async () =>
     .spyOn(c, 'consumeMessages')
     .mockResolvedValueOnce([delivery('active')])
     .mockResolvedValue([]);
-  jest.spyOn(c, 'getNextVisibleTime').mockResolvedValue(new Date(Date.now() + 60000));
+  jest.spyOn(c, 'getNextVisibleInMs').mockResolvedValue(60000);
   const release = jest.spyOn(c, 'releaseMessage').mockResolvedValue();
   const consumer = new Consumer('q', c, { topic: 't', batchSize: 1 });
   const { value: message } = await consumer.messages().next();
@@ -205,7 +205,6 @@ test('unsafe IDs are rejected before destructive operations', async () => {
  *  those in `gone`, which it leaves out as the SQL does an expired lease or
  *  queue. */
 function heartbeatClient(gone: string[], options: { onQueueFatal?: (queue: string) => void } = {}) {
-  const until = () => new Date(Date.now() + 60000);
   const socket = {
     release: jest.fn(),
     query: jest.fn(async (sql: string, [names, ids, tokens]: any[]) => {
@@ -215,14 +214,14 @@ function heartbeatClient(gone: string[], options: { onQueueFatal?: (queue: strin
             key: `${queue}/${ids[i]}`,
             queue_name: queue,
             message_id: ids[i],
-            vt: until(),
+            vt_remaining_ms: '60000',
             consumer_token: tokens[i],
             outcome: 'extended',
           }))
         : names.map((queue: string) => ({
             key: queue,
             queue_name: queue,
-            keep_alive_until: until(),
+            keep_alive_remaining_ms: '60000',
             outcome: 'extended',
           }));
       return { rows: rows.filter((r: any) => !gone.includes(r.key)) };
@@ -305,6 +304,29 @@ test('a heartbeat call waits for the earliest deadline, between one and five sec
     expect(within).toBeGreaterThan(2900);
     expect(within).toBeLessThanOrEqual(3000);
     expect(await flush(60000)).toBe(5000);
+  } finally {
+    await c.close();
+  }
+});
+
+test('a slow queue declaration does not push the first keep-alive later', async () => {
+  // The database starts the keep-alive when it runs create_queue.
+  const socket = {
+    release: jest.fn(),
+    query: jest.fn(async () => {
+      await sleep(300);
+      return { rows: [{ create_queue: 'g' }] };
+    }),
+  };
+  const c = new Connection({ pool: { on() {}, connect: async () => socket } as any });
+  (c as any).connected = true;
+  try {
+    const before = Date.now();
+    await c.createQueue('q', 't', true, { keepAliveInterval: 2 });
+    const entry = (c as any).keepAliveEntries.get('q');
+    // Counted from the response, it would be 300 ms later.
+    expect(entry.expiresAt.getTime()).toBeLessThan(before + 2200);
+    expect(entry.nextAt.getTime()).toBeLessThan(before + 1200);
   } finally {
     await c.close();
   }

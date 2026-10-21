@@ -27,13 +27,17 @@ type Message struct {
 	ID int64
 	// Payload is the JSON-encoded message payload.
 	Payload json.RawMessage
-	// PublishedAt is when the message was first published to the topic.
+	// PublishedAt is when the message was first published to the topic, on the
+	// database's clock (unlike VT).
 	PublishedAt time.Time
 	// DeliveryAttempt is the number of times this message has been consumed
 	// (including the current attempt).
 	DeliveryAttempt int
-	// VT is the visibility timeout expiration timestamp. If the message is not
-	// acknowledged by this time, it becomes visible to other consumers.
+	// VT is the visibility timeout expiration, on this process's clock: the
+	// clock reading taken before the claim or extension plus the time left by
+	// the database clock. It is never later than the real deadline, whatever the
+	// database clock reads, and is when auto-extension gives the lease up. If
+	// the message is not acknowledged by then, it can be redelivered.
 	VT time.Time
 	// GroupKey is the message group the message was published into (see
 	// WithGroupKey); empty for an ungrouped message.
@@ -210,7 +214,8 @@ func (m *Message) Release(ctx context.Context) error {
 //   - ctx: Context for cancellation and timeout control.
 //   - vt: New visibility timeout in seconds from now.
 //
-// Returns the new visibility timeout expiration timestamp, or an error if:
+// Returns the new visibility timeout expiration on this process's clock (see
+// Message.VT), or an error if:
 //   - The consumer token doesn't match.
 //   - The message is not in 'processing' state.
 //   - The visibility timeout has already expired.
@@ -240,11 +245,17 @@ func (m *Message) SetVT(ctx context.Context, vt int) (result time.Time, resultEr
 		return time.Time{}, ErrConnectionClosed
 	}
 
+	// set_vt returns the time left by the database clock; VT is sent plus
+	// it, as for consumed messages.
 	var newVT time.Time
 	err := m.conn.withRetry(ctx, func(ctx context.Context) error {
-		return m.conn.pool.QueryRow(ctx,
+		sent := time.Now()
+		var remainingMs int64
+		err := m.conn.pool.QueryRow(ctx,
 			"SELECT postgremq.set_vt($1, $2, $3, $4)",
-			m.queue, m.ID, m.consumerToken, vt).Scan(&newVT)
+			m.queue, m.ID, m.consumerToken, vt).Scan(&remainingMs)
+		newVT = sent.Add(time.Duration(remainingMs) * time.Millisecond)
+		return err
 	})
 	if err != nil {
 		return time.Time{}, mapPgError(err)

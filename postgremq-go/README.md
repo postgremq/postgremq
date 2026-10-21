@@ -92,7 +92,7 @@ Runnable programs are in [examples/](examples/README.md).
 
 From its first `Consume` or `ConsumeHandler` until `Close`, each `Connection` holds one pooled connection for `LISTEN` (shared by all its consumers), so size the pool for that plus publish, consume, settle and heartbeat traffic. `LISTEN` needs session affinity and does not work through a transaction-mode pooler. If the session fails, the client closes that connection and reconnects after a delay that starts at 1 second and grows ×1.5 per attempt up to 30 seconds. Notifications sent while it is disconnected are lost; consumers still poll every `WithCheckTimeout`. Connection methods are safe for concurrent use.
 
-On connect, `Dial` and `DialFromPool` read `postgremq.info()` and check that the installation's schema version is on an mq compatibility line this client implements (`postgremq.SupportedMQVersions()`, currently `["0.1"]`). A line is an mq major, or before 1.0 a major and minor: a breaking schema change bumps the major, or before 1.0 the minor, so a client built for mq 0.1 accepts 0.1.x and rejects 0.2.0. Otherwise they return a `*postgremq.CompatibilityError` (`errors.Is(err, postgremq.ErrIncompatibleSchema)`) with the schema version and the supported lines; a database without `info()` (not installed, or older than discovery), or whose `info()` reports no schema version, gets the same error saying it needs an installation or upgrade. Connection and permission errors are returned as they are. Within a supported line, a function the installation lacks fails with the database's error (SQLSTATE `42883`) like any other.
+On connect, `Dial` and `DialFromPool` read `postgremq.info()` and check that the installation's schema version is on an mq compatibility line this client implements (`postgremq.SupportedMQVersions()`, currently `["0.2"]`). A line is an mq major, or before 1.0 a major and minor: a breaking schema change bumps the major, or before 1.0 the minor, so a client built for mq 0.2 accepts 0.2.x and rejects 0.1.x and 0.3.0. Otherwise they return a `*postgremq.CompatibilityError` (`errors.Is(err, postgremq.ErrIncompatibleSchema)`) with the schema version and the supported lines; a database without `info()` (not installed, or older than discovery), or whose `info()` reports no schema version, gets the same error saying it needs an installation or upgrade. Connection and permission errors are returned as they are. Within a supported line, a function the installation lacks fails with the database's error (SQLSTATE `42883`) like any other.
 
 | Connection option | Default | Effect |
 |---|---|---|
@@ -127,7 +127,7 @@ A consumer binds to one queue generation (incarnation): the generation cached by
 ```go
 id, err := conn.Publish(ctx, "orders", json.RawMessage(`{"order_id": 1}`))
 
-// Not visible to consumers until the given time.
+// Not visible to consumers until the database's clock reaches the given time.
 id, err = conn.Publish(ctx, "orders", payload,
 	postgremq.WithDeliverAfter(time.Now().Add(5*time.Minute)))
 ```
@@ -162,7 +162,7 @@ The consumer fetches in batches, starting immediately. After that, a fetch is tr
 
 - a publish `NOTIFY` on the topic, or a `NOTIFY` on the queue (sent by nack, release, DLQ requeue, and settlements that unblock a message group);
 - a full batch, which triggers an immediate refetch;
-- an empty batch, after which the consumer asks the database for the next visible time (a delayed message or an expiring lease) and fetches then, or after 100 ms if that time has already passed;
+- an empty batch, after which the consumer asks the database how long until the next row becomes visible (a delayed message or an expiring lease) and fetches then, or after 100 ms if that time has already passed;
 - a failed fetch, which is retried after about one second;
 - `WithCheckTimeout` passing without any of the above. It bounds every wait; after a partial batch the consumer waits for a notification or this timeout.
 
@@ -216,7 +216,7 @@ defer hc.Stop()
 | Method | Effect |
 |---|---|
 | `Ack(ctx)` | Marks the message completed. |
-| `Nack(ctx, opts...)` | Returns the message for redelivery: immediately, or at `WithDelayUntil(t)`. On the final allowed attempt, it moves the message to the DLQ. |
+| `Nack(ctx, opts...)` | Returns the message for redelivery: immediately, or at `WithDelayUntil(t)`, where `t` is read on the local clock (the client sends the time remaining until `t`). On the final allowed attempt, it moves the message to the DLQ. |
 | `Release(ctx)` | Returns the message immediately and does not count the attempt. Use it for work you never started. |
 | `AckWithTx(ctx, tx)` | `Ack` inside your transaction. See [Transactions](#transactions). |
 | `SetVT(ctx, seconds)` | Sets the lease deadline to now + `seconds`, updates `msg.VT` and returns the new deadline. It does not settle the message. It always runs SQL, also after a settle call; the server returns `ErrLeaseLost` for a delivery that is no longer processing under this token or whose lease has passed. |
@@ -279,7 +279,7 @@ A claimed message is invisible to other consumers until its visibility timeout (
 - A message is extended when `WithExtensionThreshold` (default 0.5) of its remaining lease has elapsed. Each extension sets the deadline to now + the consumer's `WithVT` and updates `msg.VT` (read it with `GetVT()`).
 - Each call is bounded by the earliest confirmed deadline in the batch, but by no less than one second and no more than five, and the connection's retry policy applies inside that bound.
 - If the row is locked by another statement, the message is retried after 100 ms; after a failed call, its messages are retried after one second. Both retries happen only until the message's last confirmed deadline.
-- Scheduling compares the deadlines the database returns with the local clock, so keep the client and database clocks synchronised.
+- A lease's deadline is the local time read before the claim or renewal call plus the time left that the database reports, so scheduling does not depend on the client and database clocks agreeing. `msg.VT` is this deadline, on the local clock.
 - If the lease is lost, because the server omits the message from the result (it is no longer processing under this token, or its lease has passed) or the last confirmed deadline passes before a renewal succeeds, the client cancels the message's `StoppedCtx`, stops extending it, and counts it in the `postgremq.client.renewal.lost` metric. Another consumer may now receive the message. Your code should stop work and still settle the message; the settle call will usually return `ErrLeaseLost`.
 - A message stays scheduled until its settle call returns, so a renewal that runs after the settlement has committed but before the call returns omits the message and reports it lost in the same way.
 

@@ -38,14 +38,15 @@ type kaResult struct {
 
 // keepAliveRegister upserts an exclusive queue into the keep-alive schedule.
 // Buffered + ctx-guarded so it never blocks the caller (CreateQueue). The fresh
-// entry carries a new deadline and nextAt.
-func (c *Connection) keepAliveRegister(queue string, intervalMs int64, generation string) {
+// entry carries a new deadline and nextAt, counted from sent, read before the
+// create_queue statement that set keep_alive_until.
+func (c *Connection) keepAliveRegister(queue string, intervalMs int64, generation string, sent time.Time) {
 	c.keepAlive.register(&kaEntry{
 		queue:      queue,
 		generation: generation,
 		intervalMs: intervalMs,
-		nextAt:     time.Now().Add(time.Duration(intervalMs/2) * time.Millisecond),
-		expiresAt:  time.Now().Add(time.Duration(intervalMs) * time.Millisecond),
+		nextAt:     sent.Add(time.Duration(intervalMs/2) * time.Millisecond),
+		expiresAt:  sent.Add(time.Duration(intervalMs) * time.Millisecond),
 	})
 }
 
@@ -149,20 +150,23 @@ func (c *Connection) extendKeepAliveLeases(ctx context.Context, names []string, 
 	leases := make(map[string]kaLease)
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		clear(leases)
-		rows, err := c.pool.Query(ctx, "SELECT queue_name, keep_alive_until, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)", names, intervalsMs, generations)
+		// Deadlines are the time left by the database clock, counted from
+		// before the call, so they never depend on the two clocks agreeing.
+		sent := time.Now()
+		rows, err := c.pool.Query(ctx, "SELECT queue_name, keep_alive_remaining_ms, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)", names, intervalsMs, generations)
 		if err != nil {
 			return mapPgError(err)
 		}
 		defer rows.Close()
 		for rows.Next() {
 			var name, outcome string
-			var until *time.Time
-			if err := rows.Scan(&name, &until, &outcome); err != nil {
+			var remainingMs *int64
+			if err := rows.Scan(&name, &remainingMs, &outcome); err != nil {
 				return err
 			}
 			lease := kaLease{busy: outcome == "busy"}
-			if until != nil {
-				lease.until = *until
+			if remainingMs != nil {
+				lease.until = sent.Add(time.Duration(*remainingMs) * time.Millisecond)
 			}
 			leases[name] = lease
 		}

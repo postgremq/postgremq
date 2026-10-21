@@ -25,7 +25,9 @@ use crate::renewal::{self, DeliveryKey, Registration, RenewalSchedule, SharedLea
 use crate::retry::{is_aborted_transaction, is_retryable, is_rolled_back, with_retry};
 use crate::scheduler::{Scheduler, spawn_scheduler};
 use crate::sync::lock;
-use crate::types::{Generation, MessageId, duration_millis, to_unix_micros};
+use crate::types::{
+    Generation, MessageId, duration_millis, millis_until, to_unix_micros, unix_micros_at,
+};
 
 /// How long [`Connection::close`] waits for consumers to exit after the
 /// shutdown deadline abandoned their work.
@@ -1232,40 +1234,20 @@ impl Inner {
 
     async fn nack_sql(&self, key: &DeliveryKey, delay: Option<Duration>) -> Result<()> {
         self.check_not_closed()?;
-        match delay.filter(|delay| !delay.is_zero()) {
-            // The delay is applied with the server's clock.
-            Some(delay) => {
-                let delay_ms = duration_millis(delay);
-                self.retry(|| {
-                    checked_out(&self.pool, async |conn| {
-                        sqlx::query(
-                            "SELECT postgremq.nack_message($1, $2, $3, \
-                         clock_timestamp() + $4 * interval '1 millisecond')",
-                        )
-                        .bind(&*key.queue)
-                        .bind(key.id.get())
-                        .bind(&*key.token)
-                        .bind(delay_ms)
-                        .execute(conn)
-                        .await
-                    })
-                })
-                .await?;
-            }
-            None => {
-                self.retry(|| {
-                    checked_out(&self.pool, async |conn| {
-                        sqlx::query("SELECT postgremq.nack_message($1, $2, $3)")
-                            .bind(&*key.queue)
-                            .bind(key.id.get())
-                            .bind(&*key.token)
-                            .execute(conn)
-                            .await
-                    })
-                })
-                .await?;
-            }
-        }
+        // The delay is applied with the server's clock.
+        let delay_ms = delay.map_or(0, duration_millis);
+        self.retry(|| {
+            checked_out(&self.pool, async |conn| {
+                sqlx::query("SELECT postgremq.nack_message($1, $2, $3, $4)")
+                    .bind(&*key.queue)
+                    .bind(key.id.get())
+                    .bind(&*key.token)
+                    .bind(delay_ms)
+                    .execute(conn)
+                    .await
+            })
+        })
+        .await?;
         Ok(())
     }
 
@@ -1287,19 +1269,21 @@ impl Inner {
 
     async fn set_vt_sql(&self, key: &DeliveryKey, secs: i32) -> Result<i64> {
         self.check_not_closed()?;
+        // set_vt returns the time left by the database clock; the deadline is
+        // sent plus it, as for claims.
         let vt_micros = self
             .retry(|| {
                 checked_out(&self.pool, async |conn| {
-                    sqlx::query_scalar(
-                        "SELECT (extract(epoch FROM postgremq.set_vt($1, $2, $3, $4)) \
-                                 * 1000000)::int8",
-                    )
-                    .bind(&*key.queue)
-                    .bind(key.id.get())
-                    .bind(&*key.token)
-                    .bind(secs)
-                    .fetch_one(conn)
-                    .await
+                    let sent = Instant::now();
+                    let remaining: i64 =
+                        sqlx::query_scalar("SELECT postgremq.set_vt($1, $2, $3, $4)")
+                            .bind(&*key.queue)
+                            .bind(key.id.get())
+                            .bind(&*key.token)
+                            .bind(secs)
+                            .fetch_one(conn)
+                            .await?;
+                    Ok(unix_micros_at(sent + millis_until(remaining)))
                 })
             })
             .await?;

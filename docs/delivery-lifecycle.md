@@ -169,14 +169,14 @@ schedule when it fetches them and deregisters them when they settle.
 
 How the client knows a lease's deadline:
 
-| Client | Lease deadline |
-|---|---|
-| Go | the `vt` returned by the claim or renewal, compared with the local clock |
-| TypeScript | the `vt` returned by the claim or renewal, compared with the local clock |
-| Rust | the local instant the request was sent (after acquiring a pool connection) plus the remaining time the server reports (`vt - clock_timestamp()`), so it does not depend on the two clocks agreeing |
-
-In Go and TypeScript, keep the client and database clocks synchronized: a client
-clock running behind the database's lets renewal start too late.
+Every client takes the local instant read before the claim or renewal call
+(in TypeScript and Rust, after acquiring a pool connection) plus the time left that the server
+reports (`vt_remaining_ms`, by the database clock, rounded down). The
+local instant precedes the server's clock reading, so the local deadline is
+never later than the real one, and no client depends on the client and database
+clocks agreeing. The lease end a delivery shows (Go `Message.VT`, TypeScript
+`message.vt`, Rust `Delivery::vt`) is this deadline, on the application's clock;
+a manual extension computes it the same way from `set_vt`.
 
 | Result for a delivery | Action |
 |---|---|
@@ -234,11 +234,11 @@ one second and 30 days in Rust).
   connection's retry policy inside that bound; TypeScript sends the call once.
 - `busy` and transport errors are retried after 100 ms until the last known
   keep-alive deadline.
-- The first deadline after a declaration is the requested interval, counted in Go
-  and TypeScript from when the declaration returned and in Rust from when it was
-  sent. Later deadlines come from the server's `keep_alive_until`: compared with
-  the local clock in Go and TypeScript, converted to remaining time as for leases
-  in Rust.
+- The first deadline after a declaration is the requested interval counted from
+  before the call, in every client (`create_queue` sets `keep_alive_until` to the
+  database clock plus the interval and reports no time left). Later deadlines
+  are the local instant before the call plus `keep_alive_remaining_ms`, as for
+  leases.
 - A queue omitted from a successful result (deleted, expired, non-exclusive or
   replaced by a new generation), or one whose deadline passes without a renewal,
   has failed permanently and becomes fatal.
@@ -322,7 +322,7 @@ next visible time where the client looks it up (below).
 | Reconnect backoff (no jitter, capped at 30 s) | 1 s, ×1.5 per attempt, never reset | 500 ms, ×2, reset once a session's subscriptions are in place | 250 ms, ×2, reset when a notification arrives |
 | After a (re)connect | subscriptions are restored; no subscriber is woken | subscriptions are restored; no subscriber is woken | every subscriber is woken once its LISTENs are in place, including on the first session |
 | Subscription changes | applied after a NOTIFY on a per-instance control channel | reconciled on every change and after each reconnect | reconciled on every change and after each reconnect |
-| `get_next_visible_time` lookup | after an empty claim; uses the retry policy | after an empty or partial claim; uses the retry policy | after an empty claim; bounded by 2 s, not retried |
+| `get_next_visible_in_ms` lookup | after an empty claim; uses the retry policy | after an empty or partial claim; uses the retry policy | after an empty claim; bounded by 2 s, not retried |
 | Wait when the next row is due but locked | 100 ms | 100 ms | 100 ms |
 | Poll interval (default) | `WithCheckTimeout` (10 s) | `pollingIntervalMs` (1 s) | `check_timeout` (10 s) |
 | Claim bound | 1 s | half the visibility timeout, at least 1 s | `statement_timeout` of half the visibility timeout, between 1 s and 30 s |

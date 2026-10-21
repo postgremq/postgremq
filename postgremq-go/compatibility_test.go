@@ -15,9 +15,9 @@ import (
 
 func TestCompatibility_SupportedVersions(t *testing.T) {
 	versions := postgremq.SupportedMQVersions()
-	assert.Equal(t, []string{"0.1"}, versions)
+	assert.Equal(t, []string{"0.2"}, versions)
 	versions[0] = "99"
-	assert.Equal(t, []string{"0.1"}, postgremq.SupportedMQVersions(), "callers get a copy")
+	assert.Equal(t, []string{"0.2"}, postgremq.SupportedMQVersions(), "callers get a copy")
 }
 
 func TestCompatibility_InstalledSchemaIsSupported(t *testing.T) {
@@ -47,9 +47,9 @@ func TestCompatibility_OtherVersionsOfTheSameLineAreAccepted(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
 	// protocol_major is only for older clients: it is ignored.
 	for _, info := range []string{
-		`{"schema_version": 10000, "protocol_major": 99}`,
-		`{"schema_version": 19999}`,
-		`{"schema_version": 10001}`,
+		`{"schema_version": 20000, "protocol_major": 99}`,
+		`{"schema_version": 29999}`,
+		`{"schema_version": 20001}`,
 	} {
 		fakeInfo(t, ctx, pool, info)
 		conn, err := postgremq.DialFromPool(ctx, pool)
@@ -68,16 +68,16 @@ func TestCompatibility_UnsupportedMajorIsRejected(t *testing.T) {
 	var compat *postgremq.CompatibilityError
 	require.ErrorAs(t, err, &compat)
 	assert.Equal(t, int64(100_020_003), compat.SchemaVersion)
-	assert.Equal(t, []string{"0.1"}, compat.SupportedVersions)
+	assert.Equal(t, []string{"0.2"}, compat.SupportedVersions)
 	assert.Contains(t, err.Error(), "mq 1.2.3 (schema version 100020003)")
-	assert.Contains(t, err.Error(), "supports mq [0.1]")
+	assert.Contains(t, err.Error(), "supports mq [0.2]")
 }
 
 // Before 1.0 a breaking schema change bumps the minor, so another 0.y is
 // another contract.
 func TestCompatibility_OtherMinorBefore1IsRejected(t *testing.T) {
 	pool, ctx := setupTestConnection(t)
-	for _, version := range []int64{20_000, 1, 99_999_999} {
+	for _, version := range []int64{10_002, 30_000, 1, 99_999_999} {
 		fakeInfo(t, ctx, pool, fmt.Sprintf(`{"schema_version": %d, "protocol_major": 1}`, version))
 
 		_, err := postgremq.DialFromPool(ctx, pool)

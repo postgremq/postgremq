@@ -461,8 +461,8 @@ describe('Connection', () => {
       expect(stats.totalCount).toBe(0);
     });
 
-    // set_vt_batch_multi returns the column as `vt`; verify the client reads it
-    // as a valid Date (auto-extension uses these Dates to schedule the next
+    // setVtBatchMulti builds `vt` from set_vt_batch_multi's vt_remaining_ms;
+    // verify it is a valid Date (auto-extension uses these Dates to schedule the next
     // round, so an Invalid Date would silently drop messages from extension).
     test('setVtBatchMulti returns valid Dates approximately at now+vt', async () => {
       const id1 = await connection.publish('msg-topic', { test: 'batch-vt-1' });

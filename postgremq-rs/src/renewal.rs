@@ -30,7 +30,7 @@ use crate::metrics::{Metrics, Operation, sqlx_error_type};
 use crate::options::RetryConfig;
 use crate::retry::{is_retryable, with_retry};
 use crate::scheduler::{Heartbeat, Schedule, heartbeat_deadline};
-use crate::types::{MessageId, millis_until};
+use crate::types::{MessageId, millis_until, unix_micros_at};
 
 /// Retry delay after a `busy` outcome.
 const BUSY_RETRY: Duration = Duration::from_millis(100);
@@ -160,7 +160,6 @@ pub(crate) struct Item {
 struct Renewal {
     busy: bool,
     remaining: Option<Duration>,
-    vt_micros: Option<i64>,
 }
 
 /// What a flush learned about its batch.
@@ -403,13 +402,10 @@ impl Schedule for RenewalSchedule {
                 Some(Some(Renewal {
                     busy: false,
                     remaining: Some(remaining),
-                    vt_micros,
                 })) => {
                     entry.confirmed_at = sent;
                     entry.expires_at = sent + *remaining;
-                    if let Some(vt) = vt_micros {
-                        entry.sink.view.publish(*vt);
-                    }
+                    entry.sink.view.publish(unix_micros_at(entry.expires_at));
                     let at = Self::renewal_at(entry);
                     self.schedule(item.key, at);
                 }
@@ -479,8 +475,7 @@ pub(crate) async fn flush(
             let rows = sqlx::query(
                 "SELECT queue_name::text AS queue_name, message_id, consumer_token::text AS consumer_token, \
                         outcome, \
-                        (extract(epoch FROM vt - clock_timestamp()) * 1000)::int8 AS remaining_ms, \
-                        (extract(epoch FROM vt) * 1000000)::int8 AS vt_us \
+                        vt_remaining_ms AS remaining_ms \
                  FROM postgremq.set_vt_batch_multi($1::varchar[], $2::int8[], $3::varchar[], $4::int4[])",
             )
             .bind(queues)
@@ -556,7 +551,6 @@ fn decode(rows: &[sqlx::postgres::PgRow]) -> Result<Renewals, sqlx::Error> {
             Renewal {
                 busy,
                 remaining: remaining.map(millis_until),
-                vt_micros: row.try_get("vt_us")?,
             },
         );
     }
@@ -579,7 +573,10 @@ pub(crate) fn on_lost(metrics: &Metrics, lost: LostLease) {
 
 #[cfg(test)]
 mod tests {
+    use std::time::SystemTime;
+
     use super::*;
+    use crate::types::to_unix_micros;
 
     fn key(id: i64) -> DeliveryKey {
         DeliveryKey {
@@ -804,7 +801,6 @@ mod tests {
             Renewal {
                 busy: false,
                 remaining: Some(Duration::from_secs(30)),
-                vt_micros: Some(30_000_042),
             },
         );
         let mut lost = Vec::new();
@@ -817,7 +813,9 @@ mod tests {
             &mut lost,
         );
         assert!(lost.is_empty());
-        assert_eq!(sink.view.vt_micros(), 30_000_042);
+        // The deadline it shows is on the local clock: 30 s from the send.
+        let shown = sink.view.vt_micros() - to_unix_micros(SystemTime::now());
+        assert!((shown - 30_000_000).abs() < 1_000_000, "{shown}");
         assert_eq!(
             state.earliest(),
             Some(Instant::now() + Duration::from_secs(15))
