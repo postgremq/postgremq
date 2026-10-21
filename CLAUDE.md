@@ -257,7 +257,7 @@ plus mq when the release commit carries a new migration:
   `FormatSchemaVersion`/`format_schema_version`/`formatSchemaVersion` decode
   it). Clients check its mq compatibility LINE on connect (the major, or
   before 1.0 major.minor; `SupportedMQVersions()` / `SUPPORTED_MQ_VERSIONS`,
-  now `["0.1"]`) and reject others, or a missing version,
+  now `["0.2"]`) and reject others, or a missing version,
   with a typed compatibility error. Change headers declare the kind: `patch`
   fix, `minor` additive, `major` breaking. Before 1.0 a `major` header bumps
   the mq MINOR and the others the patch (Cargo-style), so a breaking SQL change
@@ -294,7 +294,7 @@ plus mq when the release commit carries a new migration:
 claims a grouped row only if no lower-seq row of its (queue, group) is
 pending/processing (`idx_queue_messages_group_head`), so groups are claimed in
 order, one at a time. Settling/removing a grouped row NOTIFYs `pmq:q:<queue>`
-to wake the successor; `get_next_visible_time` skips blocked successors.
+to wake the successor; `get_next_visible_in_ms` skips blocked successors.
 Group rows are pruned by `prune_message_groups` (lock SKIP LOCKED, then a
 separate fresh-snapshot DELETE — a single DELETE is unsafe under EPQ). Clients:
 Go `WithGroupKey` / `Message.GroupKey`,`GroupSeq`; TS `{ groupKey }` /

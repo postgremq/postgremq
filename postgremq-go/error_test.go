@@ -325,13 +325,13 @@ func TestConsumeMessagesReturnsPartialOnError(t *testing.T) {
 	// Build a Rows that yields 2 successful scans then surfaces an error
 	// via Err() (the path pgx takes for a network drop after Next()
 	// returned false at end-of-stream).
-	makeScan := func(id int64, payload string, token string, attempts int, vt, pubAt time.Time) func(dest ...any) error {
+	makeScan := func(id int64, payload string, token string, attempts int, vtRemainingMs int64, pubAt time.Time) func(dest ...any) error {
 		return func(dest ...any) error {
 			*dest[0].(*int64) = id
 			*dest[1].(*json.RawMessage) = json.RawMessage(payload)
 			*dest[2].(*string) = token
 			*dest[3].(*int) = attempts
-			*dest[4].(*time.Time) = vt
+			*dest[4].(*int64) = vtRemainingMs
 			*dest[5].(*time.Time) = pubAt
 			return nil
 		}
@@ -339,8 +339,8 @@ func TestConsumeMessagesReturnsPartialOnError(t *testing.T) {
 	now := time.Now()
 	rows := &MockRows{
 		ScanFuncs: []func(dest ...any) error{
-			makeScan(1, `{"a":1}`, "tok-1", 1, now.Add(30*time.Second), now),
-			makeScan(2, `{"a":2}`, "tok-2", 1, now.Add(30*time.Second), now),
+			makeScan(1, `{"a":1}`, "tok-1", 1, 30000, now),
+			makeScan(2, `{"a":2}`, "tok-2", 1, 30000, now),
 		},
 		ErrAfter: &pgconn.PgError{Code: "08006", Message: "stream lost mid-batch"},
 	}

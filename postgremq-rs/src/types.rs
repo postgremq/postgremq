@@ -3,6 +3,7 @@
 use std::fmt;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio::time::Instant;
 use uuid::Uuid;
 
 /// A message ID (`postgremq.messages.id`, a `BIGINT`).
@@ -93,6 +94,18 @@ pub(crate) fn to_unix_micros(time: SystemTime) -> i64 {
     }
 }
 
+/// Converts a monotonic instant to Unix microseconds on the local wall clock,
+/// read now: how a lease deadline kept as `sent + remaining` is shown to the
+/// application, so it never depends on the database clock agreeing.
+pub(crate) fn unix_micros_at(at: Instant) -> i64 {
+    let (now, wall) = (Instant::now(), SystemTime::now());
+    if at >= now {
+        wall.checked_add(at - now).map_or(i64::MAX, to_unix_micros)
+    } else {
+        wall.checked_sub(now - at).map_or(i64::MIN, to_unix_micros)
+    }
+}
+
 /// Converts a millisecond count reported by SQL (possibly negative, meaning
 /// "already due") to a non-negative [`Duration`].
 pub(crate) fn millis_until(millis: i64) -> Duration {
@@ -118,6 +131,16 @@ mod tests {
         for micros in [0, 1, -1, 1_700_000_000_123_456, -86_400_000_000] {
             assert_eq!(to_unix_micros(from_unix_micros(micros)), micros);
         }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn instants_convert_to_the_local_wall_clock() {
+        let wall = to_unix_micros(SystemTime::now());
+        let ahead = unix_micros_at(Instant::now() + Duration::from_secs(30)) - wall;
+        assert!((ahead - 30_000_000).abs() < 1_000_000, "{ahead}");
+        tokio::time::advance(Duration::from_secs(60)).await;
+        let past = unix_micros_at(Instant::now() - Duration::from_secs(30)) - wall;
+        assert!((past + 30_000_000).abs() < 1_000_000, "{past}");
     }
 
     #[test]

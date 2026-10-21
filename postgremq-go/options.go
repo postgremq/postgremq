@@ -445,7 +445,9 @@ type messageOptions struct {
 // failed messages.
 //
 // Parameters:
-//   - t: Absolute timestamp when the message should become visible.
+//   - t: Absolute timestamp when the message should become visible, read on
+//     the application's clock: Nack sends the time remaining until t, and the
+//     database adds it to its own clock, so the two clocks need not agree.
 //
 // If not specified, Nack makes the message immediately visible for redelivery.
 //
@@ -481,7 +483,8 @@ type publishOptions struct {
 // specified time.
 //
 // Parameters:
-//   - t: Absolute timestamp when the message should become visible.
+//   - t: Absolute timestamp when the message should become visible, compared
+//     with the database's clock (unlike WithDelayUntil, it is sent as is).
 //
 // If not specified, the message is immediately visible for consumption.
 //

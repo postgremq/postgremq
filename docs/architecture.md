@@ -124,21 +124,23 @@ is and is not promised.
 
 Notifications carry no payload and are only hints. Clients also poll, so a
 missed notification delays delivery but never loses a message.
-`get_next_visible_time(queue)` tells a client when the next row becomes
-visible (a delayed message or an expiring lease), so it can sleep until
-then instead of polling at a fixed rate.
+`get_next_visible_in_ms(queue)` tells a client how long until the next row
+becomes visible (a delayed message or an expiring lease), by the database
+clock, so it can sleep that long instead of polling at a fixed rate.
 
 ### Batched background calls
 
 Two functions exist so that clients renew in bulk:
 
 - `set_vt_batch_multi(queues, ids, tokens, vts)` renews many leases across
-  many queues in one call. Each row comes back `extended` (with the confirmed
-  `vt`) or `busy` (the row was locked; `NOWAIT` keeps one contended row from
-  delaying the rest). A row that is omitted has lost its lease.
+  many queues in one call. Each row comes back `extended` (with the
+  milliseconds left on the renewed lease, `vt_remaining_ms`) or `busy` (the
+  row was locked; `NOWAIT` keeps one contended row from delaying the rest).
+  A row that is omitted has lost its lease.
 - `extend_queue_keep_alive_multi(queues, intervals, generations)` does the
-  same for exclusive queues: `extended`, `busy`, or omitted when the queue is
-  gone, expired or of a different generation.
+  same for exclusive queues: `extended` (with `keep_alive_remaining_ms`),
+  `busy`, or omitted when the queue is gone,
+  expired or of a different generation.
 
 ### Maintenance
 
@@ -200,7 +202,7 @@ A consumer runs one loop per queue:
    then buffer the deliveries for the application.
 3. After a claim that returned fewer rows than requested, wait for the first
    of: a notification on the topic or queue channel, the poll interval, or
-   the time `get_next_visible_time` reports (looked up after an empty claim,
+   the time `get_next_visible_in_ms` reports (looked up after an empty claim,
    and in TypeScript after a partial one too).
 
 Applications take deliveries from an iterator or stream (Go channel,
@@ -229,13 +231,15 @@ queues, in one `set_vt_batch_multi` call:
   the lease is lost. The scheduler cancels the delivery's signal and stops
   tracking it.
 
-Go and TypeScript compare the `vt` the server returns with the local
-clock, so their scheduling assumes the client and database clocks agree.
-Rust records the local send instant plus the remaining time the server
-reports, which does not depend on the clocks agreeing. A delivery leaves the
-renewal schedule when its settlement call completes, successfully or not; in
-Rust a loss seen while its settlement is in progress is not reported. Manual
-extension of a delivery is independent of this schedule: automatic renewal
+No client compares a server timestamp with its own clock. Each takes the
+local instant before the call plus the time left that the server reports
+(`vt_remaining_ms`), so the deadline does not depend on the client and
+database clocks agreeing, and the lease end it shows the application
+(`Message.VT`, `message.vt`, `Delivery::vt`) is that same deadline on the
+application's clock. A delivery leaves the renewal schedule when its
+settlement call completes, successfully or not; in Rust a loss seen while its
+settlement is in progress is not reported. Manual extension of a delivery is
+independent of this schedule: automatic renewal
 continues from its own last confirmation, so an application that uses both
 is responsible for keeping them consistent.
 
@@ -308,7 +312,7 @@ a timeout.
 | Driver | pgx v5 | node-postgres | sqlx 0.9 |
 | Background schedules | One goroutine per scheduler owns its schedule; register and deregister are commands on a channel; the SQL call runs on a separate goroutine | Timers on the event loop over a `Map` schedule | `std::sync::Mutex`-guarded schedule driven by one Tokio task per scheduler; the SQL call runs on a separate task |
 | Renewal order | Min-heap keyed by (queue, message ID, token) | `Map` keyed by (queue, message ID, token) | Map of live deliveries plus a min-heap of pending renewals |
-| Lease and keep-alive deadlines | Server timestamps compared with the local clock | Server timestamps compared with the local clock | Local send instant plus the remaining time the server reports |
+| Lease and keep-alive deadlines | Local instant before the call plus the remaining time the server reports | Local instant before the call plus the remaining time the server reports | Local send instant plus the remaining time the server reports |
 | Same-name declare and delete | Not serialized | Not serialized | Serialized by a per-name lock on the connection |
 | Delivery stream | `Consumer.Messages()` channel | `for await` over `consumer.messages()` | `Stream` / `Consumer::next()` |
 | Cancellation | `context.Context` | `AbortSignal` | `CancellationToken` |

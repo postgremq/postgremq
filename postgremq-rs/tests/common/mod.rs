@@ -203,6 +203,36 @@ impl TestDb {
             .unwrap()
     }
 
+    /// A pool on this database whose sessions read a clock `skew_ms` ahead:
+    /// `clock_timestamp()` is shadowed through the search path for the
+    /// schema's function bodies. Column and parameter defaults were bound at
+    /// install and keep the real clock, so a negative skew would hide
+    /// default-time publishes; only positive skews are supported.
+    pub(crate) async fn skewed_pool(&self, skew_ms: i64) -> PgPool {
+        assert!(skew_ms >= 0, "a negative skew hides default-time publishes");
+        ddl(
+            &mut self.pool.acquire().await.unwrap(),
+            format!(
+                "CREATE SCHEMA IF NOT EXISTS skew; \
+                 CREATE OR REPLACE FUNCTION skew.clock_timestamp() RETURNS timestamptz \
+                 LANGUAGE sql VOLATILE AS $$ SELECT pg_catalog.clock_timestamp() \
+                 + {skew_ms} * interval '1 ms' $$"
+            ),
+        )
+        .await
+        .unwrap();
+        PgPoolOptions::new()
+            .test_before_acquire(false)
+            .max_connections(10)
+            .connect_with(
+                server_options()
+                    .database(&self.name)
+                    .options([("search_path", "skew,pg_catalog,public")]),
+            )
+            .await
+            .unwrap()
+    }
+
     /// A connection over this database's pool.
     pub(crate) async fn connect(&self, options: ConnectionOptions) -> Connection {
         Connection::from_pool(self.pool.clone(), options)

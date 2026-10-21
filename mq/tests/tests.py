@@ -484,11 +484,11 @@ def test_maintenance_fast_skips_healthy_in_flight(cur: psycopg2.extensions.curso
     # Consume with a comfortable VT so the lease is solidly in the future.
     # max_delivery_attempts=1 so this single consume puts us at the limit.
     cur.execute("""
-        SELECT message_id, consumer_token, delivery_attempts, vt
+        SELECT message_id, consumer_token, delivery_attempts
         FROM postgremq.consume_message('HealthyMaintQueue', 60, 1)
     """)
     row = cur.fetchone()
-    msg_id, token, attempts, vt = row
+    msg_id, token, attempts = row
     assert attempts == 1, f"expected delivery_attempts=1 (== max), got {attempts}"
 
     # Run maintenance: the row hits delivery_attempts >= max but the lease is
@@ -783,9 +783,9 @@ def test_set_vt(cur: psycopg2.extensions.cursor) -> None:
     cur.execute("""
         SELECT postgremq.set_vt(%s, %s, %s, 60)
     """, (queue_name, message_id, consumer_token))
-    new_vt = cur.fetchone()[0]
-    assert new_vt > datetime.now(pytz.UTC)
-    assert new_vt < datetime.now(pytz.UTC) + timedelta(seconds=61)
+    # The time left on the new lease, in milliseconds, rounded down.
+    remaining_ms = cur.fetchone()[0]
+    assert 59000 < remaining_ms <= 60000
     
     # Test wrong consumer token
     with pytest.raises(Exception):
@@ -824,7 +824,7 @@ def test_set_vt_batch_multi_extends_across_queues(cur):
 
     cur.execute(
         """
-        SELECT queue_name, message_id, vt
+        SELECT queue_name, message_id, vt_remaining_ms
         FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)
         """,
         (['MQ1', 'MQ2'], [m1, m2], [t1, t2], [600, 600]),
@@ -840,6 +840,23 @@ def test_set_vt_batch_multi_extends_across_queues(cur):
     now = datetime.now(pytz.UTC)
     for r in cur.fetchall():
         assert r['vt'] > now + timedelta(seconds=590)
+
+
+def test_lease_functions_report_time_remaining_by_the_database_clock(cur):
+    """consume_message and set_vt_batch_multi report the time left on the
+    lease by the database clock in whole milliseconds, rounded down, so it
+    never exceeds the lease asked for; a client adds it to its own clock."""
+    cur.execute("SELECT postgremq.create_topic('RemTopic')")
+    cur.execute("SELECT postgremq.create_queue('RemQ', 'RemTopic', 3, false)")
+    cur.execute("SELECT postgremq.publish_message('RemTopic', '{}'::jsonb)")
+    cur.execute("SELECT message_id, consumer_token, vt_remaining_ms FROM postgremq.consume_message('RemQ', 30, 1)")
+    claimed = cur.fetchone()
+    assert 29000 < claimed['vt_remaining_ms'] <= 30000
+    cur.execute(
+        "SELECT vt_remaining_ms FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)",
+        (['RemQ'], [claimed['message_id']], [claimed['consumer_token']], [600]),
+    )
+    assert 599000 < cur.fetchone()['vt_remaining_ms'] <= 600000
 
 
 def test_set_vt_batch_multi_composite_key_no_cross_queue_bleed(cur):
@@ -896,14 +913,13 @@ def test_set_vt_batch_multi_mixed_vt(cur):
     )
 
     cur.execute(
-        "SELECT message_id, vt FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)",
+        "SELECT message_id, vt_remaining_ms FROM postgremq.set_vt_batch_multi(%s, %s, %s, %s)",
         (['MixQ', 'MixQ'], [a_id, b_id], [a_tok, b_tok], [120, 600]),
     )
-    got = {r['message_id']: r['vt'] for r in cur.fetchall()}
-    now = datetime.now(pytz.UTC)
+    got = {r['message_id']: r['vt_remaining_ms'] for r in cur.fetchall()}
     # a ~120s, b ~600s — distinct windows.
-    assert now + timedelta(seconds=110) < got[a_id] < now + timedelta(seconds=130)
-    assert got[b_id] > now + timedelta(seconds=590)
+    assert 119000 < got[a_id] <= 120000
+    assert 599000 < got[b_id] <= 600000
 
 
 def test_set_vt_batch_multi_partial_lease_loss(cur):
@@ -1226,10 +1242,9 @@ def test_delayed_nack_notifications(cur: psycopg2.extensions.cursor) -> None:
     cur.execute('LISTEN "pmq:q:TestQueue"')
 
     # Nack with 2 second delay
-    delay_time = datetime.now(pytz.UTC) + timedelta(seconds=2)
     cur.execute("""
-        SELECT postgremq.nack_message('TestQueue', %s, %s, %s)
-    """, (msg_id, token, delay_time))
+        SELECT postgremq.nack_message('TestQueue', %s, %s, 2000)
+    """, (msg_id, token))
 
     # Get notification
     conn = cur.connection
@@ -1445,6 +1460,13 @@ def test_sqlstate_codes_pmq03_validation(cur: psycopg2.extensions.cursor) -> Non
     assert exc_info.value.pgcode == 'PMQ03'
     cur.connection.rollback()
 
+    # nack_message: negative or over-100-year delay
+    for delay_ms in (-1, 3155760000001):
+        with pytest.raises(psycopg2.Error) as exc_info:
+            cur.execute("SELECT postgremq.nack_message('VQueue', 1, 'tok', %s)", (delay_ms,))
+        assert exc_info.value.pgcode == 'PMQ03'
+        cur.connection.rollback()
+
     # set_vt_batch_multi: mismatched array lengths
     with pytest.raises(psycopg2.Error) as exc_info:
         cur.execute("""
@@ -1479,7 +1501,7 @@ NULL_ARGUMENT_CALLS = {
     # generation NULL = any incarnation
     'consume_message': (["'{queue}'", '30', '1', 'NULL'], {3}),
     'ack_message': (["'{queue}'", '{id}', "'{token}'"], set()),
-    'nack_message': (["'{queue}'", '{id}', "'{token}'", 'clock_timestamp()'], set()),
+    'nack_message': (["'{queue}'", '{id}', "'{token}'", '0'], set()),
     'release_message': (["'{queue}'", '{id}', "'{token}'"], set()),
     'set_vt': (["'{queue}'", '{id}', "'{token}'", '30'], set()),
     'set_vt_batch_multi': (["ARRAY['{queue}']::varchar[]", 'ARRAY[{id}]::bigint[]',
@@ -1496,7 +1518,7 @@ NULL_ARGUMENT_CALLS = {
     'clean_up_topic': (["'{topic}'"], set()),
     'list_messages': (["'{queue}'"], set()),
     'get_message': (['{id}'], set()),
-    'get_next_visible_time': (["'{queue}'"], set()),
+    'get_next_visible_in_ms': (["'{queue}'"], set()),
     # NULL arrays = an empty batch
     'prune_message_groups': (['NULL', 'NULL'], {0, 1}),
     'cleanup_unreferenced_messages': (['24', '1000'], set()),
@@ -1618,7 +1640,7 @@ def test_nack_final_attempt_inline_dlq(cur: psycopg2.extensions.cursor) -> None:
         SELECT message_id, consumer_token FROM postgremq.consume_message('TestQueue', 30)
     """)
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, 0)", (msg_id, token))
 
     cur.execute("""
         SELECT status, delivery_attempts FROM postgremq.queue_messages
@@ -1635,7 +1657,7 @@ def test_nack_final_attempt_inline_dlq(cur: psycopg2.extensions.cursor) -> None:
     msg_id2, token2 = cur.fetchone()
     assert msg_id2 == msg_id
 
-    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, NOW())", (msg_id, token2))
+    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, 0)", (msg_id, token2))
 
     # Row should be gone from postgremq.queue_messages and present in DLQ — without
     # any maintenance call.
@@ -1661,7 +1683,7 @@ def test_nack_non_final_does_not_dlq(cur: psycopg2.extensions.cursor) -> None:
 
     cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('TestQueue', 30)")
     msg_id, token = cur.fetchone()
-    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+    cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, 0)", (msg_id, token))
 
     cur.execute("""
         SELECT status FROM postgremq.queue_messages
@@ -1684,7 +1706,7 @@ def test_unlimited_attempts_never_dlq_inline(cur: psycopg2.extensions.cursor) ->
     for _ in range(5):
         cur.execute("SELECT message_id, consumer_token FROM postgremq.consume_message('TestQueue', 30)")
         msg_id, token = cur.fetchone()
-        cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, NOW())", (msg_id, token))
+        cur.execute("SELECT postgremq.nack_message('TestQueue', %s, %s, 0)", (msg_id, token))
 
     cur.execute("SELECT count(*) FROM postgremq.dead_letter_queue WHERE queue_name='TestQueue'")
     assert cur.fetchone()[0] == 0
@@ -1693,44 +1715,42 @@ def parse_timestamp(ts_str: str) -> datetime:
     """Parse timestamp from notification."""
     return datetime.fromisoformat(ts_str.replace('Z', '+00:00'))
 
-def test_get_next_visible_time(cur: psycopg2.extensions.cursor) -> None:
-    """Test getting next message visibility time."""
+def test_get_next_visible_in_ms(cur: psycopg2.extensions.cursor) -> None:
+    """Milliseconds until the next message becomes visible, by the database
+    clock, rounded up; zero or negative when one is visible now."""
     cur.execute("SELECT postgremq.create_topic('TestTopic')")
     cur.execute("SELECT postgremq.create_queue('TestQueue', 'TestTopic', 2, false)")
-    
+
     # When no messages, should return NULL
-    cur.execute("SELECT postgremq.get_next_visible_time('TestQueue')")
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('TestQueue')")
     assert cur.fetchone()[0] is None
-    
+
     # Publish message with 2 second delay
-    delay_time = datetime.now(pytz.UTC) + timedelta(seconds=2)
     cur.execute("""
-        SELECT postgremq.publish_message('TestTopic', '{"test":"data"}'::jsonb, %s)
-    """, (delay_time,))
-    
-    # Should return the delay time
-    cur.execute("SELECT postgremq.get_next_visible_time('TestQueue')")
-    next_time = cur.fetchone()[0]
-    assert abs(next_time - delay_time) < timedelta(milliseconds=100)
-    
+        SELECT postgremq.publish_message('TestTopic', '{"test":"data"}'::jsonb,
+                                         clock_timestamp() + interval '2 seconds')
+    """)
+
+    # Should return the time left until the delay ends
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('TestQueue')")
+    assert 1900 < cur.fetchone()[0] <= 2000
+
     # Publish immediate message
     cur.execute("""
         SELECT postgremq.publish_message('TestTopic', '{"test":"immediate"}'::jsonb)
     """)
-    
-    # Should return current time (immediate message)
-    cur.execute("SELECT postgremq.get_next_visible_time('TestQueue')")
-    next_time = cur.fetchone()[0]
-    assert abs(next_time - datetime.now(pytz.UTC)) < timedelta(seconds=1)
-    
+
+    # The immediate message is visible now
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('TestQueue')")
+    assert cur.fetchone()[0] <= 0
+
     # Consume one message
     cur.execute("SELECT * FROM postgremq.consume_message('TestQueue', 30)")
     msg = cur.fetchone()
-    
-    # Should still return delay_time for the delayed message
-    cur.execute("SELECT postgremq.get_next_visible_time('TestQueue')")
-    next_time = cur.fetchone()[0]
-    assert abs(next_time - delay_time) < timedelta(milliseconds=100)
+
+    # Back to the delayed message
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('TestQueue')")
+    assert 1500 < cur.fetchone()[0] <= 2000
 
 def test_consume_message_published_at(cur: psycopg2.extensions.cursor) -> None:
     """Test that consume_message returns published_at timestamp."""
@@ -1835,8 +1855,34 @@ def test_delete_inactive_queues_edge_cases(cur: psycopg2.extensions.cursor) -> N
     # Clean up
     cur.execute("DELETE FROM postgremq.topics WHERE name = 'null_ka_topic'")
 
-def test_get_next_visible_time_multiple_queues(cur: psycopg2.extensions.cursor) -> None:
-    """Test get_next_visible_time with multiple queues."""
+def test_get_next_visible_in_ms_rounds_up(cur):
+    """A row visible 0.4 ms from now is reported as 1 ms away, not 0 (which
+    means visible now): the wait never ends before the row is visible."""
+    cur.execute("SELECT postgremq.create_topic('RoundTopic')")
+    cur.execute("SELECT postgremq.create_queue('RoundQ', 'RoundTopic', 2, false)")
+    # Pin the database clock the functions read, as the clock-skew tests do.
+    cur.execute("""
+        CREATE SCHEMA pin;
+        CREATE FUNCTION pin.clock_timestamp() RETURNS timestamptz LANGUAGE sql
+            AS $$ SELECT '2030-01-01 00:00:00+00'::timestamptz $$;
+        SET search_path = pin, pg_catalog, public""")
+    cur.execute("""SELECT postgremq.publish_message('RoundTopic', '{}'::jsonb,
+                       '2030-01-01 00:00:00.0004+00'::timestamptz)""")
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('RoundQ')")
+    assert cur.fetchone()[0] == 1
+    cur.execute("RESET search_path; DROP SCHEMA pin CASCADE")
+
+
+def test_get_next_visible_in_ms_is_null_for_a_row_delayed_forever(cur):
+    cur.execute("SELECT postgremq.create_topic('InfTopic')")
+    cur.execute("SELECT postgremq.create_queue('InfQ', 'InfTopic', 2, false)")
+    cur.execute("SELECT postgremq.publish_message('InfTopic', '{}'::jsonb, 'infinity'::timestamptz)")
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('InfQ')")
+    assert cur.fetchone()[0] is None
+
+
+def test_get_next_visible_in_ms_multiple_queues(cur: psycopg2.extensions.cursor) -> None:
+    """Test get_next_visible_in_ms with multiple queues."""
     # Create separate topics for each queue to avoid cross-routing of messages
     cur.execute("SELECT postgremq.create_topic('MultiQTopic1')")
     cur.execute("SELECT postgremq.create_topic('MultiQTopic2')")
@@ -1856,10 +1902,10 @@ def test_get_next_visible_time_multiple_queues(cur: psycopg2.extensions.cursor) 
     """, (delay2,))
     
     # Check both queues
-    cur.execute("SELECT postgremq.get_next_visible_time('Queue1')")
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('Queue1')")
     next_time1 = cur.fetchone()[0]
     
-    cur.execute("SELECT postgremq.get_next_visible_time('Queue2')")
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('Queue2')")
     next_time2 = cur.fetchone()[0]
     
     # Check that next_time2 is earlier than next_time1
@@ -2021,10 +2067,9 @@ def test_purge_all_messages_states(cur: psycopg2.extensions.cursor) -> None:
     cur.execute("SELECT * FROM postgremq.consume_message('PurgeQueue2', 30, 1)")
     msg = cur.fetchone()
     if msg:
-        delay_time = datetime.now(pytz.UTC) + timedelta(seconds=10)
         cur.execute("""
-            SELECT postgremq.nack_message('PurgeQueue2', %s, %s, %s)
-        """, (msg['message_id'], msg['consumer_token'], delay_time))
+            SELECT postgremq.nack_message('PurgeQueue2', %s, %s, 10000)
+        """, (msg['message_id'], msg['consumer_token']))
     
     # Verify initial message counts
     cur.execute("SELECT COUNT(*) FROM postgremq.messages")
@@ -2154,24 +2199,21 @@ def test_nack_message_delays(cur: psycopg2.extensions.cursor) -> None:
     
     # 2. Short delay (1 second)
     msg2 = messages[1]
-    short_delay = datetime.now(pytz.UTC) + timedelta(seconds=1)
     cur.execute("""
-        SELECT postgremq.nack_message('NackQueue', %s, %s, %s)
-    """, (msg2['message_id'], msg2['consumer_token'], short_delay))
+        SELECT postgremq.nack_message('NackQueue', %s, %s, 1000)
+    """, (msg2['message_id'], msg2['consumer_token']))
     
     # 3. Medium delay (3 seconds)
     msg3 = messages[2]
-    medium_delay = datetime.now(pytz.UTC) + timedelta(seconds=3)
     cur.execute("""
-        SELECT postgremq.nack_message('NackQueue', %s, %s, %s)
-    """, (msg3['message_id'], msg3['consumer_token'], medium_delay))
+        SELECT postgremq.nack_message('NackQueue', %s, %s, 3000)
+    """, (msg3['message_id'], msg3['consumer_token']))
     
     # 4. Long delay (5 seconds)
     msg4 = messages[3]
-    long_delay = datetime.now(pytz.UTC) + timedelta(seconds=5)
     cur.execute("""
-        SELECT postgremq.nack_message('NackQueue', %s, %s, %s)
-    """, (msg4['message_id'], msg4['consumer_token'], long_delay))
+        SELECT postgremq.nack_message('NackQueue', %s, %s, 5000)
+    """, (msg4['message_id'], msg4['consumer_token']))
     
     # Test immediate message availability
     cur.execute("SELECT * FROM postgremq.consume_message('NackQueue', 30, 1)")
@@ -2550,8 +2592,10 @@ def test_heartbeat_contention_is_local_and_clock_is_fresh(cur, conn, db_config, 
         cur.execute("SET statement_timeout='500ms'")
         cur.execute("SELECT * FROM postgremq.set_vt_batch_multi(%s::varchar[], %s::bigint[], %s::varchar[], %s::int[])",
                     [['q','q'], [m['message_id'] for m in deliveries], [m['consumer_token'] for m in deliveries], [10,10]])
-        outcomes = {r['message_id']:r['outcome'] for r in cur.fetchall()}
-        assert outcomes == {deliveries[0]['message_id']:'busy', deliveries[1]['message_id']:'extended'}
+        rows = {r['message_id']:r for r in cur.fetchall()}
+        assert {k:r['outcome'] for k, r in rows.items()} == {deliveries[0]['message_id']:'busy', deliveries[1]['message_id']:'extended'}
+        assert rows[deliveries[0]['message_id']]['vt_remaining_ms'] is None
+        assert 9000 < rows[deliveries[1]['message_id']]['vt_remaining_ms'] <= 10000
     finally:
         blocker.rollback(); blocker.close()
         cur.execute("SET statement_timeout=0")
@@ -2643,8 +2687,10 @@ def test_keepalive_contention_does_not_block_other_queues(cur, db_config, test_d
             locked.execute("SELECT 1 FROM postgremq.queues WHERE name='a' FOR UPDATE")
         cur.execute("SET statement_timeout='500ms'")
         cur.execute("SELECT * FROM postgremq.extend_queue_keep_alive_multi(ARRAY['a','b']::varchar[],ARRAY[60000,60000]::bigint[])")
-        outcomes = {r['queue_name']:r['outcome'] for r in cur.fetchall()}
-        assert outcomes == {'a':'busy','b':'extended'}
+        rows = {r['queue_name']:r for r in cur.fetchall()}
+        assert {k:r['outcome'] for k, r in rows.items()} == {'a':'busy','b':'extended'}
+        assert rows['a']['keep_alive_remaining_ms'] is None
+        assert 59000 < rows['b']['keep_alive_remaining_ms'] <= 60000
     finally:
         blocker.rollback(); blocker.close()
         cur.execute("SET statement_timeout=0")
@@ -3001,7 +3047,7 @@ def test_group_nack_with_delay_blocks_group(cur):
     b1 = _publish(cur, 'gt', {}, 'B')
     [head] = _consume(cur, 'gq')
     assert head['id'] == a1
-    cur.execute("SELECT postgremq.nack_message('gq', %s, %s, clock_timestamp() + interval '1 second')",
+    cur.execute("SELECT postgremq.nack_message('gq', %s, %s, 1000)",
                 (a1, head['token']))
     # Group A is blocked by its delayed head; group B is unaffected.
     got = _consume(cur, 'gq', limit=10)
@@ -3029,17 +3075,17 @@ def test_group_lease_expiry_redelivers_head(cur):
 
 
 def test_group_next_visible_time_ignores_blocked_successors(cur):
-    """Clients schedule their next fetch at get_next_visible_time. A blocked
+    """Clients schedule their next fetch by get_next_visible_in_ms. A blocked
     successor's vt is in the past; reporting it would make them refetch in a
     tight loop while the head is leased."""
     cur.execute("SELECT postgremq.create_topic('gt'); SELECT postgremq.create_queue('gq', 'gt')")
     _publish(cur, 'gt', {}, 'A')
     _publish(cur, 'gt', {}, 'A')
     [head] = _consume(cur, 'gq', vt=60)
-    cur.execute("SELECT postgremq.get_next_visible_time('gq') - clock_timestamp()")
-    assert cur.fetchone()[0] > timedelta(seconds=55)
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('gq')")
+    assert cur.fetchone()[0] > 55000
     _ack(cur, 'gq', head)
-    cur.execute("SELECT postgremq.get_next_visible_time('gq') <= clock_timestamp()")
+    cur.execute("SELECT postgremq.get_next_visible_in_ms('gq') <= 0")
     assert cur.fetchone()[0] is True
 
 
@@ -3483,6 +3529,75 @@ def test_latest_sql_install_equals_the_migrations(postgres_container, db_config,
     """A fresh latest.sql install equals running every migration as a migrator does."""
     _assert_install_equals_migrations(postgres_container, db_config, admin_conn,
                                       SQL_FILE.read_text(), _migration_files())
+
+
+def test_recreating_functions_keeps_their_privileges(db_config, admin_conn):
+    """A migration that recreates a function (0.2.0 changes result types and
+    arguments, and replaces get_next_visible_time) keeps the grants of an installation that revoked PUBLIC EXECUTE and
+    granted a runtime role, as mq/README.md suggests (here also for functions
+    created later, so a recreated function would get no grant at all)."""
+    name, role = f"mq_grants_{uuid.uuid4().hex[:8]}", f"pmq_app_{uuid.uuid4().hex[:8]}"
+    _fresh_database(admin_conn, name)
+    migrations = _migration_files()
+    upgrade = next(i for i, (_, path) in enumerate(migrations) if path.name == '0.2.0.up.sql')
+    signatures = ['postgremq.consume_message(varchar, integer, integer, uuid)',
+                  'postgremq.nack_message(varchar, bigint, varchar, bigint)',
+                  'postgremq.get_next_visible_in_ms(varchar)']
+    try:
+        with psycopg2.connect(**{**db_config, 'dbname': name}) as c:
+            c.autocommit = True
+            with c.cursor() as cur:
+                cur.execute('CREATE SCHEMA postgremq; CREATE TABLE postgremq.postgremq_migrations '
+                            '(version bigint not null primary key, dirty boolean not null)')
+                for _, path in migrations[:upgrade]:
+                    cur.execute(path.read_text())
+                cur.execute(f'CREATE ROLE {role}')
+                cur.execute('REVOKE EXECUTE ON ALL FUNCTIONS IN SCHEMA postgremq FROM PUBLIC; '
+                            'ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC')
+                cur.execute(f'GRANT EXECUTE ON ALL FUNCTIONS IN SCHEMA postgremq TO {role}')
+                for _, path in migrations[upgrade:]:
+                    cur.execute(path.read_text())
+                for signature in signatures:
+                    cur.execute('SELECT has_function_privilege(%s, %s, %s)', (role, signature, 'EXECUTE'))
+                    assert cur.fetchone()[0], f'the runtime role lost EXECUTE on {signature}'
+                    cur.execute('SELECT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, '
+                                "acldefault('f', p.proowner))) a WHERE p.oid = %s::regprocedure "
+                                'AND a.grantee = 0)', (signature,))
+                    assert not cur.fetchone()[0], f'PUBLIC regained EXECUTE on {signature}'
+    finally:
+        with admin_conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+            cur.execute(f"DROP ROLE IF EXISTS {role}")
+
+
+def test_recreating_functions_keeps_the_default_public_grant(db_config, admin_conn):
+    """A function still on the default acl (EXECUTE for PUBLIC) keeps it when
+    0.2.0 recreates it, even if the default privileges for new functions were
+    changed since it was created."""
+    name = f"mq_grants_{uuid.uuid4().hex[:8]}"
+    _fresh_database(admin_conn, name)
+    migrations = _migration_files()
+    upgrade = next(i for i, (_, path) in enumerate(migrations) if path.name == '0.2.0.up.sql')
+    try:
+        with psycopg2.connect(**{**db_config, 'dbname': name}) as c:
+            c.autocommit = True
+            with c.cursor() as cur:
+                cur.execute('CREATE SCHEMA postgremq; CREATE TABLE postgremq.postgremq_migrations '
+                            '(version bigint not null primary key, dirty boolean not null)')
+                for _, path in migrations[:upgrade]:
+                    cur.execute(path.read_text())
+                cur.execute('ALTER DEFAULT PRIVILEGES REVOKE EXECUTE ON FUNCTIONS FROM PUBLIC')
+                for _, path in migrations[upgrade:]:
+                    cur.execute(path.read_text())
+                for signature in ['postgremq.consume_message(varchar, integer, integer, uuid)',
+                                  'postgremq.get_next_visible_in_ms(varchar)']:
+                    cur.execute('SELECT EXISTS (SELECT 1 FROM pg_proc p, aclexplode(coalesce(p.proacl, '
+                                "acldefault('f', p.proowner))) a WHERE p.oid = %s::regprocedure "
+                                "AND a.grantee = 0 AND a.privilege_type = 'EXECUTE')", (signature,))
+                    assert cur.fetchone()[0], f'PUBLIC lost EXECUTE on {signature}'
+    finally:
+        with admin_conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
 
 
 def test_info_reports_the_schema_version_and_protocol_major(cur):

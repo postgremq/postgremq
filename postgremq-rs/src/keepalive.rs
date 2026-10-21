@@ -247,7 +247,7 @@ pub(crate) async fn flush(
             let sent = Instant::now();
             let rows = sqlx::query(
                 "SELECT queue_name::text AS queue_name, outcome, \
-                        (extract(epoch FROM keep_alive_until - clock_timestamp()) * 1000)::int8 AS remaining_ms \
+                        keep_alive_remaining_ms AS remaining_ms \
                  FROM postgremq.extend_queue_keep_alive_multi($1::varchar[], $2::int8[], $3::uuid[])",
             )
             .bind(queues)

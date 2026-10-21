@@ -145,14 +145,17 @@ impl Delivery {
         self.inner.attempts
     }
 
-    /// When the message was published (distributed to the queue).
+    /// When the message was published (distributed to the queue), on the
+    /// database's clock (unlike [`vt`](Self::vt)).
     #[must_use]
     pub fn published_at(&self) -> SystemTime {
         self.inner.published_at
     }
 
     /// The current lease deadline, as last confirmed by the server (by a
-    /// renewal or [`extend`](Self::extend), whichever was recorded last).
+    /// renewal or [`extend`](Self::extend), whichever was recorded last), on
+    /// this process's clock: the instant the request was sent plus the time
+    /// left by the database clock, so it never depends on the two agreeing.
     #[must_use]
     pub fn vt(&self) -> SystemTime {
         from_unix_micros(self.inner.lease.vt_micros())

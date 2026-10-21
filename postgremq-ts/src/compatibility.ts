@@ -14,7 +14,7 @@ import { CompatibilityError } from './errors';
  * The mq (schema) compatibility lines this client implements and is tested
  * against: an mq major (`'1'`), or before 1.0 a major and minor (`'0.1'`).
  */
-export const SUPPORTED_MQ_VERSIONS: readonly string[] = Object.freeze(['0.1']);
+export const SUPPORTED_MQ_VERSIONS: readonly string[] = Object.freeze(['0.2']);
 
 /** SQLSTATEs meaning discovery is missing: the function or the whole schema. */
 const UNDEFINED_FUNCTION = '42883';

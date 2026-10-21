@@ -36,7 +36,7 @@ use crate::metrics::Operation;
 use crate::options::ConsumeSettings;
 use crate::renewal::{Confirmation, DeliveryKey, LeaseSink, Registration, SharedLease};
 use crate::sync::lock;
-use crate::types::{Generation, MessageId, from_unix_micros, millis_until};
+use crate::types::{Generation, MessageId, from_unix_micros, millis_until, unix_micros_at};
 
 /// Retry delay after a failed fetch.
 const FETCH_ERROR_RETRY: Duration = Duration::from_secs(1);
@@ -668,16 +668,17 @@ async fn claim(
         let group_key: Option<String> = row.try_get("group_key")?;
         let group_seq: Option<i64> = row.try_get("group_seq")?;
         let attempts: i32 = row.try_get("delivery_attempts")?;
+        let lease = millis_until(row.try_get("lease_ms")?);
         Ok(Claimed {
             sent,
             id: row.try_get("message_id")?,
             payload: row.try_get("payload")?,
             token: row.try_get("consumer_token")?,
             attempts: u32::try_from(attempts).map_err(|err| sqlx::Error::Decode(Box::new(err)))?,
-            vt_micros: row.try_get("vt_us")?,
+            vt_micros: unix_micros_at(sent + lease),
             published_micros: row.try_get("published_us")?,
             group: group_key.zip(group_seq),
-            lease: millis_until(row.try_get("lease_ms")?),
+            lease,
         })
     });
     Ok(decoded
@@ -714,10 +715,9 @@ async fn claim_on(
     let sent = Instant::now();
     let rows = sqlx::query(
         "SELECT message_id, payload, consumer_token::text AS consumer_token, delivery_attempts, \
-                (extract(epoch FROM vt) * 1000000)::int8 AS vt_us, \
                 (extract(epoch FROM published_at) * 1000000)::int8 AS published_us, \
                 group_key::text AS group_key, group_seq, \
-                (extract(epoch FROM vt - clock_timestamp()) * 1000)::int8 AS lease_ms \
+                vt_remaining_ms AS lease_ms \
          FROM postgremq.consume_message($1, $2, $3, $4)",
     )
     .bind(queue)
@@ -738,12 +738,10 @@ async fn next_visible(conn: &Inner, queue: &str) -> NextFetch {
     // closes the connection instead of returning it to the pool).
     let lookup = async {
         let mut checkout = Checkout::acquire(&conn.pool).await?;
-        let result = sqlx::query_scalar(
-            "SELECT (extract(epoch FROM postgremq.get_next_visible_time($1) - clock_timestamp()) * 1000)::int8",
-        )
-        .bind(queue)
-        .fetch_one(checkout.conn()?)
-        .await;
+        let result = sqlx::query_scalar("SELECT postgremq.get_next_visible_in_ms($1)")
+            .bind(queue)
+            .fetch_one(checkout.conn()?)
+            .await;
         checkout.release();
         result
     };

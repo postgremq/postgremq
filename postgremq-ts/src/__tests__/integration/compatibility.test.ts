@@ -41,8 +41,8 @@ async function fakeInfo(pool: { query: (sql: string) => Promise<unknown> }, info
 }
 
 describe('schema compatibility', () => {
-  test('declares mq line 0.1, read-only', () => {
-    expect(SUPPORTED_MQ_VERSIONS).toEqual(['0.1']);
+  test('declares mq line 0.2, read-only', () => {
+    expect(SUPPORTED_MQ_VERSIONS).toEqual(['0.2']);
     expect(Object.isFrozen(SUPPORTED_MQ_VERSIONS)).toBe(true);
   });
 
@@ -56,9 +56,9 @@ describe('schema compatibility', () => {
   test('other versions of the same line are accepted; protocol_major is ignored', async () => {
     const iso = await installed();
     for (const info of [
-      '{"schema_version": 10000, "protocol_major": 99}',
-      '{"schema_version": 19999}',
-      '{"schema_version": 10001}',
+      '{"schema_version": 20000, "protocol_major": 99}',
+      '{"schema_version": 29999}',
+      '{"schema_version": 20001}',
     ]) {
       await fakeInfo(iso.pool, info);
       expect(await connectTo(iso.connectionString)).toBeUndefined();
@@ -72,9 +72,9 @@ describe('schema compatibility', () => {
     const err = await connectTo(iso.connectionString);
 
     expect(err).toBeInstanceOf(CompatibilityError);
-    expect(err).toMatchObject({ schemaVersion: 100_020_003, supportedVersions: ['0.1'] });
+    expect(err).toMatchObject({ schemaVersion: 100_020_003, supportedVersions: ['0.2'] });
     expect((err as Error).message).toContain('mq 1.2.3 (schema version 100020003)');
-    expect((err as Error).message).toContain('supports mq [0.1]');
+    expect((err as Error).message).toContain('supports mq [0.2]');
   });
 
   // Before 1.0 a breaking schema change bumps the minor, so another 0.y is
@@ -82,7 +82,8 @@ describe('schema compatibility', () => {
   test('another minor before 1.0 is rejected', async () => {
     const iso = await installed();
     for (const [info, version] of [
-      ['{"schema_version": 20000, "protocol_major": 1}', 20_000],
+      ['{"schema_version": 10002, "protocol_major": 1}', 10_002],
+      ['{"schema_version": 30000}', 30_000],
       ['{"schema_version": 1}', 1],
       ['{"schema_version": 99999999}', 99_999_999],
     ] as const) {

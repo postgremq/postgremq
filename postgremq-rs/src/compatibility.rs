@@ -14,7 +14,7 @@ use crate::error::{Error, Result, sqlstate_of};
 /// [`Connection::connect`](crate::Connection::connect) and
 /// [`Connection::from_pool`](crate::Connection::from_pool) reject a schema
 /// version on any other line.
-pub const SUPPORTED_MQ_VERSIONS: &[&str] = &["0.1"];
+pub const SUPPORTED_MQ_VERSIONS: &[&str] = &["0.2"];
 
 /// The compatibility line of a stored schema version.
 pub(crate) fn mq_line(version: u64) -> String {

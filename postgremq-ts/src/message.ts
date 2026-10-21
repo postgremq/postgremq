@@ -28,7 +28,7 @@ export class Message {
   /** Number of delivery attempts */
   public readonly deliveryAttempts: number;
 
-  /** Published timestamp */
+  /** Published timestamp, on the database's clock (unlike vt) */
   public readonly publishedAt: Date;
 
   /** Message group (see PublishOptions.groupKey); null if ungrouped */
@@ -37,7 +37,9 @@ export class Message {
   /** Dense 1-based position in the group, in publish commit order; null if ungrouped */
   public readonly groupSeq: number | null;
 
-  /** Visibility timeout expiration (lease end); updated by auto-extension and setVt */
+  /** Visibility timeout expiration (lease end) on the local clock: the time read
+   *  before the claim or extension plus the time left by the database clock, so
+   *  never later than the real deadline. Updated by auto-extension and setVt */
   public vt: Date;
 
   /** Unused: written after a successful terminal call but never read.

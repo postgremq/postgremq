@@ -2,7 +2,6 @@ package postgremq
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -299,7 +298,9 @@ func (c *Connection) CreateQueue(ctx context.Context, name, topic string, exclus
 		return fmt.Errorf("keep alive interval must be at least 1ms")
 	}
 	var generation string
+	var sent time.Time // the keep-alive deadline is counted from it
 	err := c.withRetry(ctx, func(ctx context.Context) error {
+		sent = time.Now()
 		err := c.pool.QueryRow(ctx,
 			"SELECT postgremq.create_queue($1, $2, $3, $4, $5 * interval '1 ms')",
 			name,                                                       // p_queue_name
@@ -323,7 +324,7 @@ func (c *Connection) CreateQueue(ctx context.Context, name, topic string, exclus
 	// if it dies again, declared fatal) anew.
 	c.fatalQueues.Delete(name)
 	if exclusive {
-		c.keepAliveRegister(name, options.keepAliveInterval.Milliseconds(), generation)
+		c.keepAliveRegister(name, options.keepAliveInterval.Milliseconds(), generation, sent)
 	}
 	return nil
 }
@@ -643,7 +644,9 @@ type MultiLock struct {
 	Queue string
 	// ID is the message ID that was extended.
 	ID int64
-	// VT is the new visibility timeout expiration timestamp.
+	// VT is the new visibility timeout expiration, on this process's clock:
+	// read before the call plus the time left by the database clock, so it is
+	// never later than the real deadline, whatever the database clock reads.
 	VT    time.Time
 	Token string
 	Busy  bool
@@ -684,8 +687,9 @@ func (c *Connection) SetVTBatchMulti(ctx context.Context, exts []MultiExtension)
 	var locks []MultiLock
 	err := c.withRetry(ctx, func(ctx context.Context) error {
 		locks = locks[:0]
+		sent := time.Now() // VT is sent plus the time left by the database clock
 		rows, err := c.pool.Query(ctx,
-			"SELECT queue_name, message_id, vt, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)",
+			"SELECT queue_name, message_id, vt_remaining_ms, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)",
 			queues, ids, tokens, vts)
 		if err != nil {
 			return mapPgError(fmt.Errorf("failed to set message visibility timeout (multi): %w", err))
@@ -693,13 +697,13 @@ func (c *Connection) SetVTBatchMulti(ctx context.Context, exts []MultiExtension)
 		defer rows.Close()
 		for rows.Next() {
 			var l MultiLock
-			var vt *time.Time
+			var remainingMs *int64
 			var outcome string
-			if err := rows.Scan(&l.Queue, &l.ID, &vt, &l.Token, &outcome); err != nil {
+			if err := rows.Scan(&l.Queue, &l.ID, &remainingMs, &l.Token, &outcome); err != nil {
 				return mapPgError(err)
 			}
-			if vt != nil {
-				l.VT = *vt
+			if remainingMs != nil {
+				l.VT = sent.Add(time.Duration(*remainingMs) * time.Millisecond)
 			}
 			l.Busy = outcome == "busy"
 			locks = append(locks, l)
@@ -781,8 +785,9 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 	if len(generations) > 0 && generations[0] != "" {
 		generation = &generations[0]
 	}
+	sent := time.Now() // VT is sent plus the time left by the database clock
 	rows, err := c.pool.Query(ctx,
-		"SELECT message_id, payload, consumer_token, delivery_attempts, vt, published_at, group_key, group_seq FROM postgremq.consume_message($1, $2, $3, $4)",
+		"SELECT message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq FROM postgremq.consume_message($1, $2, $3, $4)",
 		queue, vt, limit, generation)
 	if err != nil {
 		return nil, mapPgError(fmt.Errorf("failed to consume messages: %w", err))
@@ -796,12 +801,12 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 			payload          json.RawMessage
 			consumerToken    string
 			deliveryAttempts int
-			vt               time.Time
+			vtRemainingMs    int64
 			publishedAt      time.Time
 			groupKey         *string
 			groupSeq         *int64
 		)
-		if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vt, &publishedAt, &groupKey, &groupSeq); err != nil {
+		if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vtRemainingMs, &publishedAt, &groupKey, &groupSeq); err != nil {
 			// Return successfully-scanned messages alongside the error.
 			// They're already claimed server-side; the caller can deliver
 			// them while still seeing the error and scheduling a retry.
@@ -817,7 +822,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 			PublishedAt:     publishedAt,
 			conn:            c,     // Set connection so methods like Ack() will work.
 			queue:           queue, // Save the originating queue name.
-			VT:              vt,
+			VT:              sent.Add(time.Duration(vtRemainingMs) * time.Millisecond),
 		}
 		if groupKey != nil && groupSeq != nil {
 			msg.GroupKey, msg.GroupSeq = *groupKey, *groupSeq
@@ -872,20 +877,23 @@ func (c *Connection) releaseMessage(ctx context.Context, queue string, messageID
 	})
 }
 
+// maxNackDelayMs is the longest delay nack_message accepts (100 years); a
+// later WithDelayUntil is capped to it rather than failing the settlement.
+const maxNackDelayMs = 3_155_760_000_000
+
 func (c *Connection) nackMessage(ctx context.Context, queue string, messageID int64, consumerToken string, delayUntil *time.Time) (resultErr error) {
 	finishMetric := c.metrics.startOperation(ctx, "nack", queue, false)
 	defer func() { finishMetric(resultErr) }()
 	return c.withRetry(ctx, func(ctx context.Context) error {
-		var err error
+		// Sent as the time remaining on the local clock, which the database
+		// adds to its own, so the clocks need not agree.
+		var delayMs int64
 		if delayUntil != nil && !delayUntil.IsZero() {
-			_, err = c.pool.Exec(ctx,
-				"SELECT postgremq.nack_message($1, $2, $3, $4)",
-				queue, messageID, consumerToken, *delayUntil)
-		} else {
-			_, err = c.pool.Exec(ctx,
-				"SELECT postgremq.nack_message($1, $2, $3)",
-				queue, messageID, consumerToken)
+			delayMs = min(max(time.Until(*delayUntil).Milliseconds(), 0), maxNackDelayMs)
 		}
+		_, err := c.pool.Exec(ctx,
+			"SELECT postgremq.nack_message($1, $2, $3, $4)",
+			queue, messageID, consumerToken, delayMs)
 		if err != nil {
 			return mapPgError(fmt.Errorf("failed to nack message: %w", err))
 		}
@@ -1478,26 +1486,25 @@ func (c *Connection) GetMessage(ctx context.Context, messageID int64) (*Publishe
 	return &msg, nil
 }
 
-func (c *Connection) getNextVisibleTime(ctx context.Context, queue string) (time.Time, error) {
+// getNextVisibleInMs reports the milliseconds until the queue's next row
+// becomes visible, measured by the database's clock (zero or negative if one
+// is already due), or nil if there is none.
+func (c *Connection) getNextVisibleInMs(ctx context.Context, queue string) (*int64, error) {
 	if err := c.checkClosed(); err != nil {
-		return time.Time{}, err
+		return nil, err
 	}
 
-	nextTime := time.Time{}
+	var inMs *int64
 	err := c.withRetry(ctx, func(ctx context.Context) error {
-		var t sql.NullTime
 		err := c.pool.QueryRow(ctx,
-			"SELECT postgremq.get_next_visible_time($1)",
-			queue).Scan(&t)
+			"SELECT postgremq.get_next_visible_in_ms($1)",
+			queue).Scan(&inMs)
 		if err != nil {
 			return fmt.Errorf("failed to get next visible time: %w", err)
 		}
-		if t.Valid {
-			nextTime = t.Time
-		}
 		return nil
 	})
-	return nextTime, err
+	return inMs, err
 }
 
 func (c *Connection) unregisterConsumer(consumer Stoppable) {

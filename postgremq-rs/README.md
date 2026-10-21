@@ -90,10 +90,10 @@ runtime.
 
 Both read `postgremq.info()` and check that the installation's schema version
 is on an mq compatibility line this client implements
-(`postgremq::SUPPORTED_MQ_VERSIONS`, currently `["0.1"]`). A line is an mq
+(`postgremq::SUPPORTED_MQ_VERSIONS`, currently `["0.2"]`). A line is an mq
 major, or before 1.0 a major and minor: a breaking schema change bumps the
-major, or before 1.0 the minor, so a client built for mq 0.1 accepts 0.1.x and
-rejects 0.2.0. Otherwise they return `Error::Incompatible` with the schema
+major, or before 1.0 the minor, so a client built for mq 0.2 accepts 0.2.x and
+rejects 0.1.x and 0.3.0. Otherwise they return `Error::Incompatible` with the schema
 version (the message also shows its mq version and the supported lines). A
 database without `info()` (not installed, or older than discovery), or whose
 `info()` reports no schema version, gets it too, meaning it needs an
@@ -198,7 +198,8 @@ conn.publish("orders", &order, PublishOptions::default().deliver_after(later))
 `MessageId`. It is retried only on SQLSTATE `40001`/`40P01`, the only proof
 that nothing was published; any other failure, including a disconnect, has an
 unknown outcome and is returned as is. `PublishOptions::deliver_after` delays
-delivery (at most about 100 years ahead); `group_key` is described under
+delivery until the database clock reaches it (at most about 100 years ahead);
+`group_key` is described under
 [Ordered delivery](#ordered-delivery-message-groups).
 
 ### Inside the caller's transaction
@@ -335,7 +336,7 @@ tokens and waits for every handler to finish and its delivery to settle.
 A `Delivery` exposes `queue()`, `message_id()`, `payload()`,
 `payload_as::<T>()`, `group_key()`, `group_seq()`, `delivery_attempts()`
 (including this claim), `published_at()`, `vt()` (the lease deadline last
-confirmed by the server), `is_settled()` and `stopped()`.
+confirmed by the server, on this process's clock), `is_settled()` and `stopped()`.
 
 | Method | Effect |
 | --- | --- |
@@ -608,8 +609,8 @@ cargo run --example metrics --features otel
 
 The crate logs through `tracing` (target `postgremq`) and never installs a
 subscriber. Timestamps are `std::time::SystemTime`. Lease and keep-alive
-scheduling use the remaining time reported by the database server, so client
-clock skew does not shorten leases.
+scheduling, and `Delivery::vt()`, use the remaining time reported by the
+database server, so client clock skew does not shorten leases.
 
 ## Running the tests
 

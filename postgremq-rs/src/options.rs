@@ -338,8 +338,9 @@ impl QueueOptions {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct PublishOptions {
-    /// The message stays invisible until this time (at most about 100
-    /// years ahead).
+    /// The message stays invisible until the database clock reaches this
+    /// time (at most about 100 years ahead). Unlike a nack delay, it is sent
+    /// as is, so it assumes the two clocks agree.
     pub deliver_after: Option<SystemTime>,
     /// Message group (1..=255 characters). Within each queue a group is
     /// delivered strictly in publish commit order, one delivery at a time;

@@ -324,7 +324,7 @@ func TestEventListener_NackTriggersPerQueueNotify(t *testing.T) {
 	waitForListen(t, pool, handle, "pmq:q:NackQueue")
 	drainHandle(handle)
 
-	_, err = pool.Exec(ctx, `SELECT postgremq.nack_message($1, $2, $3, NOW())`, "NackQueue", msgID, token)
+	_, err = pool.Exec(ctx, `SELECT postgremq.nack_message($1, $2, $3, 0)`, "NackQueue", msgID, token)
 	require.NoError(t, err)
 
 	select {
