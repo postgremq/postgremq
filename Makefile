@@ -1,6 +1,8 @@
 # PostgreMQ development tasks. `make` lists them.
 #
-# Schema changes: `make migration name=<snake_case> bump=<patch|minor|major>`,
+# Schema changes: `make migration name=<snake_case> bump=<patch|minor|major>`
+# (the kind of change: a fix, additive or breaking; before 1.0 breaking bumps
+# the minor and the others the patch, see RELEASE.md),
 # write the SQL below the change header it adds to the pending migration
 # (mq/migrations/X.Y.Z.up.sql, the next mq release), make the same change in
 # mq/sql/latest.sql, then `make sync` and commit everything in one commit.

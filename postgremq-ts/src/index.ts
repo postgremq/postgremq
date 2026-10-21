@@ -41,7 +41,7 @@ export {
 } from './errors';
 
 // Schema compatibility metadata.
-export { SUPPORTED_MQ_MAJORS } from './compatibility';
+export { SUPPORTED_MQ_VERSIONS } from './compatibility';
 
 // Schema migrations (compatible with the Go client and the CLI).
 export { migrate, getMigrationStatus, formatSchemaVersion, MigrationStatus } from './migrate';

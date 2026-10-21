@@ -3394,6 +3394,15 @@ def _migration_files() -> list[tuple[int, Path]]:
                   for version, _ in [schema.parse_name(path.name)])
 
 
+def test_version_bumps_read_0x_like_cargo():
+    """Before 1.0 a breaking change bumps the minor and starts a new
+    compatibility line; additive changes and fixes bump the patch."""
+    V = schema.Version
+    assert [V(0, 1, 2).bump(level) for level in schema.LEVELS] == [V(0, 1, 3), V(0, 1, 3), V(0, 2, 0)]
+    assert [V(1, 2, 3).bump(level) for level in schema.LEVELS] == [V(1, 2, 4), V(1, 3, 0), V(2, 0, 0)]
+    assert [V(0, 1, 9).line(), V(0, 2, 0).line(), V(1, 4, 2).line()] == ['0.1', '0.2', '1']
+
+
 def test_latest_sql_records_the_latest_migration_version(cur):
     """A latest.sql install is recognised by the migrators as current."""
     latest = _migration_files()[-1][0]

@@ -59,6 +59,9 @@ make sync                                           # every client's copy, lates
 
 and one commit with all of it, in a PR titled at the same level (`fix(sql):`
 for patch, `feat(sql):` for minor, `feat(sql)!:` for major; CI checks it).
+Before 1.0 a breaking change bumps mq's minor and an additive one its patch
+(RELEASE.md), so change the interface in place: no deprecated copies of the
+old functions; move every client to the new line in the same commit.
 `make migration` creates the pending migration, adds your section to it, or
 renames it to a higher version when your change needs one, and prints where
 to write. The SQL tests check that both paths produce the same schema.
@@ -174,16 +177,17 @@ PR title must be a [Conventional Commit](https://www.conventionalcommits.org/)
 - **Breaking changes**: add `!` after the scope and a `BREAKING CHANGE:`
   footer in the PR description's squash commit body, saying what breaks and
   how to migrate. Before 1.0 a client's breaking change is a minor release,
-  listed under "BREAKING CHANGES"; a breaking schema change bumps mq's major
-  version.
+  listed under "BREAKING CHANGES"; a breaking schema change bumps mq's minor
+  before 1.0 and its major after.
 - Commits on your branch can be anything; only the squash commit counts. Keep
   a PR to one component where you can, so each release note says what changed
   in that component.
 
 Examples: `feat(go): add WithGroupKey publish option`,
 `fix(sql): keep group order when a nack is delayed`,
-`feat(ts)!: make connect() check the mq major`,
-`feat(sql): add queue priority` (a minor schema change, with `make sync`).
+`feat(ts)!: make connect() check the mq compatibility line`,
+`feat(sql): add queue priority` (an additive, `minor`-level schema change,
+with `make sync`).
 
 ## Reporting bugs and requesting features
 

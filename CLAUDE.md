@@ -255,10 +255,15 @@ plus mq when the release commit carries a new migration:
   = version of the last migration applied, stored as major·10⁸ + minor·10⁴ +
   patch (0.1.0 = 10000; read from `postgremq.postgremq_migrations`; clients'
   `FormatSchemaVersion`/`format_schema_version`/`formatSchemaVersion` decode
-  it). Clients check its mq MAJOR on connect (`SupportedMQMajors()` /
-  `SUPPORTED_MQ_MAJORS`, now `[0]`) and reject others, or a missing version,
-  with a typed compatibility error. Additive SQL changes are minor; breaking
-  ones bump the mq major (a `major` change header). `protocol_major` is legacy,
+  it). Clients check its mq compatibility LINE on connect (the major, or
+  before 1.0 major.minor; `SupportedMQVersions()` / `SUPPORTED_MQ_VERSIONS`,
+  now `["0.1"]`) and reject others, or a missing version,
+  with a typed compatibility error. Change headers declare the kind: `patch`
+  fix, `minor` additive, `major` breaking. Before 1.0 a `major` header bumps
+  the mq MINOR and the others the patch (Cargo-style), so a breaking SQL change
+  is made in place (no deprecated copies of old functions) and moves every
+  client to the new line in the same commit; after 1.0 levels bump their own
+  position. `protocol_major` is legacy,
   for clients ≤0.3.0: derived in info() as mq major + 1 since mq 0.1.1; never
   check it in new code. No capability lists or feature probes.
 - A RELEASED migration (one in the newest `mq/v*` release in history) NEVER

@@ -17,7 +17,7 @@ Used on release PRs (--all), by the release guard before tags are created
   a new mq version, every client is part of it (else a client would keep
   shipping an older schema while mq is released), and no commit scoped to the
   schema alone (`feat(sql): ...`) since the last mq release asks for a higher
-  level than the new version's;
+  level than the pending migration's highest change header;
 - the Go module requires no other module of this repository and has a LICENSE;
 - with --tag-exists, the tag exists and points at HEAD.
 """
@@ -130,16 +130,17 @@ class Checker:
     def mq_level_covers_schema_commits(self) -> None:
         """A release must not understate a schema change: every commit since
         the last mq release that touched mq/migrations and is scoped to the
-        schema alone asks for at most the new version's level (PR titles are
-        checked as they merge; this catches what got past that)."""
+        schema alone asks for at most the pending migration's highest
+        change-header level (PR titles are checked as they merge; this
+        catches what got past that)."""
         try:
             tree = schema.Tree.load()
+            pending = tree.pending()
+            if not pending:
+                return
+            level = tree.pending_level(pending[-1])
         except schema.SchemaError:
             return  # reported by schema()
-        pending = tree.pending()
-        if not pending:
-            return
-        level = pending[-1].level_from(tree.base)
         previous = schema.released_tag('HEAD')
         start = previous[1] if previous else json.loads(
             (ROOT / 'release-please-config.json').read_text())['bootstrap-sha']
@@ -162,7 +163,7 @@ class Checker:
                 continue
             if scopes and scopes <= schema.SCHEMA_SCOPES and schema.rank(asked) > schema.rank(level):
                 self.errors.append(f'{sha} "{subject}" is a {asked} schema change, but this release makes mq '
-                                   f'{pending[-1]}, a {level} bump of {tree.base}: add a {asked} change header '
+                                   f'{pending[-1]}, whose change headers are at most {level}: add a {asked} change header '
                                    f'to the pending migration (`make migration`)')
 
     def mq(self, version: str) -> None:

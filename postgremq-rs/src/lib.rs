@@ -25,7 +25,7 @@ mod sync;
 mod types;
 
 pub use admin::{DlqMessage, MaintenanceCounters, QueueInfo, QueueStatistics};
-pub use compatibility::SUPPORTED_MQ_MAJORS;
+pub use compatibility::SUPPORTED_MQ_VERSIONS;
 pub use connection::Connection;
 pub use consumer::Consumer;
 pub use delivery::Delivery;

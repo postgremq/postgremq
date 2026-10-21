@@ -1,7 +1,7 @@
 import { describe, test, expect, beforeAll, afterEach } from '@jest/globals';
 import { Connection } from '../../connection';
 import { CompatibilityError } from '../../errors';
-import { SUPPORTED_MQ_MAJORS } from '../../compatibility';
+import { SUPPORTED_MQ_VERSIONS, mqLine } from '../../compatibility';
 import { createEmptyTestDatabase, createIsolatedTestConnection, getSharedTestDatabase, TestDatabase } from '../helpers';
 
 let shared: TestDatabase;
@@ -41,23 +41,23 @@ async function fakeInfo(pool: { query: (sql: string) => Promise<unknown> }, info
 }
 
 describe('schema compatibility', () => {
-  test('declares mq major 0, read-only', () => {
-    expect(SUPPORTED_MQ_MAJORS).toEqual([0]);
-    expect(Object.isFrozen(SUPPORTED_MQ_MAJORS)).toBe(true);
+  test('declares mq line 0.1, read-only', () => {
+    expect(SUPPORTED_MQ_VERSIONS).toEqual(['0.1']);
+    expect(Object.isFrozen(SUPPORTED_MQ_VERSIONS)).toBe(true);
   });
 
-  test('the installed schema has a supported major', async () => {
+  test('the installed schema is on a supported line', async () => {
     const iso = await installed();
     const { rows } = await iso.pool.query("SELECT (postgremq.info()->>'schema_version')::bigint AS version");
-    expect(SUPPORTED_MQ_MAJORS).toContain(Math.floor(Number(rows[0].version) / 100_000_000));
+    expect(SUPPORTED_MQ_VERSIONS).toContain(mqLine(Number(rows[0].version)));
     expect(await connectTo(iso.connectionString)).toBeUndefined();
   });
 
-  test('other versions of the same major are accepted; protocol_major is ignored', async () => {
+  test('other versions of the same line are accepted; protocol_major is ignored', async () => {
     const iso = await installed();
     for (const info of [
-      '{"schema_version": 1, "protocol_major": 1}',
-      '{"schema_version": 99999999, "protocol_major": 99}',
+      '{"schema_version": 10000, "protocol_major": 99}',
+      '{"schema_version": 19999}',
       '{"schema_version": 10001}',
     ]) {
       await fakeInfo(iso.pool, info);
@@ -72,9 +72,25 @@ describe('schema compatibility', () => {
     const err = await connectTo(iso.connectionString);
 
     expect(err).toBeInstanceOf(CompatibilityError);
-    expect(err).toMatchObject({ schemaVersion: 100_020_003, supportedMajors: [0] });
+    expect(err).toMatchObject({ schemaVersion: 100_020_003, supportedVersions: ['0.1'] });
     expect((err as Error).message).toContain('mq 1.2.3 (schema version 100020003)');
-    expect((err as Error).message).toContain('mq majors [0]');
+    expect((err as Error).message).toContain('supports mq [0.1]');
+  });
+
+  // Before 1.0 a breaking schema change bumps the minor, so another 0.y is
+  // another contract.
+  test('another minor before 1.0 is rejected', async () => {
+    const iso = await installed();
+    for (const [info, version] of [
+      ['{"schema_version": 20000, "protocol_major": 1}', 20_000],
+      ['{"schema_version": 1}', 1],
+      ['{"schema_version": 99999999}', 99_999_999],
+    ] as const) {
+      await fakeInfo(iso.pool, info);
+      const err = await connectTo(iso.connectionString);
+      expect(err).toBeInstanceOf(CompatibilityError);
+      expect(err).toMatchObject({ schemaVersion: version });
+    }
   });
 
   test('a missing or malformed schema version is incompatible', async () => {

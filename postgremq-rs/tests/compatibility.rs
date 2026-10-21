@@ -12,7 +12,7 @@ mod common;
 use common::TestDb;
 use std::future::Future as _;
 
-use postgremq::{Connection, ConnectionOptions, Error, ErrorKind, SUPPORTED_MQ_MAJORS};
+use postgremq::{Connection, ConnectionOptions, Error, ErrorKind, SUPPORTED_MQ_VERSIONS};
 
 async fn connect(pool: &sqlx::PgPool) -> postgremq::Result<Connection> {
     Connection::from_pool(pool.clone(), ConnectionOptions::default()).await
@@ -32,27 +32,32 @@ async fn fake_info(pool: &sqlx::PgPool, body: &str) {
 }
 
 #[test]
-fn declares_mq_major_0() {
-    assert_eq!(SUPPORTED_MQ_MAJORS, &[0]);
+fn declares_mq_line_0_1() {
+    assert_eq!(SUPPORTED_MQ_VERSIONS, &["0.1"]);
 }
 
 #[tokio::test]
-async fn the_installed_schema_has_a_supported_major() {
+async fn the_installed_schema_is_on_a_supported_line() {
     let db = TestDb::new().await;
     let version: i64 = sqlx::query_scalar("SELECT (postgremq.info()->>'schema_version')::bigint")
         .fetch_one(&db.pool)
         .await
         .unwrap();
-    assert!(SUPPORTED_MQ_MAJORS.contains(&(u64::try_from(version).unwrap() / 100_000_000)));
+    let line = if version < 100_000_000 {
+        format!("0.{}", version / 10_000)
+    } else {
+        (version / 100_000_000).to_string()
+    };
+    assert!(SUPPORTED_MQ_VERSIONS.contains(&line.as_str()));
     connect(&db.pool).await.unwrap().close().await;
 }
 
 #[tokio::test]
-async fn other_versions_of_the_same_major_are_accepted() {
+async fn other_versions_of_the_same_line_are_accepted() {
     // protocol_major is only for older clients: it is ignored.
     for body in [
-        "SELECT jsonb_build_object('schema_version', 1, 'protocol_major', 1)",
-        "SELECT jsonb_build_object('schema_version', 99999999, 'protocol_major', 99)",
+        "SELECT jsonb_build_object('schema_version', 10000, 'protocol_major', 99)",
+        "SELECT jsonb_build_object('schema_version', 19999)",
         "SELECT jsonb_build_object('schema_version', 10001)",
     ] {
         let db = TestDb::new().await;
@@ -87,10 +92,33 @@ async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
     let message = err.to_string();
     assert!(
         message.contains("mq 1.2.3 (schema version 100020003)")
-            && message.contains("mq majors [0]"),
+            && message.contains("supports mq [0.1]"),
         "{message}"
     );
     assert!(std::error::Error::source(&err).is_none());
+}
+
+/// Before 1.0 a breaking schema change bumps the minor, so another 0.y is
+/// another contract.
+#[tokio::test]
+async fn another_minor_before_1_is_rejected() {
+    for version in [20_000_u64, 1, 99_999_999] {
+        let db = TestDb::new().await;
+        fake_info(
+            &db.pool,
+            &format!("SELECT jsonb_build_object('schema_version', {version}, 'protocol_major', 1)"),
+        )
+        .await;
+
+        let err = connect(&db.pool).await.unwrap_err();
+
+        match &err {
+            Error::Incompatible { schema_version, .. } => {
+                assert_eq!(*schema_version, Some(version))
+            }
+            other => panic!("{other:?}"),
+        }
+    }
 }
 
 #[tokio::test]

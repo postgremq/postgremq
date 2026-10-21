@@ -130,8 +130,8 @@ pub enum Error {
     Payload(#[source] serde_json::Error),
 
     /// The database's PostgreMQ installation is not compatible with this
-    /// client: its schema version's mq major is not in
-    /// [`SUPPORTED_MQ_MAJORS`](crate::SUPPORTED_MQ_MAJORS) (the message lists
+    /// client: its schema version's mq line is not in
+    /// [`SUPPORTED_MQ_VERSIONS`](crate::SUPPORTED_MQ_VERSIONS) (the message lists
     /// them), it reports no schema version, or it has no discovery function
     /// (`postgremq.info()`) and needs an installation or upgrade (then
     /// `source` is the database error).
@@ -302,18 +302,18 @@ impl Error {
 }
 
 fn incompatible_message(schema_version: Option<u64>, discovery_missing: bool) -> String {
-    let supported = crate::SUPPORTED_MQ_MAJORS;
+    let supported = format!("[{}]", crate::SUPPORTED_MQ_VERSIONS.join(", "));
     if discovery_missing {
         return format!(
-            "postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports mq majors {supported:?})"
+            "postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports mq {supported})"
         );
     }
     match schema_version {
         None => format!(
-            "the database's PostgreMQ installation reports no schema version; it needs an installation or upgrade (client supports mq majors {supported:?})"
+            "the database's PostgreMQ installation reports no schema version; it needs an installation or upgrade (client supports mq {supported})"
         ),
         Some(version) => format!(
-            "the database's PostgreMQ schema is mq {} (schema version {version}); this client supports mq majors {supported:?}",
+            "the database's PostgreMQ schema is mq {} (schema version {version}); this client supports mq {supported}",
             crate::format_schema_version(version)
         ),
     }

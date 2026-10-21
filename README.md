@@ -45,7 +45,8 @@ Requirements: PostgreSQL 15+. Go 1.25+, Node.js 22+ or Rust 1.94+ for the
 clients.
 
 Each component has its own version and changelog, and the clients check the
-database's schema version (its mq major) when they connect; see
+database's schema version (its mq compatibility line: the major, or before
+1.0 the major and minor) when they connect; see
 [RELEASE.md](./RELEASE.md).
 
 ## Quick start

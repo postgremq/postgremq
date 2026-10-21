@@ -37,22 +37,35 @@ outside these directories (docs, `observability/`, CI) release nothing.
   - Breaking changes are listed under **⚠ BREAKING CHANGES** in the release
     notes, from the commit's `!` or `BREAKING CHANGE:` footer.
 - mq: semantic versioning of the schema, as the people who write each change
-  declare it: a breaking change (clients already deployed stop working against
-  the migrated database) bumps MAJOR, an additive one MINOR, a fix PATCH,
-  before 1.0 as after. `mq/vX.Y.Z` is the schema at migration X.Y.Z; the
-  database stores it as one number, X×10⁸ + Y×10⁴ + Z (0.1.0 is 10000), which
-  `postgremq.info()` reports as `schema_version`. Clients check its major
-  when they connect (below).
+  declare it in its change header: `major` a breaking change (clients already
+  deployed stop working against the migrated database), `minor` an additive
+  one, `patch` a fix.
+  - After 1.0: a breaking change bumps MAJOR, an additive one MINOR, a fix
+    PATCH.
+  - Before 1.0 (now), as Cargo reads 0.x versions: a breaking change bumps
+    MINOR (0.1.2 → 0.2.0); an additive change or a fix bumps PATCH. So a
+    breaking schema change is just a changed function, column or rule in the
+    pending migration: no compatibility shims or deprecated copies of the old
+    interface.
+  - A version's **compatibility line** is its major, or before 1.0 its major
+    and minor (`0.1` for 0.1.x). Clients check it when they connect (below).
+  - Released versions keep their numbers: 0.1.0 (a `minor` header) predates
+    this rule. Moving mq to 1.0.0 is a deliberate step: no change header
+    reaches it, so it needs its own change to `scripts/schema.py`.
+  - `mq/vX.Y.Z` is the schema at migration X.Y.Z; the database stores it as
+    one number, X×10⁸ + Y×10⁴ + Z (0.1.0 is 10000), which `postgremq.info()`
+    reports as `schema_version`.
 - Published versions and tags are immutable. A correction is a new release.
 
 ## The SQL schema
 
 ### Compatibility and discovery
 
-The mq major is the contract clients rely on: SQL function signatures, result
-types, error codes, ownership rules and delivery semantics. Additive changes (a
-new function, an added optional parameter with a default, an added result
-field) are minor versions and keep it; incompatible ones are a new major.
+The compatibility line (the mq major, or before 1.0 the major and minor) is
+the contract clients rely on: SQL function signatures, result types, error
+codes, ownership rules and delivery semantics. Additive changes (a new
+function, an added optional parameter with a default, an added result field)
+and fixes keep it; incompatible ones start a new line.
 
 ```sql
 SELECT postgremq.info();
@@ -67,19 +80,25 @@ reports the same number; `FormatSchemaVersion` (Go), `format_schema_version`
 (Rust) and `formatSchemaVersion` (TypeScript) turn it into the mq version,
 and the CLI shows both.
 
-Each client declares the mq majors it implements (`SupportedMQMajors()` in Go,
-`SUPPORTED_MQ_MAJORS` in TypeScript and Rust; `[0]` now), checks
-`schema_version` when it connects, and rejects any other major with a typed
-compatibility error that names the schema version and the supported majors
+Each client declares the mq lines it implements (`SupportedMQVersions()` in
+Go, `SUPPORTED_MQ_VERSIONS` in TypeScript and Rust; `["0.1"]` now), checks
+`schema_version` when it connects, and rejects any other line with a typed
+compatibility error that names the schema version and the supported lines
 (Go `*CompatibilityError` / `ErrIncompatibleSchema`, TypeScript
 `CompatibilityError`, Rust `Error::Incompatible`). A database without
 `info()`, or whose `info()` reports no schema version, gets the same error
 saying it needs an installation or upgrade; connection and permission errors
-keep their real cause. Within a supported major, clients call SQL functions
+keep their real cause. Within a supported line, clients call SQL functions
 directly: a function missing from an older installation fails with the
 database's own error (SQLSTATE 42883), through normal error handling. A
-client may declare a second major only when it implements and tests both
-contracts.
+client may declare a second line only when it implements and tests both
+contracts. A schema change that starts a new line therefore moves every
+client to it in the same commit (its `make sync` already changes every
+client).
+
+Clients released before compatibility lines (up to 0.4.0) check only the
+major, so they accept every 0.x schema: against a later 0.y they connect and
+then fail on the first function or column that changed.
 
 `protocol_major` is for clients up to 0.3.0, which check it instead of the mq
 major: since mq 0.1.1 `info()` derives it from the version (the mq major + 1),
@@ -105,7 +124,8 @@ signature and these fields are stable; fields may be added.
   ```
 
   Its version is the last release bumped by the highest level among its
-  sections, so the next mq version is always visible on `main`, and releases
+  sections (before 1.0: `major` bumps the minor, `minor` and `patch` the
+  patch), so the next mq version is always visible on `main`, and releases
   have no gaps. A pending migration may still change until it is released;
   a database migrated from an unreleased build is rebuilt, not upgraded.
 - `mq/sql/latest.sql` is the fresh-install script: everything the migrations
@@ -145,7 +165,7 @@ git add -A && git commit -m "feat(sql): add queue priority"
 |---|---|
 | none (the last migration is released) | creates the last release bumped by `bump` |
 | one, at the same or a higher level | adds the header to it |
-| one, at a lower level | renames it to the higher version, then adds the header |
+| one, at a lower level | renames it when the higher level gives another version (before 1.0 `minor` and `patch` give the same), then adds the header |
 
 and prints where to write. `make hooks` installs a pre-commit hook that
 refuses a commit while the schema is inconsistent or out of sync (it checks
@@ -159,7 +179,8 @@ check-title`: a PR that changes `mq/migrations` needs a releasing type
 change header it adds; a title scoped to the schema alone (`fix(sql): ...`,
 `feat(mq): ...`) must match the highest level exactly. Before the release
 PR is merged, `verify_release.py --all` checks again that no schema-scoped
-commit since the last mq release asks for more than the new version gives.
+commit since the last mq release asks for more than the pending migration's
+change headers declare.
 
 **Two PRs changing the schema at once.** After one merges, rebasing the
 other usually conflicts on the version `latest.sql` records (take either side;

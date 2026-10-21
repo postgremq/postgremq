@@ -113,8 +113,8 @@ export class ConnectionClosedError extends Error {
 
 /**
  * CompatibilityError is thrown by `Connection.connect()` when the database's
- * PostgreMQ schema has an mq major this client does not support (see
- * `SUPPORTED_MQ_MAJORS`), reports no schema version, or has no discovery
+ * PostgreMQ schema is on an mq line this client does not support (see
+ * `SUPPORTED_MQ_VERSIONS`), reports no schema version, or has no discovery
  * function (`postgremq.info()`) and needs an installation or upgrade. Mirrors
  * the Go client's CompatibilityError / ErrIncompatibleSchema.
  *
@@ -128,22 +128,22 @@ export class CompatibilityError extends Error {
    * missing or reports none.
    */
   readonly schemaVersion?: number;
-  /** The mq majors this client supports. */
-  readonly supportedMajors: readonly number[];
+  /** The mq lines this client supports (`SUPPORTED_MQ_VERSIONS`). */
+  readonly supportedVersions: readonly string[];
   /** The database error when discovery is missing. */
   readonly cause?: Error;
-  constructor(details: { schemaVersion?: number; supportedMajors: readonly number[]; cause?: Error }) {
-    const supported = `[${details.supportedMajors.join(', ')}]`;
+  constructor(details: { schemaVersion?: number; supportedVersions: readonly string[]; cause?: Error }) {
+    const supported = `[${details.supportedVersions.join(', ')}]`;
     super(
       details.cause
-        ? `postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports mq majors ${supported}): ${details.cause.message}`
+        ? `postgremq: postgremq.info() is unavailable; the database needs a PostgreMQ installation or upgrade (client supports mq ${supported}): ${details.cause.message}`
         : details.schemaVersion === undefined
-          ? `postgremq: the database's PostgreMQ installation reports no schema version; it needs an installation or upgrade (client supports mq majors ${supported})`
-          : `postgremq: the database's PostgreMQ schema is mq ${formatSchemaVersion(details.schemaVersion)} (schema version ${details.schemaVersion}); this client supports mq majors ${supported}`
+          ? `postgremq: the database's PostgreMQ installation reports no schema version; it needs an installation or upgrade (client supports mq ${supported})`
+          : `postgremq: the database's PostgreMQ schema is mq ${formatSchemaVersion(details.schemaVersion)} (schema version ${details.schemaVersion}); this client supports mq ${supported}`
     );
     this.name = 'CompatibilityError';
     this.schemaVersion = details.schemaVersion;
-    this.supportedMajors = details.supportedMajors;
+    this.supportedVersions = details.supportedVersions;
     this.cause = details.cause;
   }
 }
