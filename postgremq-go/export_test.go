@@ -3,6 +3,8 @@ package postgremq
 import (
 	"context"
 	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // This file is compiled only during `go test`. It exposes a few unexported
@@ -88,4 +90,33 @@ func ValidateConsumeOptionsForTest(opts ...ConsumeOption) error {
 		o(&options)
 	}
 	return validateConsumeOptions(&options)
+}
+
+// TestMigration is an up migration for MigrateWith. Tests only.
+type TestMigration struct {
+	Version uint64
+	SQL     string
+}
+
+// EmbeddedMigrations returns the embedded migrations in order. Tests only.
+func EmbeddedMigrations() ([]TestMigration, error) {
+	migrations, err := loadMigrations()
+	if err != nil {
+		return nil, err
+	}
+	out := make([]TestMigration, len(migrations))
+	for i, m := range migrations {
+		out[i] = TestMigration{Version: m.version, SQL: m.sql}
+	}
+	return out, nil
+}
+
+// MigrateWith runs Migrate over the given migrations instead of the embedded
+// ones. Tests only.
+func MigrateWith(pool *pgxpool.Pool, migrations []TestMigration) error {
+	ms := make([]migration, len(migrations))
+	for i, m := range migrations {
+		ms[i] = migration{version: m.Version, sql: m.SQL}
+	}
+	return runMigrations(context.Background(), pool, ms)
 }

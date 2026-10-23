@@ -152,8 +152,8 @@ export class CompatibilityError extends Error {
  * DirtySchemaError is thrown by `migrate()` when the recorded schema version
  * is marked dirty: a migration failed partway, so the schema is in an unknown
  * state. Fix the schema by hand, then clear the flag in
- * `postgremq.postgremq_migrations`. Mirrors golang-migrate's ErrDirty, which
- * the Go client returns.
+ * `postgremq.postgremq_migrations`. Mirrors the Go client's
+ * `*DirtySchemaError` (`ErrDirtySchema`).
  *
  * Pure client-side error (no SQLSTATE), so it carries no `code`.
  */
@@ -164,6 +164,86 @@ export class DirtySchemaError extends Error {
     super(`postgremq: database schema is dirty at version ${version}; a migration failed partway and needs manual repair`);
     this.name = 'DirtySchemaError';
     this.version = version;
+  }
+}
+
+/**
+ * UnknownSchemaVersionError is thrown by `migrate()` when the recorded schema
+ * version is below this package's latest migration but is none of its
+ * migrations, so no upgrade from it is known. Nothing is applied. Mirrors the
+ * Go client's `*UnknownSchemaVersionError` (`ErrUnknownSchemaVersion`).
+ */
+export class UnknownSchemaVersionError extends Error {
+  /** The recorded schema version. */
+  readonly version: number;
+  constructor(version: number) {
+    super(
+      `postgremq: database schema version ${version} (mq ${formatSchemaVersion(version)}) is not one of this client's migrations, so no upgrade from it is known`,
+    );
+    this.name = 'UnknownSchemaVersionError';
+    this.version = version;
+  }
+}
+
+/** The fields of a node-postgres database error a MigrationError reports. */
+interface DatabaseErrorFields {
+  severity?: string;
+  code?: string;
+  detail?: string;
+  hint?: string;
+  internalQuery?: string;
+  where?: string;
+}
+
+/**
+ * MigrationError is thrown by `migrate()` when a migration fails. Its version
+ * is left dirty (`migrate()` then throws DirtySchemaError until it is
+ * repaired). The migration runs in one transaction: when the database
+ * reported the error (`cause.code` is its SQLSTATE), it was rolled back; after
+ * a connection failure or a query timeout its outcome is unknown, so inspect
+ * the schema before repairing.
+ * The database error is `cause` (its SQLSTATE is `cause.code`). The message
+ * adds the server's detail, hint, the failing query inside a function and its
+ * context. Mirrors the Go client's `*MigrationError` (`ErrMigrationFailed`).
+ */
+export class MigrationError extends Error {
+  /** The schema version of the migration that failed. */
+  readonly version: number;
+  /**
+   * The line and column of the error in the migration's file, from 1, when
+   * PostgreSQL reports a position (it does for errors in the file's
+   * statements, including a function's definition). Absent too when the
+   * position cannot be mapped to the file: with a multibyte database or client
+   * encoding other than UTF8 (such as EUC_JP) the server counts other
+   * characters.
+   */
+  readonly line?: number;
+  readonly column?: number;
+  /** The database error. */
+  readonly cause: Error;
+  constructor(details: { version: number; line?: number; column?: number; cause: Error }) {
+    const db = details.cause as Error & DatabaseErrorFields;
+    const at = details.line !== undefined ? ` at line ${details.line}, column ${details.column}` : '';
+    const error = db.severity && db.code ? `${db.severity}: ${db.message} (SQLSTATE ${db.code})` : db.message;
+    const extra = (
+      [
+        ['detail', db.detail],
+        ['hint', db.hint],
+        ['query', db.internalQuery],
+        ['context', db.where],
+      ] as const
+    )
+      .filter(([, value]) => value)
+      .map(([name, value]) => `; ${name}: ${value}`)
+      .join('');
+    super(
+      `postgremq: migration ${formatSchemaVersion(details.version)} (schema version ${details.version}) failed${at}: ${error}${extra}`,
+    );
+    this.name = 'MigrationError';
+    this.version = details.version;
+    this.line = details.line;
+    this.column = details.column;
+    this.cause = details.cause;
   }
 }
 

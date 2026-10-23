@@ -24,7 +24,11 @@ differences are in [docs/delivery-lifecycle.md](./docs/delivery-lifecycle.md).
 
 ## Prerequisites
 
-- Docker. The test suites start PostgreSQL 15 with testcontainers.
+- Docker. The test suites start PostgreSQL 15 with testcontainers (the Go,
+  TypeScript and Rust suites can use a server of yours instead: set
+  `POSTGREMQ_TEST_DATABASE_URL` to a URL of it whose user can create
+  databases and roles; the suites create their own databases there and drop
+  them, except the Rust suite's schema template, which it keeps for later runs).
 - Go 1.25+ (the Go workspace and the metrics example need Go 1.26)
 - Node.js 22+ (the test suite needs 22.22+)
 - Rust 1.94+
@@ -84,7 +88,9 @@ RELEASE.md has the full rules.
 
 ```bash
 cd postgremq-go
-GOWORK=off go test -race ./...     # as CI runs it: the module on its own
+GOWORK=off go test -race ./...     # as CI runs it: the module on its own; starts
+                                   # a postgres:15 container per test package, or
+                                   # set POSTGREMQ_TEST_DATABASE_URL (see README)
 go test -short ./...               # skips the long benchmarks
 make check                         # postgremq-go/Makefile: gofmt, go vet, staticcheck
 ```
@@ -101,7 +107,8 @@ cd postgremq-ts
 npm ci
 npm run build
 npx tsc --noEmit
-npm test                  # Jest; parallel workers, one PostgreSQL container per worker
+npm test                  # Jest; parallel workers, one PostgreSQL container per test file
+                          # (or POSTGREMQ_TEST_DATABASE_URL, a database per test file)
 ```
 
 ### Rust
@@ -112,7 +119,7 @@ cargo fmt --check
 cargo clippy --all-targets --all-features -- -D warnings
 cargo test                         # starts a postgres:15 container, or set
 cargo test --all-features          # POSTGREMQ_TEST_DATABASE_URL to a server whose
-                                   # user can create databases
+                                   # user can create databases and roles
 ```
 
 ### Observability (end-to-end)

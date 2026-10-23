@@ -12,40 +12,51 @@ import { Connection } from '../connection';
 /**
  * PostgreSQL container for testing
  */
+/**
+ * The environment variable with the URL of a server to use instead of a
+ * container, as in the Go and Rust suites: a PostgreSQL 15+ server whose user
+ * can create databases and roles. The tests connect to the URL's database only
+ * to create and drop their own.
+ */
+const SERVER_URL_ENV = 'POSTGREMQ_TEST_DATABASE_URL';
+
 export class TestDatabase {
   private container: StartedTestContainer | null = null;
-  private pool: Pool | null = null; // admin pool connected to default DB
+  private pool: Pool | null = null; // the shared database; also creates and drops the others
   public connectionString: string = '';
-  private host: string | null = null;
-  private port: number | null = null;
+  private serverUrl: string = ''; // the server's admin database
+  private sharedDatabase: string | null = null; // created on POSTGREMQ_TEST_DATABASE_URL's server
   private createdDatabases: Set<string> = new Set();
 
   /**
-   * Start a PostgreSQL container with the queue schema
-   * If TEST_DATABASE_URL is set, uses existing database instead of Testcontainers
+   * Start a PostgreSQL container with the queue schema, or, when
+   * POSTGREMQ_TEST_DATABASE_URL is set, create a database with it on that
+   * server.
    */
   async start(): Promise<void> {
-    // Ensure we don't override container runtime detection; rely on defaults
-    // Check if we should use an existing database
-    const existingDbUrl = process.env.TEST_DATABASE_URL;
+    const serverUrl = process.env[SERVER_URL_ENV];
 
-    if (existingDbUrl) {
-      console.log('Using existing PostgreSQL database...');
-      this.connectionString = existingDbUrl;
+    if (serverUrl) {
+      console.log('Using the PostgreSQL server of POSTGREMQ_TEST_DATABASE_URL...');
+      this.serverUrl = serverUrl;
+      this.databaseUrl('postgres'); // fails on a URL it cannot derive from, before anything is created
+      const admin = new Pool({ connectionString: serverUrl, max: 1 });
+      this.sharedDatabase = `pgmq_ts_shared_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
+      try {
+        await admin.query(`CREATE DATABASE ${this.sharedDatabase}`);
+      } finally {
+        await admin.end();
+      }
+      this.connectionString = this.databaseUrl(this.sharedDatabase);
 
-      // Create connection pool
       this.pool = new Pool({
         connectionString: this.connectionString,
         max: 10
       });
-
-      // Wait for database to be ready
+      // pool.end() resolves before the sockets close, so dropping the shared
+      // database WITH (FORCE) on stop can terminate a closing client.
+      this.pool.on('error', () => {});
       await this.waitForDatabase();
-
-      // Clean up any existing schema
-      await this.cleanupExistingSchema();
-
-      // Load SQL schema
       await this.loadSchema();
 
       console.log('PostgreSQL database ready');
@@ -66,9 +77,8 @@ export class TestDatabase {
       const host = this.container.getHost();
       const port = this.container.getMappedPort(5432);
 
-      this.host = host;
-      this.port = port;
-      this.connectionString = `postgresql://postgres:postgres@${host}:${port}/postgremq_test`;
+      this.serverUrl = `postgresql://postgres:postgres@${host}:${port}/postgres`;
+      this.connectionString = this.databaseUrl('postgremq_test');
 
       // Create connection pool
       this.pool = new Pool({
@@ -105,20 +115,23 @@ export class TestDatabase {
     }
   }
 
-  /**
-   * Clean up existing schema (for reusing existing database)
-   */
-  private async cleanupExistingSchema(): Promise<void> {
+  /** The URL of `database` on this server, with the server's credentials and options. */
+  databaseUrl(database: string): string {
+    // A Unix socket goes in ?host=, which node-postgres lets override the
+    // URL's host; WHATWG URLs reject credentials without a host, so give it one.
+    const serverUrl = this.serverUrl.replace(/^(postgres(?:ql)?:\/\/[^/?#]*@)(?=[/?#]|$)/, '$1localhost');
+    let url: URL;
     try {
-      // Only remove queue objects; application schemas belong to the caller.
-      await this.pool!.query(`
-        DROP SCHEMA IF EXISTS postgremq CASCADE;
-      `);
-
-      console.log('Existing schema cleaned up');
-    } catch (error) {
-      console.warn('Warning during schema cleanup:', error);
+      url = new URL(serverUrl);
+    } catch {
+      // Not the URL's error: it would carry the password.
+      throw new Error(`${SERVER_URL_ENV} is not a valid URL`);
     }
+    url.pathname = `/${database}`;
+    // node-postgres lets these override the path.
+    url.searchParams.delete('dbname');
+    url.searchParams.delete('database');
+    return url.toString();
   }
 
   /**
@@ -156,6 +169,18 @@ export class TestDatabase {
       } catch {}
       await this.pool.end();
       this.pool = null;
+    }
+
+    if (this.sharedDatabase) {
+      const admin = new Pool({ connectionString: this.serverUrl, max: 1 });
+      try {
+        await admin.query(`DROP DATABASE IF EXISTS ${this.sharedDatabase} WITH (FORCE)`);
+      } catch {
+        // best effort, like the other test databases
+      } finally {
+        await admin.end();
+      }
+      this.sharedDatabase = null;
     }
 
     if (this.container) {
@@ -223,9 +248,7 @@ export async function createIsolatedTestConnection(db: TestDatabase): Promise<{ 
   db['createdDatabases'].add(dbName);
 
   // Connect to the new database
-  const host = db['host']!;
-  const port = db['port']!;
-  const isolatedConnStr = `postgresql://postgres:postgres@${host}:${port}/${dbName}`;
+  const isolatedConnStr = db.databaseUrl(dbName);
   const isolatedPool = new Pool({ connectionString: isolatedConnStr, max: 10 });
 
   // Wait for readiness
@@ -278,13 +301,27 @@ export async function createIsolatedTestConnection(db: TestDatabase): Promise<{ 
  * Create a fresh database WITHOUT the PostgreMQ schema (for migration tests).
  * `connectionString` lets a test open further pools, as separate processes would.
  */
-export async function createEmptyTestDatabase(db: TestDatabase): Promise<{ pool: Pool; connectionString: string; dropDatabase: () => Promise<void> }> {
+export async function createEmptyTestDatabase(
+  db: TestDatabase,
+  options: { encoding?: string; clientEncoding?: string } = {},
+): Promise<{ pool: Pool; connectionString: string; dropDatabase: () => Promise<void> }> {
   if (!db['pool']) throw new Error('Database pool not initialized');
   const dbName = `pgmq_ts_empty_${Date.now()}_${Math.floor(Math.random() * 1e6)}`;
-  await db['pool']!.query(`CREATE DATABASE ${dbName}`);
+  await db['pool']!.query(
+    options.encoding
+      ? `CREATE DATABASE ${dbName} ENCODING '${options.encoding}' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0`
+      : `CREATE DATABASE ${dbName}`,
+  );
   db['createdDatabases'].add(dbName);
-  const connectionString = `postgresql://postgres:postgres@${db['host']!}:${db['port']!}/${dbName}`;
+  const connectionString = db.databaseUrl(dbName);
   const pool = new Pool({ connectionString, max: 10 });
+  if (options.clientEncoding) {
+    // node-postgres ignores a client_encoding option.
+    const clientEncoding = options.clientEncoding;
+    pool.on('connect', (client) => {
+      client.query(`SET client_encoding TO '${clientEncoding}'`).catch(() => {});
+    });
+  }
   // pool.end() resolves before the sockets close, so DROP DATABASE ... WITH
   // (FORCE) can terminate a closing client; that error is expected here.
   pool.on('error', () => {});

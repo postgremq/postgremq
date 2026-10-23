@@ -1,5 +1,6 @@
 /**
- * Schema migrations, compatible with the Go client and the CLI (golang-migrate):
+ * Schema migrations, compatible with the Go and Rust clients and the CLI, which
+ * all follow golang-migrate's protocol:
  * the same version table (`postgremq.postgremq_migrations`, one row of
  * `version`, `dirty`), the same advisory lock, and the same dirty-flag
  * protocol, so any client can migrate a database another one installed.
@@ -11,7 +12,7 @@
  */
 
 import { Pool, PoolClient } from 'pg';
-import { DirtySchemaError } from './errors';
+import { DirtySchemaError, MigrationError, UnknownSchemaVersionError } from './errors';
 import { MIGRATIONS } from './migrations.generated';
 
 /** The migration state of a database, from `getMigrationStatus()`. */
@@ -31,7 +32,9 @@ export interface MigrationStatus {
   latestVersion: number;
   /**
    * Whether `currentVersion` is below `latestVersion`. A dirty database may
-   * report `false`; `migrate()` refuses it either way.
+   * report `false`; `migrate()` refuses it either way. It is also `true` for
+   * a version below the latest that none of the migrations knows, which
+   * `migrate()` refuses.
    */
   needsMigration: boolean;
 }
@@ -49,7 +52,11 @@ export { formatSchemaVersion } from './schema-version';
  * This is schema management, separate from {@link Connection}: run it once
  * before connecting, e.g. at application start-up.
  *
+ * @throws MigrationError when a migration fails; its version is left dirty
+ *   (and it is rolled back when the database reported the error).
  * @throws DirtySchemaError when a previous migration failed partway.
+ * @throws UnknownSchemaVersionError when the recorded version is below the
+ *   latest but none of the migrations, so no upgrade from it is known.
  */
 export async function migrate(pool: Pool): Promise<void> {
   const client = await pool.connect();
@@ -65,6 +72,14 @@ export async function migrate(pool: Pool): Promise<void> {
     if (dirty) {
       throw new DirtySchemaError(version);
     }
+    // A version below the latest that is none of the migrations is not a
+    // state they can upgrade from. A version above it was recorded by a
+    // newer client: nothing to do.
+    if (version !== 0 && version < LATEST_VERSION && !MIGRATIONS.some((m) => m.version === version)) {
+      throw new UnknownSchemaVersionError(version);
+    }
+    const pending = MIGRATIONS.some((m) => m.version > version);
+    const positions = pending ? await serverPositionUnit(client) : undefined;
     for (const migration of MIGRATIONS) {
       if (migration.version <= version) {
         continue;
@@ -72,7 +87,15 @@ export async function migrate(pool: Pool): Promise<void> {
       await setVersion(client, migration.version, true);
       // No parameters: the simple query protocol runs the whole file in one
       // implicit transaction, as the Go client does.
-      await client.query(migration.sql);
+      try {
+        await client.query(migration.sql);
+      } catch (err) {
+        // Kept as it is (an error from another realm fails instanceof Error).
+        const cause = typeof err === 'object' && err !== null ? (err as Error) : new Error(String(err));
+        const position = Number((cause as { position?: unknown }).position);
+        const at = sqlPosition(migration.sql, position, positions);
+        throw new MigrationError({ version: migration.version, ...at, cause });
+      }
       await setVersion(client, migration.version, false);
     }
   } finally {
@@ -85,6 +108,83 @@ export async function migrate(pool: Pool): Promise<void> {
     }
     client.release(discard);
   }
+}
+
+/**
+ * What a PostgreSQL error position counts in the UTF-8 migration text:
+ * characters (code points) or bytes. Undefined for characters of another
+ * multibyte encoding, which `sqlPosition` does not decode.
+ */
+type PositionUnit = 'characters' | 'bytes' | undefined;
+
+const SINGLE_BYTE_ENCODINGS = new Set([
+  'LATIN1', 'LATIN2', 'LATIN3', 'LATIN4', 'LATIN5', 'LATIN6', 'LATIN7', 'LATIN8', 'LATIN9', 'LATIN10',
+  'ISO_8859_5', 'ISO_8859_6', 'ISO_8859_7', 'ISO_8859_8', 'KOI8R', 'KOI8U', 'WIN866', 'WIN874',
+  'WIN1250', 'WIN1251', 'WIN1252', 'WIN1253', 'WIN1254', 'WIN1255', 'WIN1256', 'WIN1257', 'WIN1258',
+]);
+
+/** What this session's server counts error positions in. */
+async function serverPositionUnit(client: PoolClient): Promise<PositionUnit> {
+  const { rows } = await client.query<{ server: string; client: string }>(
+    "SELECT current_setting('server_encoding') AS server, current_setting('client_encoding') AS client",
+  );
+  return positionUnit(rows[0].server, rows[0].client);
+}
+
+/**
+ * What the server counts an error position in. It counts characters of the
+ * text in the database's encoding, converted from client_encoding unless that
+ * is the database's or SQL_ASCII (taken as it is); conversion keeps the
+ * characters, except into EUC_JIS_2004, which combines some pairs into one. A
+ * SQL_ASCII database counts bytes.
+ *
+ * @internal Exported for tests.
+ */
+export function positionUnit(serverEncoding: string, clientEncoding: string): PositionUnit {
+  if (serverEncoding === 'SQL_ASCII') {
+    return 'bytes';
+  }
+  if (serverEncoding === 'EUC_JIS_2004') {
+    return undefined;
+  }
+  if (clientEncoding === 'UNICODE') {
+    clientEncoding = 'UTF8'; // its alias, reported as it was set
+  }
+  const encoding =
+    clientEncoding === serverEncoding || clientEncoding === 'SQL_ASCII' ? serverEncoding : clientEncoding;
+  if (encoding === 'UTF8') {
+    return 'characters';
+  }
+  return SINGLE_BYTE_ENCODINGS.has(encoding) ? 'bytes' : undefined; // a single byte is one character
+}
+
+/**
+ * The line and column, from 1 and the column in characters, of a PostgreSQL
+ * error position in `sql`. The position counts from 1 in `unit`; one past the
+ * end is the end of the input. Empty when there is no position or no unit.
+ *
+ * @internal Exported for tests.
+ */
+export function sqlPosition(sql: string, position: number, unit: PositionUnit): { line?: number; column?: number } {
+  if (!Number.isInteger(position) || position <= 0 || unit === undefined) {
+    return {};
+  }
+  let before: string;
+  if (unit === 'bytes') {
+    const bytes = Buffer.from(sql, 'utf8');
+    if (position - 1 > bytes.length) {
+      return {};
+    }
+    before = bytes.subarray(0, position - 1).toString('utf8');
+  } else {
+    const characters = Array.from(sql);
+    if (position - 1 > characters.length) {
+      return {};
+    }
+    before = characters.slice(0, position - 1).join('');
+  }
+  const lines = before.split('\n');
+  return { line: lines.length, column: Array.from(lines[lines.length - 1]).length + 1 };
 }
 
 /**

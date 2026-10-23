@@ -140,9 +140,11 @@ describe('schema compatibility', () => {
     cleanups.push(async () => {
       await shared.getPool().query(`DROP ROLE IF EXISTS ${role}`);
     });
+    // In the query: node-postgres prefers it to the URL's credentials, and a
+    // URL without a host (a socket in ?host=) cannot take credentials.
     const url = new URL(iso.connectionString);
-    url.username = role;
-    url.password = 'x';
+    url.searchParams.set('user', role);
+    url.searchParams.set('password', 'x');
 
     const err = await connectTo(url.toString());
 

@@ -29,7 +29,7 @@ pub use compatibility::SUPPORTED_MQ_VERSIONS;
 pub use connection::Connection;
 pub use consumer::Consumer;
 pub use delivery::Delivery;
-pub use error::{Error, ErrorKind, Result};
+pub use error::{Error, ErrorKind, Result, SqlPosition};
 pub use handler::{HandlerConsumer, HandlerError};
 pub use migrate::{MigrationStatus, format_schema_version, migrate, migration_status};
 pub use options::{

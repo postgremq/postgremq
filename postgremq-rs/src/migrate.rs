@@ -1,6 +1,7 @@
-//! Schema migrations, compatible with the Go client and the CLI
-//! (golang-migrate): the same version table, advisory lock and dirty-flag
-//! protocol, so any client can migrate a database another one installed.
+//! Schema migrations, compatible with the Go and TypeScript clients and the
+//! CLI, which all follow golang-migrate's protocol: the same version table,
+//! advisory lock and dirty-flag protocol, so any client can migrate a
+//! database another one installed.
 //!
 //! A schema version is an mq version stored as one number,
 //! `major * 10^8 + minor * 10^4 + patch` (see [`format_schema_version`]).
@@ -8,7 +9,9 @@
 use sqlx::{AssertSqlSafe, Connection as _, PgConnection, PgPool};
 use tracing::Instrument as _;
 
-use crate::error::{Error, Result};
+use sqlx::postgres::{PgDatabaseError, PgErrorPosition};
+
+use crate::error::{Error, Result, SqlPosition};
 
 /// An embedded up migration.
 struct Migration {
@@ -63,7 +66,9 @@ pub struct MigrationStatus {
     /// The schema version of the latest migration embedded in this crate.
     pub latest_version: u64,
     /// Whether `current_version` is below `latest_version`. A dirty database
-    /// may report `false`; [`migrate`] refuses it either way.
+    /// may report `false`; [`migrate`] refuses it either way. It is also
+    /// `true` for a version below the latest that none of the migrations
+    /// knows, which [`migrate`] refuses.
     pub needs_migration: bool,
 }
 
@@ -85,9 +90,12 @@ pub struct MigrationStatus {
 ///
 /// # Errors
 ///
+/// [`Error::Migration`] when a migration fails (its version is left dirty,
+/// and it is rolled back when the database reported the error);
 /// [`Error::DirtySchema`] when a previous migration failed partway;
-/// [`Error::Sqlx`] for database errors, including a failing migration (whose
-/// version is then left dirty).
+/// [`Error::UnknownSchemaVersion`] when the recorded version is below the
+/// latest but none of the migrations; [`Error::Sqlx`] for other database
+/// errors.
 pub async fn migrate(pool: &PgPool) -> Result<()> {
     run(pool, MIGRATIONS).await
 }
@@ -128,7 +136,7 @@ async fn run(pool: &PgPool, migrations: &'static [Migration]) -> Result<()> {
             return Err(err);
         }
     };
-    let current = match applied_version(&mut conn).await {
+    let current = match applied_version(&mut conn, migrations).await {
         Ok(current) => current,
         Err(err) => {
             finish(conn, Some(lock)).await;
@@ -167,18 +175,38 @@ async fn lock(conn: &mut PgConnection) -> Result<i64> {
 }
 
 /// Under the lock: creates the version table if needed and returns the
-/// applied version, refusing a dirty one. Safe to cancel.
-async fn applied_version(conn: &mut PgConnection) -> Result<u64> {
+/// applied version, refusing a dirty one and one `migrations` cannot upgrade.
+/// Safe to cancel.
+async fn applied_version(conn: &mut PgConnection, migrations: &[Migration]) -> Result<u64> {
     ensure_version_table(conn).await?;
     let (current, dirty) = read_version(conn).await?;
     if dirty {
         return Err(Error::DirtySchema { version: current });
+    }
+    // A version below the latest that is none of the migrations is not a
+    // state they can upgrade from. A version above it was recorded by a
+    // newer client: nothing to do.
+    if current != 0
+        && migrations
+            .last()
+            .is_some_and(|latest| current < latest.version)
+        && !migrations.iter().any(|m| m.version == current)
+    {
+        return Err(Error::UnknownSchemaVersion { version: current });
     }
     Ok(current)
 }
 
 /// Applies the migrations above `current`, each under the dirty flag.
 async fn apply(conn: &mut PgConnection, migrations: &[Migration], current: u64) -> Result<()> {
+    if migrations.iter().all(|m| m.version <= current) {
+        return Ok(());
+    }
+    let server_encoding: String = sqlx::query_scalar("SELECT current_setting('server_encoding')")
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(Error::Sqlx)?;
+    let positions = position_unit(&server_encoding);
     for migration in migrations.iter().filter(|m| m.version > current) {
         tracing::info!(version = migration.version, "applying schema migration");
         set_version(conn, migration.version, true).await?;
@@ -187,10 +215,76 @@ async fn apply(conn: &mut PgConnection, migrations: &[Migration], current: u64) 
         sqlx::raw_sql(migration.sql)
             .execute(&mut *conn)
             .await
-            .map_err(Error::Sqlx)?;
+            .map_err(|source| migration_error(migration, source, positions))?;
         set_version(conn, migration.version, false).await?;
     }
     Ok(())
+}
+
+/// What a PostgreSQL error position counts in the UTF-8 migration text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PositionUnit {
+    Characters,
+    Bytes,
+}
+
+/// What the server counts an error position in, given `server_encoding`
+/// (sqlx sets client_encoding to UTF8). It counts characters of the text
+/// converted to the database's encoding; conversion keeps the characters,
+/// except into EUC_JIS_2004, which combines some pairs into one (`None`: not
+/// mapped). A SQL_ASCII database does not convert and counts bytes.
+fn position_unit(server_encoding: &str) -> Option<PositionUnit> {
+    match server_encoding {
+        "SQL_ASCII" => Some(PositionUnit::Bytes),
+        "EUC_JIS_2004" => None,
+        _ => Some(PositionUnit::Characters),
+    }
+}
+
+/// An [`Error::Migration`] for `migration`'s `source`, located in its file
+/// when the server reports a position in `positions`.
+fn migration_error(
+    migration: &Migration,
+    source: sqlx::Error,
+    positions: Option<PositionUnit>,
+) -> Error {
+    let position = match (
+        crate::error::pg_error(&source).and_then(PgDatabaseError::position),
+        positions,
+    ) {
+        (Some(PgErrorPosition::Original(position)), Some(unit)) => {
+            sql_position(migration.sql, position, unit)
+                .and_then(|(line, column)| SqlPosition::new(line, column))
+        }
+        _ => None,
+    };
+    Error::Migration {
+        version: migration.version,
+        position,
+        source,
+    }
+}
+
+/// The line and column, from 1 and the column in characters, of a
+/// PostgreSQL error position in `sql`. The position counts from 1 in `unit`;
+/// one past the end is the end of the input.
+fn sql_position(sql: &str, position: usize, unit: PositionUnit) -> Option<(usize, usize)> {
+    let offset = position.checked_sub(1)?;
+    let before = if unit == PositionUnit::Bytes {
+        sql.get(..offset)?
+    } else {
+        let end = sql
+            .char_indices()
+            .map(|(index, _)| index)
+            .chain([sql.len()])
+            .nth(offset)?;
+        &sql[..end]
+    };
+    let line_start = before.rfind('\n').map_or(0, |newline| newline + 1);
+    Some((
+        before.matches('\n').count() + 1,
+        before[line_start..].chars().count() + 1,
+    ))
 }
 
 /// Releases the lock and ends the session. Failures are only logged: ending
@@ -430,8 +524,19 @@ mod tests {
         let err = run(&db.pool, WITH_FAILURE).await.err();
 
         assert!(
-            matches!(&err, Some(Error::Sqlx(_))),
-            "a failing migration is a database error: {err:?}"
+            matches!(
+                &err,
+                Some(Error::Migration {
+                    version: 2,
+                    position: Some(SqlPosition { line, column, .. }),
+                    ..
+                }) if (line.get(), column.get()) == (1, 58)
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.as_ref().and_then(Error::sqlstate).as_deref(),
+            Some("42P01")
         );
         assert_eq!(version_row(&db.pool).await, (2, true));
         assert!(
@@ -462,5 +567,295 @@ mod tests {
             "{err:?}"
         );
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn refuses_a_version_that_is_none_of_its_migrations() -> Result<()> {
+        let db = common::TestDb::empty().await;
+        run(&db.pool, &MIGRATIONS[..1]).await?;
+        let unknown = MIGRATIONS[1].version - 1; // between two released migrations
+        sqlx::query("UPDATE postgremq.postgremq_migrations SET version = $1")
+            .bind(i64::try_from(unknown).unwrap_or_else(|err| unreachable!("{err}")))
+            .execute(&db.pool)
+            .await
+            .map_err(Error::Sqlx)?;
+
+        let err = migrate(&db.pool).await.err();
+
+        assert!(
+            matches!(err, Some(Error::UnknownSchemaVersion { version, .. }) if version == unknown),
+            "{err:?}"
+        );
+        assert!(
+            err.as_ref()
+                .is_some_and(|err| err.to_string().contains(&format!(
+                    "database schema version {unknown} (mq {}) is not one of this client's migrations",
+                    format_schema_version(unknown)
+                )))
+        );
+        assert_eq!(
+            err.map(|err| err.kind()),
+            Some(crate::ErrorKind::UnknownSchemaVersion)
+        );
+        assert_eq!(
+            version_row(&db.pool).await,
+            (
+                i64::try_from(unknown).unwrap_or_else(|err| unreachable!("{err}")),
+                false
+            ),
+            "nothing is applied"
+        );
+        let locks: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' \
+             AND database = (SELECT oid FROM pg_database WHERE datname = current_database())",
+        )
+        .fetch_one(&db.pool)
+        .await
+        .map_err(Error::Sqlx)?;
+        assert_eq!(locks, 0, "the lock is released");
+        Ok(())
+    }
+
+    /// A failed migration's error says where in the file it failed and keeps
+    /// the database error as its source.
+    #[tokio::test]
+    async fn a_failing_migration_says_where_it_failed() {
+        struct Case {
+            sql: &'static str,
+            code: &'static str,
+            at: Option<(u32, u32)>,
+            want: &'static [&'static str],
+        }
+        let cases = [
+            // Positions count characters, not bytes.
+            Case {
+                sql: "-- café ☕\nCREATE TABLE postgremq.t (id int);\n  SELEC 1;\n",
+                code: "42601",
+                at: Some((3, 3)),
+                want: &[
+                    "migration 9.0.2 (schema version 900000002) failed at line 3, column 3: ",
+                    r#"syntax error at or near "SELEC""#,
+                ],
+            },
+            Case {
+                sql: "CREATE TABLE postgremq.t (id int);\nSELECT (\n",
+                code: "42601",
+                at: Some((3, 1)),
+                want: &[
+                    "failed at line 3, column 1: ",
+                    "syntax error at end of input",
+                ],
+            },
+            Case {
+                sql: "CREATE FUNCTION postgremq.f() RETURNS int LANGUAGE sql AS $$\n  SELECT 1;\n  SELECT x FROM no_such_table;\n$$;\n",
+                code: "42P01",
+                at: Some((3, 17)),
+                want: &[
+                    "failed at line 3, column 17: ",
+                    r#"relation "no_such_table" does not exist"#,
+                ],
+            },
+            Case {
+                sql: "CREATE FUNCTION postgremq.h() RETURNS bigint LANGUAGE plpgsql AS $$\nBEGIN\n  RETURN (SELECT count(*) FROM no_such_table);\nEND $$;\nSELECT postgremq.h();\n",
+                code: "42P01",
+                at: None,
+                want: &[
+                    "query: (SELECT count(*) FROM no_such_table)",
+                    "context: PL/pgSQL function postgremq.h() line 3 at RETURN",
+                ],
+            },
+            Case {
+                sql: "CREATE TABLE postgremq.t (id int PRIMARY KEY);\nINSERT INTO postgremq.t VALUES (1), (1);\n",
+                code: "23505",
+                at: None,
+                want: &[
+                    "duplicate key value",
+                    "detail: Key (id)=(1) already exists.",
+                ],
+            },
+            Case {
+                sql: "DO $$\nBEGIN\n  RAISE EXCEPTION 'boom' USING HINT = 'look here';\nEND $$;\n",
+                code: "P0001",
+                at: None,
+                want: &[
+                    "boom",
+                    "hint: look here",
+                    "context: PL/pgSQL function inline_code_block line 3 at RAISE",
+                ],
+            },
+        ];
+        for case in cases {
+            let db = common::TestDb::empty().await;
+            let migrations: &'static [Migration] = Box::leak(Box::new([
+                Migration {
+                    version: 1,
+                    sql: MIGRATIONS[0].sql,
+                },
+                Migration {
+                    version: 900_000_002,
+                    sql: case.sql,
+                },
+            ]));
+
+            let err = run(&db.pool, migrations).await.err();
+
+            let Some(Error::Migration {
+                version, position, ..
+            }) = &err
+            else {
+                panic!("{}: {err:?}", case.sql);
+            };
+            assert_eq!(*version, 900_000_002);
+            assert_eq!(
+                position.map(|at| (at.line.get(), at.column.get())),
+                case.at,
+                "{}",
+                case.sql
+            );
+            assert!(
+                err.as_ref()
+                    .and_then(std::error::Error::source)
+                    .is_some_and(|source| source.is::<sqlx::Error>()),
+                "the database error is the source"
+            );
+            assert_eq!(
+                err.as_ref().and_then(Error::sqlstate).as_deref(),
+                Some(case.code)
+            );
+            let message = err.as_ref().map(ToString::to_string).unwrap_or_default();
+            for want in case.want {
+                assert!(message.contains(want), "{message:?} lacks {want:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn sql_position_counts_characters_from_one() {
+        let sql = "ab\nc☕d\n";
+        for (position, want) in [
+            (1, (1, 1)),
+            (3, (1, 3)),
+            (4, (2, 1)),
+            (6, (2, 3)),
+            (7, (2, 4)),
+            (8, (3, 1)), // the end of the input
+        ] {
+            assert_eq!(
+                sql_position(sql, position, PositionUnit::Characters),
+                Some(want),
+                "{position}"
+            );
+        }
+        assert_eq!(
+            sql_position("SELECT (", 9, PositionUnit::Characters),
+            Some((1, 9))
+        );
+        for position in [0, 9] {
+            assert_eq!(
+                sql_position(sql, position, PositionUnit::Characters),
+                None,
+                "{position}"
+            );
+        }
+    }
+
+    /// A SQL_ASCII database counts the UTF-8 file's bytes; the column is still
+    /// in characters.
+    #[test]
+    fn sql_position_in_bytes() {
+        let sql = "ab\nc☕d\n";
+        for (position, want) in [(4, (2, 1)), (8, (2, 3)), (9, (2, 4)), (10, (3, 1))] {
+            assert_eq!(
+                sql_position(sql, position, PositionUnit::Bytes),
+                Some(want),
+                "{position}"
+            );
+        }
+        assert_eq!(sql_position(sql, 11, PositionUnit::Bytes), None);
+    }
+
+    /// Measured on PostgreSQL 15 with sqlx's UTF8 client: EUC_JP converts
+    /// character for character; UTF8 into EUC_JIS_2004 combines か and ゚ into
+    /// one.
+    #[test]
+    fn position_unit_follows_the_servers_conversion() {
+        for (server, want) in [
+            ("UTF8", Some(PositionUnit::Characters)),
+            ("LATIN1", Some(PositionUnit::Characters)),
+            ("EUC_JP", Some(PositionUnit::Characters)),
+            ("SQL_ASCII", Some(PositionUnit::Bytes)),
+            ("EUC_JIS_2004", None),
+        ] {
+            assert_eq!(position_unit(server), want, "{server}");
+        }
+    }
+
+    #[test]
+    fn a_migration_error_without_a_database_error_shows_its_source() {
+        let err = Error::Migration {
+            version: 20_001,
+            position: None,
+            source: sqlx::Error::Protocol("connection reset".into()),
+        };
+        assert_eq!(
+            err.to_string(),
+            "migration 0.2.1 (schema version 20001) failed: encountered unexpected or invalid data: connection reset"
+        );
+        assert_eq!(err.kind(), crate::ErrorKind::Migration);
+        assert_eq!(err.sqlstate(), None);
+        assert!(std::error::Error::source(&err).is_some());
+    }
+
+    /// PostgreSQL counts an error position in characters of the text
+    /// converted to the database's encoding: a SQL_ASCII database does not
+    /// convert, so it counts the bytes.
+    #[tokio::test]
+    async fn a_failing_migration_is_located_in_a_sql_ascii_database() {
+        // é is two bytes in UTF-8.
+        const BROKEN: &[Migration] = &[Migration {
+            version: 900_000_002,
+            sql: "-- é é\n  SELEC 1;\n",
+        }];
+        let db = common::TestDb::empty_with_encoding("SQL_ASCII").await;
+
+        let err = run(&db.pool, BROKEN).await.err();
+
+        assert!(
+            matches!(
+                &err,
+                Some(Error::Migration {
+                    position: Some(SqlPosition { line, column, .. }),
+                    ..
+                }) if (line.get(), column.get()) == (2, 3)
+            ),
+            "{err:?}"
+        );
+    }
+
+    /// Converting UTF8 into EUC_JIS_2004 combines か and ゚ into one
+    /// character, so the server's position (8, against 9 counting
+    /// characters) is reported without a location rather than a wrong one.
+    #[tokio::test]
+    async fn a_failing_migration_in_an_euc_jis_2004_database_is_not_located() {
+        const BROKEN: &[Migration] = &[Migration {
+            version: 900_000_002,
+            sql: "-- \u{304b}\u{309a}\n  SELEC 1;\n",
+        }];
+        let db = common::TestDb::empty_with_encoding("EUC_JIS_2004").await;
+
+        let err = run(&db.pool, BROKEN).await.err();
+
+        let Some(Error::Migration {
+            position, source, ..
+        }) = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(*position, None);
+        let database_error = crate::error::pg_error(source).expect("a database error");
+        assert_eq!(
+            database_error.position(),
+            Some(PgErrorPosition::Original(8))
+        );
     }
 }

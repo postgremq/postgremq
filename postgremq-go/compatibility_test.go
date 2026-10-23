@@ -161,7 +161,7 @@ func TestCompatibility_PermissionErrorKeepsItsCause(t *testing.T) {
 	_, err := pool.Exec(ctx, fmt.Sprintf("CREATE ROLE %s LOGIN PASSWORD 'x'", role))
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, _ = sharedContainer.adminPool.Exec(context.Background(), "DROP ROLE IF EXISTS "+role)
+		_, _ = sharedServer.adminPool.Exec(context.Background(), "DROP ROLE IF EXISTS "+role)
 	})
 	cfg := pool.Config().Copy()
 	cfg.ConnConfig.User, cfg.ConnConfig.Password = role, "x"

@@ -3,10 +3,13 @@ package postgremq_test
 import (
 	"context"
 	"fmt"
+	"hash/crc32"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,8 +25,8 @@ func setupEmptyTestDatabase(t *testing.T) (*pgxpool.Pool, context.Context) {
 	// Create a unique database for this test
 	dbName := fmt.Sprintf("pgmq_migrate_test_%s_%d", sanitizeTestName(t.Name()), time.Now().UnixNano())
 
-	// Connect to the container's default postgres database
-	adminConn, err := pgxpool.NewWithConfig(ctx, sharedContainer.config)
+	// Connect to the server's admin database
+	adminConn, err := pgxpool.NewWithConfig(ctx, sharedServer.config)
 	require.NoError(t, err, "Failed to connect to postgres")
 	defer adminConn.Close()
 
@@ -32,7 +35,7 @@ func setupEmptyTestDatabase(t *testing.T) (*pgxpool.Pool, context.Context) {
 	require.NoError(t, err, "Failed to create test database")
 
 	// Update the connection config to point to the new database
-	testConfig := sharedContainer.config.Copy()
+	testConfig := sharedServer.config.Copy()
 	testConfig.ConnConfig.Database = dbName
 	testConfig.MaxConns = 10
 	testConfig.MinConns = 2
@@ -51,7 +54,7 @@ func setupEmptyTestDatabase(t *testing.T) (*pgxpool.Pool, context.Context) {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		_, err = sharedContainer.adminPool.Exec(cleanupCtx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
+		_, err = sharedServer.adminPool.Exec(cleanupCtx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
 		if err != nil {
 			t.Logf("Warning: Failed to drop test database %s: %v", dbName, err)
 		}
@@ -217,10 +220,288 @@ func TestMigration_DirtyDatabaseFails(t *testing.T) {
 	require.NoError(t, err)
 
 	err = postgremq.Migrate(pool)
-	require.Error(t, err)
+	require.ErrorIs(t, err, postgremq.ErrDirtySchema)
 	status, statusErr := postgremq.GetMigrationStatus(pool)
 	require.NoError(t, statusErr)
-	assert.Contains(t, err.Error(), fmt.Sprintf("Dirty database version %d", status.LatestVersion))
+	var dirty *postgremq.DirtySchemaError
+	require.ErrorAs(t, err, &dirty)
+	assert.Equal(t, status.LatestVersion, dirty.Version)
+	assert.Contains(t, err.Error(), fmt.Sprintf("dirty at version %d", status.LatestVersion))
+}
+
+func TestMigration_NegativeVersionReadsAsNoVersion(t *testing.T) {
+	pool, ctx := setupEmptyTestDatabase(t)
+	require.NoError(t, postgremq.Migrate(pool))
+
+	// golang-migrate records -1 (no version) after a failed first down migration.
+	_, err := pool.Exec(ctx, "UPDATE postgremq.postgremq_migrations SET version = -1, dirty = true")
+	require.NoError(t, err)
+
+	status, err := postgremq.GetMigrationStatus(pool)
+	require.NoError(t, err)
+	assert.Equal(t, uint(0), status.CurrentVersion)
+	assert.True(t, status.Dirty)
+
+	err = postgremq.Migrate(pool)
+	var dirty *postgremq.DirtySchemaError
+	require.ErrorAs(t, err, &dirty)
+	assert.Equal(t, uint(0), dirty.Version)
+}
+
+// migrationLockID is golang-migrate's advisory lock key for the version table,
+// database.GenerateAdvisoryLockId(db, "postgremq", "postgremq_migrations"),
+// which every client and older releases take.
+func migrationLockID(database string) int64 {
+	return int64(crc32.ChecksumIEEE([]byte("postgremq\x00postgremq_migrations\x00"+database)) * 1_486_364_155)
+}
+
+func TestMigration_WaitsForTheLockOtherClientsTake(t *testing.T) {
+	pool, ctx := setupEmptyTestDatabase(t)
+	holder, err := pool.Acquire(ctx)
+	require.NoError(t, err)
+	defer func() {
+		_, _ = holder.Exec(ctx, "SELECT pg_advisory_unlock_all()")
+		holder.Release()
+	}()
+	var database string
+	require.NoError(t, holder.QueryRow(ctx, "SELECT current_database()").Scan(&database))
+	_, err = holder.Exec(ctx, "SELECT pg_advisory_lock($1)", migrationLockID(database))
+	require.NoError(t, err)
+
+	done := make(chan error, 1)
+	go func() { done <- postgremq.Migrate(pool) }()
+	// Migrate's session waits for that lock.
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT FROM pg_locks
+			WHERE locktype = 'advisory' AND NOT granted AND classid = 0 AND objid = $1
+			AND database = (SELECT oid FROM pg_database WHERE datname = current_database()))`,
+			migrationLockID(database)).Scan(&waiting)
+		return err == nil && waiting
+	}, 10*time.Second, 20*time.Millisecond)
+	select {
+	case err := <-done:
+		t.Fatalf("Migrate did not wait for the lock: %v", err)
+	default:
+	}
+	var installed bool
+	require.NoError(t, pool.QueryRow(ctx, "SELECT to_regnamespace('postgremq') IS NOT NULL").Scan(&installed))
+	assert.False(t, installed, "nothing is created before the lock is taken")
+
+	_, err = holder.Exec(ctx, "SELECT pg_advisory_unlock($1)", migrationLockID(database))
+	require.NoError(t, err)
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(30 * time.Second):
+		t.Fatal("Migrate did not finish after the lock was released")
+	}
+	status, err := postgremq.GetMigrationStatus(pool)
+	require.NoError(t, err)
+	assert.Equal(t, status.LatestVersion, status.CurrentVersion)
+}
+
+func versionRow(t *testing.T, pool *pgxpool.Pool) (int64, bool) {
+	t.Helper()
+	var version int64
+	var dirty bool
+	require.NoError(t, pool.QueryRow(context.Background(),
+		"SELECT version, dirty FROM postgremq.postgremq_migrations").Scan(&version, &dirty))
+	return version, dirty
+}
+
+func tableExists(t *testing.T, pool *pgxpool.Pool, table string) bool {
+	t.Helper()
+	var exists bool
+	require.NoError(t, pool.QueryRow(context.Background(), "SELECT to_regclass($1) IS NOT NULL", table).Scan(&exists))
+	return exists
+}
+
+func TestMigration_UpgradesByThePendingMigrationsOnly(t *testing.T) {
+	pool, _ := setupEmptyTestDatabase(t)
+	embedded, err := postgremq.EmbeddedMigrations()
+	require.NoError(t, err)
+	upgrade := []postgremq.TestMigration{
+		embedded[0],
+		{Version: 2, SQL: "CREATE TABLE postgremq.upgraded (id int);"},
+	}
+
+	require.NoError(t, postgremq.MigrateWith(pool, upgrade[:1]))
+	version, dirty := versionRow(t, pool)
+	assert.Equal(t, int64(1), version)
+	assert.False(t, dirty)
+
+	require.NoError(t, postgremq.MigrateWith(pool, upgrade))
+	version, dirty = versionRow(t, pool)
+	assert.Equal(t, int64(2), version)
+	assert.False(t, dirty)
+	assert.True(t, tableExists(t, pool, "postgremq.upgraded"))
+}
+
+func TestMigration_UpgradesALatestSQLInstall(t *testing.T) {
+	pool, _ := setupTestConnection(t) // installs latest.sql
+	installed, dirty := versionRow(t, pool)
+	require.False(t, dirty)
+	embedded, err := postgremq.EmbeddedMigrations()
+	require.NoError(t, err)
+	// The embedded migrations plus one more, as a later release adds.
+	upgrade := append(embedded, postgremq.TestMigration{
+		Version: uint64(installed) + 1,
+		SQL:     "CREATE TABLE postgremq.upgraded (id int);",
+	})
+
+	require.NoError(t, postgremq.MigrateWith(pool, upgrade))
+
+	version, dirty := versionRow(t, pool)
+	assert.Equal(t, installed+1, version)
+	assert.False(t, dirty)
+	assert.True(t, tableExists(t, pool, "postgremq.upgraded"))
+}
+
+func TestMigration_RefusesAnUnknownVersion(t *testing.T) {
+	pool, ctx := setupEmptyTestDatabase(t)
+	embedded, err := postgremq.EmbeddedMigrations()
+	require.NoError(t, err)
+	unknown := embedded[1].Version - 1 // between two released migrations
+	require.NoError(t, postgremq.MigrateWith(pool, embedded[:1]))
+	_, err = pool.Exec(ctx, "UPDATE postgremq.postgremq_migrations SET version = $1", int64(unknown))
+	require.NoError(t, err)
+
+	err = postgremq.Migrate(pool)
+	require.ErrorIs(t, err, postgremq.ErrUnknownSchemaVersion)
+	var unknownErr *postgremq.UnknownSchemaVersionError
+	require.ErrorAs(t, err, &unknownErr)
+	assert.Equal(t, uint(unknown), unknownErr.Version)
+	assert.Contains(t, err.Error(), fmt.Sprintf("database schema version %d (mq %s) is not one of this client's migrations",
+		unknown, postgremq.FormatSchemaVersion(uint(unknown))))
+
+	version, dirty := versionRow(t, pool)
+	assert.Equal(t, int64(unknown), version, "nothing is applied")
+	assert.False(t, dirty)
+}
+
+func TestMigration_StatusDoesNotNeedAPoolConnection(t *testing.T) {
+	pool, ctx := setupEmptyTestDatabase(t)
+	require.NoError(t, postgremq.Migrate(pool))
+	var held []*pgxpool.Conn
+	for range pool.Config().MaxConns {
+		conn, err := pool.Acquire(ctx)
+		require.NoError(t, err)
+		held = append(held, conn)
+	}
+	defer func() {
+		for _, conn := range held {
+			conn.Release()
+		}
+	}()
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := postgremq.GetMigrationStatus(pool)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("GetMigrationStatus waited for a pool connection")
+	}
+}
+
+func TestMigration_AFailingMigrationLeavesItsVersionDirtyAndStops(t *testing.T) {
+	pool, _ := setupEmptyTestDatabase(t)
+	embedded, err := postgremq.EmbeddedMigrations()
+	require.NoError(t, err)
+	withFailure := []postgremq.TestMigration{
+		embedded[0],
+		{Version: 2, SQL: "CREATE TABLE postgremq.half_done (id int); SELECT * FROM no_such_table;"},
+		{Version: 3, SQL: "CREATE TABLE postgremq.after_broken (id int);"},
+	}
+
+	err = postgremq.MigrateWith(pool, withFailure)
+	require.ErrorIs(t, err, postgremq.ErrMigrationFailed)
+	var migrationErr *postgremq.MigrationError
+	require.ErrorAs(t, err, &migrationErr)
+	assert.Equal(t, uint(2), migrationErr.Version)
+	assert.Equal(t, [2]int{1, 58}, [2]int{migrationErr.Line, migrationErr.Column})
+	assert.Contains(t, err.Error(), "no_such_table")
+
+	version, dirty := versionRow(t, pool)
+	assert.Equal(t, int64(2), version)
+	assert.True(t, dirty)
+	assert.False(t, tableExists(t, pool, "postgremq.half_done"), "the failed migration is rolled back")
+	assert.False(t, tableExists(t, pool, "postgremq.after_broken"), "later migrations are not run")
+
+	err = postgremq.MigrateWith(pool, withFailure)
+	var dirtyErr *postgremq.DirtySchemaError
+	require.ErrorAs(t, err, &dirtyErr)
+	assert.Equal(t, uint(2), dirtyErr.Version)
+	assert.False(t, tableExists(t, pool, "postgremq.after_broken"))
+}
+
+// A failed migration's error says where in the file it failed, as
+// golang-migrate's did, and keeps the database error.
+func TestMigration_AFailingMigrationSaysWhereItFailed(t *testing.T) {
+	embedded, err := postgremq.EmbeddedMigrations()
+	require.NoError(t, err)
+	for name, tc := range map[string]struct {
+		sql          string
+		code         string
+		line, column int
+		want         []string
+	}{
+		"syntax error": {
+			// Positions count characters, not bytes.
+			sql:  "-- café ☕\nCREATE TABLE postgremq.t (id int);\n  SELEC 1;\n",
+			code: "42601", line: 3, column: 3,
+			want: []string{"postgremq: migration 9.0.2 (schema version 900000002) failed at line 3, column 3: ", `syntax error at or near "SELEC"`},
+		},
+		"syntax error at the end of the file": {
+			sql:  "CREATE TABLE postgremq.t (id int);\nSELECT (\n",
+			code: "42601", line: 3, column: 1,
+			want: []string{"failed at line 3, column 1: ", "syntax error at end of input"},
+		},
+		"error in a function's definition": {
+			sql:  "CREATE FUNCTION postgremq.f() RETURNS int LANGUAGE sql AS $$\n  SELECT 1;\n  SELECT x FROM no_such_table;\n$$;\n",
+			code: "42P01", line: 3, column: 17,
+			want: []string{"failed at line 3, column 17: ", `relation "no_such_table" does not exist`},
+		},
+		"error while a function runs": {
+			sql: "CREATE FUNCTION postgremq.h() RETURNS bigint LANGUAGE plpgsql AS $$\nBEGIN\n" +
+				"  RETURN (SELECT count(*) FROM no_such_table);\nEND $$;\nSELECT postgremq.h();\n",
+			code: "42P01",
+			want: []string{"query: (SELECT count(*) FROM no_such_table)", "context: PL/pgSQL function postgremq.h() line 3 at RETURN"},
+		},
+		"error with a detail": {
+			sql: "CREATE TABLE postgremq.t (id int PRIMARY KEY);\n" +
+				"INSERT INTO postgremq.t VALUES (1), (1);\n",
+			code: "23505",
+			want: []string{"duplicate key value", "detail: Key (id)=(1) already exists."},
+		},
+		"error in a function body": {
+			sql:  "DO $$\nBEGIN\n  RAISE EXCEPTION 'boom' USING HINT = 'look here';\nEND $$;\n",
+			code: "P0001",
+			want: []string{"boom", "hint: look here", "context: PL/pgSQL function inline_code_block line 3 at RAISE"},
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			pool, _ := setupEmptyTestDatabase(t)
+			err := postgremq.MigrateWith(pool, []postgremq.TestMigration{
+				embedded[0],
+				{Version: 900_000_002, SQL: tc.sql},
+			})
+			var migrationErr *postgremq.MigrationError
+			require.ErrorAs(t, err, &migrationErr)
+			assert.Equal(t, uint(900_000_002), migrationErr.Version)
+			assert.Equal(t, [2]int{tc.line, tc.column}, [2]int{migrationErr.Line, migrationErr.Column})
+			var pgErr *pgconn.PgError
+			require.ErrorAs(t, err, &pgErr)
+			assert.Equal(t, tc.code, pgErr.Code)
+			for _, want := range tc.want {
+				assert.Contains(t, err.Error(), want)
+			}
+		})
+	}
 }
 
 func TestMigration_Concurrent(t *testing.T) {
@@ -262,4 +543,91 @@ func TestMigration_LatestSQLInstallIsCurrent(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, status.LatestVersion, status.CurrentVersion)
 	assert.False(t, status.Dirty)
+}
+
+// PostgreSQL counts an error position in characters of the text converted to
+// the database's encoding; the error is located in the file when that is UTF8
+// or a single-byte encoding.
+func TestMigration_AFailingMigrationIsLocatedInEveryEncoding(t *testing.T) {
+	for _, tc := range []struct{ database, client string }{
+		{"UTF8", ""},
+		{"UTF8", "SQL_ASCII"}, // characters: the UTF8 database takes the bytes as they are
+		{"UTF8", "LATIN1"},    // bytes: each one is converted to a character
+		{"SQL_ASCII", ""},
+		{"SQL_ASCII", "UTF8"}, // bytes: a SQL_ASCII database does not convert
+		{"LATIN1", ""},
+		{"EUC_JP", "UTF8"}, // characters: converted
+	} {
+		t.Run(tc.database+"/"+tc.client, func(t *testing.T) {
+			pool := encodingTestPool(t, tc.database, tc.client)
+
+			// é is two bytes in UTF-8 and one character in every encoding here.
+			err := postgremq.MigrateWith(pool, []postgremq.TestMigration{
+				{Version: 900_000_002, SQL: "-- é é\n  SELEC 1;\n"},
+			})
+
+			var migrationErr *postgremq.MigrationError
+			require.ErrorAs(t, err, &migrationErr)
+			assert.Equal(t, [2]int{2, 3}, [2]int{migrationErr.Line, migrationErr.Column})
+		})
+	}
+}
+
+// The server's position counts neither the file's characters (9 here) nor
+// its bytes (13 with 㡡㡡) when it is in another multibyte encoding: with
+// EUC_JP on both ends it counts the UTF-8 bytes as EUC_JP characters, and
+// converting UTF8 into EUC_JIS_2004 combines か and ゚ into one. The error is
+// reported without a location rather than a wrong one.
+func TestMigration_AFailingMigrationInAnotherMultibyteEncodingIsNotLocated(t *testing.T) {
+	for _, tc := range []struct {
+		database, client, sql string
+		position              int32
+	}{
+		{"EUC_JP", "EUC_JP", "-- 㡡㡡\n  SELEC 1;\n", 10},
+		{"EUC_JIS_2004", "UTF8", "-- \u304b\u309a\n  SELEC 1;\n", 8},
+	} {
+		t.Run(tc.database+"/"+tc.client, func(t *testing.T) {
+			pool := encodingTestPool(t, tc.database, tc.client)
+
+			err := postgremq.MigrateWith(pool, []postgremq.TestMigration{{Version: 900_000_002, SQL: tc.sql}})
+
+			var migrationErr *postgremq.MigrationError
+			require.ErrorAs(t, err, &migrationErr)
+			var pgErr *pgconn.PgError
+			require.ErrorAs(t, err, &pgErr)
+			assert.Equal(t, tc.position, pgErr.Position, "the server reports a position")
+			assert.Equal(t, [2]int{0, 0}, [2]int{migrationErr.Line, migrationErr.Column})
+			assert.NotContains(t, err.Error(), "at line")
+		})
+	}
+}
+
+// encodingTestPool is a pool on a new empty database in encoding, with
+// client_encoding set, or the database's when it is empty.
+func encodingTestPool(t *testing.T, encoding, clientEncoding string) *pgxpool.Pool {
+	t.Helper()
+	ctx := context.Background()
+	name := fmt.Sprintf("pgmq_encoding_%s_%d", strings.ToLower(encoding), time.Now().UnixNano())
+	_, err := sharedServer.adminPool.Exec(ctx, fmt.Sprintf(
+		"CREATE DATABASE %s ENCODING '%s' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0", name, encoding))
+	require.NoError(t, err)
+	cfg := sharedServer.config.Copy()
+	cfg.ConnConfig.Database = name
+	delete(cfg.ConnConfig.RuntimeParams, "client_encoding") // POSTGREMQ_TEST_DATABASE_URL may set one
+	if clientEncoding != "" {
+		cfg.ConnConfig.RuntimeParams["client_encoding"] = clientEncoding
+	}
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		pool.Close()
+		_, _ = sharedServer.adminPool.Exec(context.Background(), "DROP DATABASE IF EXISTS "+name+" WITH (FORCE)")
+	})
+	var got string
+	require.NoError(t, pool.QueryRow(ctx, "SHOW client_encoding").Scan(&got))
+	if clientEncoding == "" {
+		clientEncoding = encoding
+	}
+	require.Equal(t, clientEncoding, got, "client_encoding")
+	return pool
 }
