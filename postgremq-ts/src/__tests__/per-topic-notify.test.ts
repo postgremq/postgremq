@@ -166,6 +166,54 @@ describe('Per-topic NOTIFY', () => {
     }
   });
 
+  test('a message published while the LISTEN session is down is delivered after the reconnect', async () => {
+    const { connection, dropDatabase, pool } = await createIsolatedTestConnection(db);
+    try {
+      await connection.createTopic('GapTopic');
+      await connection.createQueue('GapQueue', 'GapTopic', false);
+      // Only the wake-up after the reconnect can deliver within the bound below.
+      const consumer = connection.consume('GapQueue', { pollingIntervalMs: 30000 });
+      const it = consumer.messages();
+      let previous: unknown;
+      // A round counts only if the publish finished within the shortest
+      // reconnect wait (half the base backoff) of the kill; otherwise the
+      // NOTIFY may have reached the new session.
+      const shortestWait = (Connection as any).NOTIFY_RECONNECT_BASE_MS / 2;
+      let gaps = 0;
+      for (let attempt = 1; gaps < 2; attempt++) {
+        expect(attempt).toBeLessThanOrEqual(4);
+        await waitFor(
+          () => {
+            const client = (connection as any).notifyClient;
+            return !!client && client !== previous && channelState(connection, 'pmq:t:GapTopic')?.listening === true;
+          },
+          10000,
+          50
+        );
+        const client = (connection as any).notifyClient;
+        // Wait like a `for await` loop does: next() fetches once (empty)
+        // and then waits for a wake-up.
+        const next = it.next();
+        await sleep(300);
+        const killed = performance.now();
+        await pool.query('SELECT pg_terminate_backend($1)', [client.processID]);
+        await connection.publish('GapTopic', { attempt });
+        const published = performance.now();
+        const result = await Promise.race([
+          next,
+          sleep(5000).then(() => ({ done: true, value: undefined as any })),
+        ]);
+        expect((result as IteratorResult<any>).done).toBe(false);
+        await (result as IteratorResult<any>).value.ack();
+        if (published - killed < shortestWait) gaps++;
+        previous = client;
+      }
+      await consumer.stop();
+    } finally {
+      await dropDatabase();
+    }
+  });
+
   test('publish wakes consumer end-to-end via per-topic NOTIFY', async () => {
     const { connection, dropDatabase } = await createIsolatedTestConnection(db);
     try {

@@ -2,28 +2,15 @@ package postgremq
 
 import (
 	"context"
-	"crypto/rand"
-	"encoding/hex"
 	"fmt"
+	"math/rand/v2"
+	"net"
 	"sync"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
-
-// controlChannelPrefix is the prefix for the per-instance control channel
-// used to wake the listener loop when subscriptions change. The full name
-// includes a random suffix unique to each EventListener so multiple service
-// instances don't wake each other on every subscription change.
-const controlChannelPrefix = "pmq:control:"
-
-// newControlChannel returns a new control-channel name with a random suffix
-// unique to this EventListener instance.
-func newControlChannel() string {
-	var b [8]byte
-	_, _ = rand.Read(b[:])
-	return controlChannelPrefix + hex.EncodeToString(b[:])
-}
 
 // EventListener subscribes to PostgreSQL LISTEN/NOTIFY events produced by the
 // SQL functions in this schema and fan-outs the signal to in-process
@@ -40,22 +27,20 @@ type EventListener struct {
 	startOnce sync.Once
 	logger    LevelLogger
 
-	// controlChannel is unique per EventListener so a wake signal from one
-	// process doesn't fan out to every other service instance also using
-	// PostgreMQ.
-	controlChannel string
-
 	mu      sync.Mutex
 	desired map[string]int               // channel -> ref count
 	handles map[string][]*ListenerHandle // channel -> active subscriber handles
 
-	// notifyReq is read by a single drainer goroutine that sends NOTIFY
-	// on the control channel. Buffered to size 1 so multiple rapid
-	// subscribe/unsubscribe events coalesce into a single NOTIFY round-trip
-	// — avoids spawning one goroutine per change under churn.
-	notifyReq chan struct{}
-	stopped   chan struct{}
-	wg        sync.WaitGroup
+	// changed records that `desired` changed since the session's last
+	// reconcile; waiting is the session's connection while it waits for a
+	// notification, so a change can interrupt that wait to reconcile at
+	// once. All in-process: applying a subscription change needs no other
+	// connection, so it works even when the pool has none free. Guarded by
+	// mu.
+	changed bool
+	waiting net.Conn
+
+	stopped chan struct{}
 }
 
 // ListenerHandle is returned by AddTopicListener / AddQueueListener and gives
@@ -76,10 +61,12 @@ type ListenerHandle struct {
 }
 
 // Wake returns a channel that fires whenever a NOTIFY for this handle's
-// channel arrives. It carries no payload — NOTIFYs are wake-up signals;
-// consumers re-fetch via consume_message on receipt. The channel is
-// closed when the handle is closed (either explicitly via Close or
-// implicitly by EventListener.Close).
+// channel arrives, and once, without a NOTIFY, when the listener starts
+// listening to the channel (on a new session or a new subscription), since a
+// message published before the LISTEN is never notified. It carries no
+// payload — wakes are signals; consumers re-fetch via consume_message on
+// receipt. The channel is closed when the handle is closed (either
+// explicitly via Close or implicitly by EventListener.Close).
 func (h *ListenerHandle) Wake() <-chan struct{} {
 	return h.ch
 }
@@ -97,15 +84,13 @@ func (h *ListenerHandle) Close() {
 func newEventListener(ctx context.Context, pool Pool, logger LevelLogger) *EventListener {
 	ctx, cancel := context.WithCancel(ctx)
 	el := &EventListener{
-		pool:           pool,
-		ctx:            ctx,
-		cancel:         cancel,
-		logger:         logger,
-		controlChannel: newControlChannel(),
-		desired:        make(map[string]int),
-		handles:        make(map[string][]*ListenerHandle),
-		notifyReq:      make(chan struct{}, 1),
-		stopped:        make(chan struct{}),
+		pool:    pool,
+		ctx:     ctx,
+		cancel:  cancel,
+		logger:  logger,
+		desired: make(map[string]int),
+		handles: make(map[string][]*ListenerHandle),
+		stopped: make(chan struct{}),
 	}
 	close(el.stopped)
 	return el
@@ -128,12 +113,11 @@ func (el *EventListener) addListener(channel string) *ListenerHandle {
 		ch:      make(chan struct{}, 8),
 	}
 	el.mu.Lock()
+	defer el.mu.Unlock()
 	el.desired[channel]++
 	el.handles[channel] = append(el.handles[channel], h)
-	needWake := el.desired[channel] == 1
-	el.mu.Unlock()
-	if needWake {
-		el.signalWake()
+	if el.desired[channel] == 1 {
+		el.markChanged()
 	}
 	return h
 }
@@ -183,45 +167,22 @@ func (el *EventListener) removeAndClose(h *ListenerHandle) {
 	el.desired[h.channel]--
 	if el.desired[h.channel] <= 0 {
 		delete(el.desired, h.channel)
-		// signalWake is non-blocking; safe under the lock. Reconcile
-		// will pick up the now-removed channel and issue UNLISTEN.
-		el.signalWake()
+		// Reconcile will pick up the now-removed channel and issue UNLISTEN.
+		el.markChanged()
 	}
 }
 
-// signalWake asks the drainer goroutine to send a control NOTIFY so the
-// listener's WaitForNotification returns and reconciles. The drainer is a
-// single long-running goroutine — see notifyDrainer — so churn cannot spawn
-// unbounded goroutines or saturate the pool.
-func (el *EventListener) signalWake() {
-	select {
-	case el.notifyReq <- struct{}{}:
-	default:
+// markChanged records a subscription change and interrupts the session's
+// wait for a notification so it reconciles. A burst of changes coalesces
+// into one reconcile. The caller holds el.mu.
+func (el *EventListener) markChanged() {
+	el.changed = true
+	if el.waiting != nil {
+		_ = el.waiting.SetReadDeadline(time.Now())
 	}
 }
 
-// notifyDrainer is the single goroutine responsible for issuing control
-// NOTIFYs. It reads from notifyReq (size 1, coalescing) and runs each Exec
-// sequentially, so a burst of subscribe/unsubscribe calls produces at most
-// one in-flight NOTIFY at a time.
-func (el *EventListener) notifyDrainer() {
-	defer el.wg.Done()
-	for {
-		select {
-		case <-el.ctx.Done():
-			return
-		case <-el.notifyReq:
-			ctx, cancel := context.WithTimeout(el.ctx, 5*time.Second)
-			_, err := el.pool.Exec(ctx, "SELECT pg_notify($1, '')", el.controlChannel)
-			cancel()
-			if err != nil && el.ctx.Err() == nil {
-				el.logger.Warnf("control notify failed: %v", err)
-			}
-		}
-	}
-}
-
-// Start launches the listener and drainer goroutines if not already started.
+// Start launches the listener goroutine if not already started.
 //
 // If Close has already run (ctx is cancelled), Start is a no-op even on the
 // cold path. Without this guard, a Connection.Consume() call that races a
@@ -230,7 +191,7 @@ func (el *EventListener) notifyDrainer() {
 // and returned. Letting startOnce.Do replace el.stopped with a fresh open
 // channel and launch goroutines would leak them past Close: they exit
 // promptly because ctx is cancelled, but Close never waited for the new
-// stopped channel to close, so the wg goroutines linger briefly without
+// stopped channel to close, so the goroutine lingers briefly without
 // synchronization.
 func (el *EventListener) Start() {
 	el.startOnce.Do(func() {
@@ -238,46 +199,58 @@ func (el *EventListener) Start() {
 			return
 		}
 		el.stopped = make(chan struct{})
-		el.wg.Add(1)
-		go el.notifyDrainer()
 		go el.run()
 	})
 }
 
 func (el *EventListener) run() {
 	defer close(el.stopped)
-	backoff := 1 * time.Second
-	maxBackoff := 30 * time.Second
+	minBackoff, maxBackoff := 1*time.Second, 30*time.Second
+	backoff := minBackoff
+	// A session that had been listening this long starts the backoff again.
+	stableAfter := 5 * time.Second
 	for {
 		select {
 		case <-el.ctx.Done():
 			return
 		default:
 		}
-		err := el.session()
+		listening, err := el.session()
 		if el.ctx.Err() != nil {
 			return
 		}
-		el.logger.Warnf("Listener disconnected, reconnecting in %v: %v", backoff, err)
+		var listened time.Duration
+		if !listening.IsZero() {
+			listened = time.Since(listening)
+		}
+		if listened >= stableAfter {
+			backoff = minBackoff
+		}
+		// Jittered within [backoff/2, backoff] so instances that lost their
+		// sessions together do not reconnect in lockstep.
+		delay := backoff - rand.N(backoff/2+1)
+		if listening.IsZero() {
+			el.logger.Warnf("Listener disconnected before listening, reconnecting in %v: %v", delay, err)
+		} else {
+			el.logger.Warnf("Listener disconnected after listening for %v, reconnecting in %v: %v", listened, delay, err)
+		}
 		select {
 		case <-el.ctx.Done():
 			return
-		case <-time.After(backoff):
+		case <-time.After(delay):
 		}
-		backoff = time.Duration(float64(backoff) * 1.5)
-		if backoff > maxBackoff {
-			backoff = maxBackoff
-		}
+		backoff = min(time.Duration(float64(backoff)*1.5), maxBackoff)
 	}
 }
 
-// session holds a dedicated pool connection, issues the control LISTEN, then
-// loops reconciling subscriptions and dispatching notifications. Returns when
-// the underlying connection fails or the context is cancelled.
-func (el *EventListener) session() error {
+// session holds a dedicated pool connection, then loops reconciling
+// subscriptions and dispatching notifications. Returns when the underlying
+// connection fails or the context is cancelled, with the time the session's
+// LISTENs were all in place (zero if they never were).
+func (el *EventListener) session() (listening time.Time, err error) {
 	conn, err := el.pool.Acquire(el.ctx)
 	if err != nil {
-		return fmt.Errorf("acquire listen connection: %w", err)
+		return listening, fmt.Errorf("acquire listen connection: %w", err)
 	}
 	defer func() {
 		// A LISTEN session must never return subscriptions to the shared pool.
@@ -287,31 +260,37 @@ func (el *EventListener) session() error {
 		conn.Release()
 	}()
 
-	if _, err := conn.Exec(el.ctx, "LISTEN "+quoteIdent(el.controlChannel)); err != nil {
-		return fmt.Errorf("listen control channel: %w", err)
-	}
-
 	// Tracks channels we have actually issued LISTEN on with this connection.
 	actual := make(map[string]struct{})
 
-	if err := el.reconcile(el.ctx, conn, actual); err != nil {
-		return fmt.Errorf("initial reconcile: %w", err)
+	// Every reconcile wakes the subscribers of the channels it started
+	// listening to: a message published before a channel's LISTEN is never
+	// notified (on a new session that is every channel, since notifications
+	// sent while no session was listening are lost). The wake comes only
+	// once the LISTENs are in place: a consumer woken earlier could fetch
+	// before them and miss a message published in between.
+	added, err := el.reconcile(el.ctx, conn, actual)
+	if err != nil {
+		return listening, fmt.Errorf("initial reconcile: %w", err)
 	}
+	listening = time.Now()
+	el.dispatch(added...)
 
 	for {
+		notification, err := el.wait(conn)
 		if err := el.ctx.Err(); err != nil {
-			return err
+			return listening, err
 		}
-
-		notification, err := conn.Conn().WaitForNotification(el.ctx)
 		if err != nil {
-			return fmt.Errorf("wait for notification: %w", err)
+			return listening, fmt.Errorf("wait for notification: %w", err)
 		}
 
-		if notification.Channel == el.controlChannel {
-			if err := el.reconcile(el.ctx, conn, actual); err != nil {
-				return fmt.Errorf("reconcile: %w", err)
+		if notification == nil {
+			added, err := el.reconcile(el.ctx, conn, actual)
+			if err != nil {
+				return listening, fmt.Errorf("reconcile: %w", err)
 			}
+			el.dispatch(added...)
 			continue
 		}
 
@@ -321,55 +300,99 @@ func (el *EventListener) session() error {
 	}
 }
 
-// reconcile issues LISTEN/UNLISTEN to bring `actual` in line with `desired`.
-func (el *EventListener) reconcile(ctx context.Context, conn *pgxpool.Conn, actual map[string]struct{}) error {
+// wait returns the session's next notification, or nil when the
+// subscriptions changed (before or during the wait) and must be reconciled.
+//
+// A change interrupts the wait by setting a read deadline on the session's
+// connection, as pgx's default context handling does, but independently of
+// the handler the pool configures (one that sends the server a cancel
+// request would delay the change and open another connection). pgx keeps
+// the connection on a timeout, resumes a message cut short by it, and
+// buffers notifications that arrive during the reconcile's statements,
+// which WaitForNotification returns before it reads.
+func (el *EventListener) wait(conn *pgxpool.Conn) (*pgconn.Notification, error) {
 	el.mu.Lock()
+	if el.changed {
+		el.mu.Unlock()
+		return nil, nil
+	}
+	netConn := conn.Conn().PgConn().Conn()
+	el.waiting = netConn
+	el.mu.Unlock()
+
+	notification, err := conn.Conn().WaitForNotification(el.ctx)
+
+	el.mu.Lock()
+	el.waiting = nil
+	el.mu.Unlock()
+	// A timeout is a change's deadline or a done el.ctx (one with a deadline
+	// times out too), which the session checks before the error.
+	if err != nil && !pgconn.Timeout(err) {
+		return nil, err
+	}
+	// A change may also have set its deadline after the wait returned.
+	if err := netConn.SetReadDeadline(time.Time{}); err != nil {
+		return nil, fmt.Errorf("clear read deadline: %w", err)
+	}
+	return notification, nil
+}
+
+// reconcile issues LISTEN/UNLISTEN to bring `actual` in line with `desired`
+// and returns the channels newly listened to. Changes after its snapshot set
+// `changed` again, so the next wait returns at once for another reconcile.
+func (el *EventListener) reconcile(ctx context.Context, conn *pgxpool.Conn, actual map[string]struct{}) ([]string, error) {
+	el.mu.Lock()
+	el.changed = false
 	desiredSnapshot := make(map[string]struct{}, len(el.desired))
 	for ch := range el.desired {
 		desiredSnapshot[ch] = struct{}{}
 	}
 	el.mu.Unlock()
 
+	var added []string
 	for ch := range desiredSnapshot {
 		if _, ok := actual[ch]; ok {
 			continue
 		}
 		if _, err := conn.Exec(ctx, "LISTEN "+quoteIdent(ch)); err != nil {
-			return fmt.Errorf("LISTEN %q: %w", ch, err)
+			return nil, fmt.Errorf("LISTEN %q: %w", ch, err)
 		}
 		actual[ch] = struct{}{}
+		added = append(added, ch)
 	}
 	for ch := range actual {
 		if _, ok := desiredSnapshot[ch]; ok {
 			continue
 		}
 		if _, err := conn.Exec(ctx, "UNLISTEN "+quoteIdent(ch)); err != nil {
-			return fmt.Errorf("UNLISTEN %q: %w", ch, err)
+			return nil, fmt.Errorf("UNLISTEN %q: %w", ch, err)
 		}
 		delete(actual, ch)
 	}
-	return nil
+	return added, nil
 }
 
 // dispatch delivers a wake event to every subscriber currently registered on
-// the given channel. Sends are non-blocking; full subscriber buffers drop the
+// the given channels. Sends are non-blocking; full subscriber buffers drop the
 // event, since the wake is informational.
 //
 // `el.mu` is held for the entire send loop. The sends are non-blocking so
 // the lock is held only as long as it takes to iterate subscribers and
 // attempt one send each — micro-scale even for many subscribers. Holding
 // the lock makes the close-vs-send race trivial: a concurrent `Close` on
-// any handle on this channel is blocked until we finish; once it acquires
+// any handle on these channels is blocked until we finish; once it acquires
 // the lock, the handle has already been removed (we never see it) or it
 // hasn't been removed yet (we sent on an open channel). Either way, the
 // close happens after our send returns.
-func (el *EventListener) dispatch(channel string) {
+func (el *EventListener) dispatch(channels ...string) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
-	for _, h := range el.handles[channel] {
-		select {
-		case h.ch <- struct{}{}:
-		default:
+	for _, channel := range channels {
+		for _, h := range el.handles[channel] {
+			select {
+			case h.ch <- struct{}{}:
+			default:
+			}
 		}
 	}
 }
@@ -384,7 +407,6 @@ func (el *EventListener) dispatch(channel string) {
 func (el *EventListener) Close() {
 	el.cancel()
 	<-el.stopped
-	el.wg.Wait() // drainer also exits on ctx.Done
 
 	el.mu.Lock()
 	defer el.mu.Unlock()

@@ -235,6 +235,8 @@ export class Connection implements IConnection {
 
   private static readonly NOTIFY_RECONNECT_BASE_MS = 500;
   private static readonly NOTIFY_RECONNECT_MAX_MS = 30000;
+  /** A session that had been listening this long starts the backoff again. */
+  private static readonly NOTIFY_RECONNECT_STABLE_MS = 5000;
 
   /**
    * Create a new connection manager
@@ -435,6 +437,9 @@ export class Connection implements IConnection {
   private async notificationLoop(signal: AbortSignal): Promise<void> {
     let backoff = Connection.NOTIFY_RECONNECT_BASE_MS;
     while (!signal.aborted && !this.isShuttingDown && this.channelStates.size) {
+      // When this session's LISTENs were all in place (performance.now();
+      // undefined: never).
+      let listeningSince: number | undefined;
       try {
         await this.runDatabase(
           async (client) => {
@@ -445,8 +450,8 @@ export class Connection implements IConnection {
               failed = error;
               this.notifyWake[1]();
             };
-            const onNotification = (msg: { channel: string }) => {
-              for (const callback of this.channelStates.get(msg.channel)?.subscribers ?? []) {
+            const wake = (callbacks: Iterable<SubscriberCallback>) => {
+              for (const callback of callbacks) {
                 try {
                   callback();
                 } catch (error) {
@@ -454,11 +459,14 @@ export class Connection implements IConnection {
                 }
               }
             };
+            const onNotification = (msg: { channel: string }) => {
+              wake(this.channelStates.get(msg.channel)?.subscribers ?? []);
+            };
             client.on('error', onError);
             client.on('notification', onNotification);
             try {
               while (!signal.aborted && this.channelStates.size) {
-                const wake = (this.notifyWake = createDeferred<void>());
+                const changed = (this.notifyWake = createDeferred<void>());
                 if (failed) throw failed;
                 for (const channel of actual) {
                   if (!this.channelStates.has(channel)) {
@@ -466,16 +474,30 @@ export class Connection implements IConnection {
                     actual.delete(channel);
                   }
                 }
+                const added: string[] = [];
                 for (const [channel, state] of this.channelStates) {
                   if (!actual.has(channel)) {
                     await client.query('LISTEN ' + quoteIdent(channel));
                     actual.add(channel);
+                    added.push(channel);
                   }
                   state.listening = true;
                 }
-                backoff = Connection.NOTIFY_RECONNECT_BASE_MS;
                 if (failed) throw failed;
-                await wake[0];
+                if (listeningSince === undefined) listeningSince = performance.now();
+                // Wake the subscribers of the channels newly listened to, once
+                // per subscriber: a message published before a channel's
+                // LISTEN is never notified (on a new session that is every
+                // channel, since notifications sent while no session was
+                // listening are lost). The wake comes only once the LISTENs
+                // are in place: a consumer woken earlier could fetch before
+                // them and miss a message published in between.
+                const callbacks = new Set<SubscriberCallback>();
+                for (const channel of added)
+                  for (const callback of this.channelStates.get(channel)?.subscribers ?? [])
+                    callbacks.add(callback);
+                wake(callbacks);
+                await changed[0];
               }
             } finally {
               client.removeListener('notification', onNotification);
@@ -489,13 +511,21 @@ export class Connection implements IConnection {
         );
       } catch (error) {
         if (!signal.aborted && !this.isShuttingDown) {
+          if (
+            listeningSince !== undefined &&
+            performance.now() - listeningSince >= Connection.NOTIFY_RECONNECT_STABLE_MS
+          )
+            backoff = Connection.NOTIFY_RECONNECT_BASE_MS;
+          // Jittered within [backoff/2, backoff] so instances that lost their
+          // sessions together do not reconnect in lockstep.
+          const delay = backoff / 2 + Math.random() * (backoff / 2);
           await new Promise<void>((resolve) => {
             const done = () => {
               clearTimeout(timer);
               signal.removeEventListener('abort', done);
               resolve();
             };
-            const timer = setTimeout(done, backoff);
+            const timer = setTimeout(done, delay);
             signal.addEventListener('abort', done, { once: true });
           });
           backoff = Math.min(backoff * 2, Connection.NOTIFY_RECONNECT_MAX_MS);

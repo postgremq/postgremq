@@ -172,10 +172,12 @@ sqlx `PgPool`) and owns:
   pool on the first consume and holds it until close; TypeScript holds a pooled
   client only while subscriptions exist; Rust uses a separate single-connection
   pool, built from the main pool's connect options, outside the main pool.
-  Subscriptions are reference-counted per channel. After a disconnect the
-  listener reconnects with exponential backoff capped at 30 s and restores
-  its subscriptions; the Rust listener also wakes every subscriber once a new
-  session's LISTENs are in place. Polling remains the fallback;
+  Subscriptions are reference-counted per channel; a channel's subscribers
+  are woken once its LISTEN is in place. After a disconnect the listener
+  reconnects with jittered exponential backoff capped at 30 s (reset after a
+  session that stayed up for 5 s), restores its subscriptions, and wakes
+  every subscriber once the new session's LISTENs are in place. Polling
+  remains the fallback;
 - one **lease-renewal scheduler** for the in-flight deliveries of all its
   consumers;
 - one **keep-alive scheduler** for all exclusive queues it created;

@@ -80,9 +80,12 @@ func TestErrLeaseLost_SetVTAfterExpiry(t *testing.T) {
 		"SetVT after vt expired should be ErrLeaseLost; got %v", err)
 
 	// Release the message so consumer.Stop can drain the in-flight tracker.
-	// Status is still 'processing' and the token still matches; only set_vt
-	// (which checks vt > NOW()) actually fails on lease expiry.
-	require.NoError(t, msg.Release(ctx))
+	// Unless the consumer has already re-claimed the expired message (a
+	// wake-up or poll fetches it again), status is still 'processing' and
+	// the token still matches: only set_vt checks vt > NOW().
+	if err := msg.Release(ctx); err != nil {
+		assert.ErrorIs(t, err, postgremq.ErrLeaseLost)
+	}
 }
 
 // TestErrLeaseLost_NackAfterStolen verifies that a nack from the original

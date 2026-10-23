@@ -319,17 +319,19 @@ next visible time where the client looks it up (below).
 |---|---|---|---|
 | LISTEN connection | acquired from the pool when the first consumer starts; closed, not returned to the pool, when a session ends | a pooled client held while subscriptions exist; destroyed, not returned to the pool, when the session ends | a separate single-connection pool built from the main pool's connect options, outside the main pool; connects once something subscribes |
 | Reconnects | until `Close`, even with no subscribers | while subscriptions exist | while subscriptions exist |
-| Reconnect backoff (no jitter, capped at 30 s) | 1 s, ×1.5 per attempt, never reset | 500 ms, ×2, reset once a session's subscriptions are in place | 250 ms, ×2, reset when a notification arrives |
-| After a (re)connect | subscriptions are restored; no subscriber is woken | subscriptions are restored; no subscriber is woken | every subscriber is woken once its LISTENs are in place, including on the first session |
-| Subscription changes | applied after a NOTIFY on a per-instance control channel | reconciled on every change and after each reconnect | reconciled on every change and after each reconnect |
+| Reconnect backoff (capped at 30 s; each wait jittered within [½, 1] × the backoff; reset after a session that had been listening for 5 s) | 1 s, ×1.5 per attempt | 500 ms, ×2 | 250 ms, ×2 |
+| Wake without a notification | a channel's subscribers are woken once its LISTEN is in place: on every new session (the first one too) all of them, and on a running session those of a channel newly subscribed to | the same | the same |
+| Subscription changes | reconciled on every change (in process, interrupting the session's wait; no other connection needed) and after each reconnect | the same | the same |
 | `get_next_visible_in_ms` lookup | after an empty claim; uses the retry policy | after an empty or partial claim; uses the retry policy | after an empty claim; bounded by 2 s, not retried |
 | Wait when the next row is due but locked | 100 ms | 100 ms | 100 ms |
 | Poll interval (default) | `WithCheckTimeout` (10 s) | `pollingIntervalMs` (1 s) | `check_timeout` (10 s) |
 | Claim bound | 1 s | half the visibility timeout, at least 1 s | `statement_timeout` of half the visibility timeout, between 1 s and 30 s |
 
-A failed claim or lookup is followed by a new attempt after one second. In Go and
-TypeScript, notifications missed while the LISTEN session was down are caught up
-by polling.
+A failed claim or lookup is followed by a new attempt after one second.
+Notifications sent while the LISTEN session was down are lost, and a message
+published before its channel's LISTEN is never notified; the wake-up once the
+LISTEN is in place makes the consumers fetch, so they catch up at once rather
+than at the next poll.
 
 Rust's `ConnectionOptions::notifications(false)` disables LISTEN and relies on
 polling alone, for example behind a transaction-pooling proxy that cannot carry a

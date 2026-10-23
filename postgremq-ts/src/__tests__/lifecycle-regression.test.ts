@@ -139,6 +139,147 @@ test('notification loop survives repeated acquisition failures', async () => {
   }
 });
 
+test('a new notification session wakes every subscriber once its LISTENs are in place', async () => {
+  const { EventEmitter } = await import('events');
+  const sessions: any[] = [];
+  const pool = {
+    on() {},
+    async connect() {
+      const socket = Object.assign(new EventEmitter(), {
+        query: jest.fn(async () => ({ rows: [] })),
+        release: jest.fn(),
+      });
+      sessions.push(socket);
+      return socket;
+    },
+  } as any;
+  const c = new Connection({ pool, shutdownTimeoutMs: 100 });
+  (c as any).connected = true;
+  const original = (Connection as any).NOTIFY_RECONNECT_BASE_MS;
+  (Connection as any).NOTIFY_RECONNECT_BASE_MS = 5;
+  try {
+    let wakes = 0;
+    let listensAtWake = -1;
+    const unsubscribe = c.subscribeForConsumer('q', 't', () => {
+      wakes++;
+      listensAtWake = sessions[sessions.length - 1].query.mock.calls.length;
+    });
+    for (let i = 0; i < 100 && wakes < 1; i++) await sleep(5);
+    // One wake for the consumer's two channels, after both LISTENs.
+    expect(wakes).toBe(1);
+    expect(listensAtWake).toBe(2);
+
+    sessions[0].emit('error', new Error('connection lost'));
+    for (let i = 0; i < 100 && wakes < 2; i++) await sleep(5);
+    expect(sessions.length).toBe(2);
+    expect(wakes).toBe(2);
+    expect(listensAtWake).toBe(2);
+    unsubscribe();
+  } finally {
+    (Connection as any).NOTIFY_RECONNECT_BASE_MS = original;
+    await c.close();
+  }
+});
+
+test('a channel newly listened to on a running session wakes only its subscribers', async () => {
+  const { EventEmitter } = await import('events');
+  const socket = Object.assign(new EventEmitter(), {
+    query: jest.fn(async () => ({ rows: [] })),
+    release: jest.fn(),
+  });
+  const pool = {
+    on() {},
+    async connect() {
+      return socket;
+    },
+  } as any;
+  const c = new Connection({ pool, shutdownTimeoutMs: 100 });
+  (c as any).connected = true;
+  try {
+    let first = 0;
+    let second = 0;
+    let listensAtWake = -1;
+    const offFirst = c.subscribeForConsumer('q1', 't1', () => first++);
+    for (let i = 0; i < 100 && first < 1; i++) await sleep(5);
+    expect(first).toBe(1);
+
+    const offSecond = c.subscribeForConsumer('q2', 't2', () => {
+      second++;
+      listensAtWake = socket.query.mock.calls.length;
+    });
+    for (let i = 0; i < 100 && second < 1; i++) await sleep(5);
+    await sleep(20);
+    // One wake for the new consumer's two channels, after both LISTENs.
+    expect(second).toBe(1);
+    expect(listensAtWake).toBe(4);
+    expect(first).toBe(1);
+
+    // A further subscriber of channels already listened to is not woken.
+    let third = 0;
+    const offThird = c.subscribeForConsumer('q2', 't2', () => third++);
+    await sleep(50);
+    expect(third).toBe(0);
+    expect(socket.query).toHaveBeenCalledTimes(4);
+    offThird();
+    offSecond();
+    offFirst();
+  } finally {
+    await c.close();
+  }
+});
+
+test('the reconnect backoff grows while sessions fail early and starts again after a stable one', async () => {
+  const { EventEmitter } = await import('events');
+  const sessions: any[] = [];
+  const pool = {
+    on() {},
+    async connect() {
+      const socket = Object.assign(new EventEmitter(), {
+        query: jest.fn(async () => ({ rows: [] })),
+        release: jest.fn(),
+      });
+      sessions.push(socket);
+      return socket;
+    },
+  } as any;
+  const c = new Connection({ pool, shutdownTimeoutMs: 100 });
+  (c as any).connected = true;
+  const saved = {
+    base: (Connection as any).NOTIFY_RECONNECT_BASE_MS,
+    stable: (Connection as any).NOTIFY_RECONNECT_STABLE_MS,
+  };
+  (Connection as any).NOTIFY_RECONNECT_BASE_MS = 100;
+  (Connection as any).NOTIFY_RECONNECT_STABLE_MS = 200;
+  // No jitter: each wait is the full backoff.
+  const random = jest.spyOn(Math, 'random').mockReturnValue(1);
+  try {
+    const listening = async (n: number) => {
+      for (let i = 0; i < 400 && (sessions.length < n || sessions[n - 1].query.mock.calls.length < 2); i++)
+        await sleep(5);
+      expect(sessions[n - 1].query.mock.calls.length).toBe(2);
+    };
+    // How long the reconnect after losing session n took.
+    const lose = async (n: number) => {
+      const start = performance.now();
+      sessions[n - 1].emit('error', new Error('connection lost'));
+      await listening(n + 1);
+      return performance.now() - start;
+    };
+    const unsubscribe = c.subscribeForConsumer('q', 't', () => {});
+    await listening(1);
+    expect(await lose(1)).toBeGreaterThanOrEqual(95);
+    expect(await lose(2)).toBeGreaterThanOrEqual(195);
+    await sleep(250);
+    expect(await lose(3)).toBeLessThan(195);
+    unsubscribe();
+  } finally {
+    random.mockRestore();
+    (Connection as any).NOTIFY_RECONNECT_BASE_MS = saved.base;
+    (Connection as any).NOTIFY_RECONNECT_STABLE_MS = saved.stable;
+    await c.close();
+  }
+});
+
 test('failed queue deletion does not stop its keepalive', async () => {
   const c = client();
   const entry = {
