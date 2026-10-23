@@ -34,8 +34,7 @@ type Consumer struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	dbCtx              context.Context  // some operations must not be cancelled by consumer stop
-	topicHandle        *ListenerHandle  // wakes on per-topic publish notifications and when its LISTEN is (re)established
-	queueHandle        *ListenerHandle  // wakes on nack/release for this queue and when its LISTEN is (re)established
+	wakeHandle         *ListenerHandle  // wakes on topic publishes, queue nack/release, and (re)established LISTENs
 	done               chan struct{}    // closed when run() exits
 	fetched            chan fetchResult // a fetch goroutine reports its batch here
 	completed          chan string      // a settled message reports its trackingID here
@@ -61,7 +60,7 @@ type fetchResult struct {
 	cause  error
 }
 
-func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger LevelLogger, queue string, topicHandle, queueHandle *ListenerHandle, options consumeOptions) (*Consumer, error) {
+func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger LevelLogger, queue string, wakeHandle *ListenerHandle, options consumeOptions) (*Consumer, error) {
 	// Validate options
 	if err := validateConsumeOptions(&options); err != nil {
 		return nil, err
@@ -85,8 +84,7 @@ func newConsumerFromOptions(parentCtx context.Context, conn *Connection, logger 
 		ctx:                ctx,
 		cancel:             cancel,
 		dbCtx:              dbCtx,
-		topicHandle:        topicHandle,
-		queueHandle:        queueHandle,
+		wakeHandle:         wakeHandle,
 		done:               make(chan struct{}),
 		fetched:            make(chan fetchResult, 1),
 		completed:          make(chan string, max(options.batchSize, 64)),
@@ -111,8 +109,7 @@ func (c *Consumer) run() {
 	defer close(c.done)
 	defer c.signalClose()
 	defer c.conn.unregisterConsumer(c)
-	defer c.topicHandle.Close()
-	defer c.queueHandle.Close()
+	defer c.wakeHandle.Close()
 
 	outbox := make([]*Message, 0, c.batchSize)
 	inflight := make(map[string]*Message)
@@ -129,8 +126,7 @@ func (c *Consumer) run() {
 	ioDone := c.dbCtx.Done()
 	fetchAfter := time.Now() // fetch immediately on start
 
-	topicCh := c.topicHandle.Wake()
-	queueCh := c.queueHandle.Wake()
+	wakeCh := c.wakeHandle.Wake()
 
 	// armFetch (re)arms the fetch timer only while a fetch is eligible — not
 	// fetching, not shutting, and the outbox is empty — otherwise it disarms by
@@ -191,18 +187,9 @@ func (c *Consumer) run() {
 			}
 			clear(inflight)
 
-		case _, ok := <-topicCh:
+		case _, ok := <-wakeCh:
 			if !ok {
-				topicCh = nil // listener closed; rely on queue/timer wake
-				break
-			}
-			fetchAfter = time.Now()
-			wokeDuringFetch = fetching
-			armFetch()
-
-		case _, ok := <-queueCh:
-			if !ok {
-				queueCh = nil
+				wakeCh = nil // listener closed; rely on the timer
 				break
 			}
 			fetchAfter = time.Now()
@@ -273,11 +260,9 @@ func (c *Consumer) run() {
 			// ctx.Done set `shutting` without re-arming (that path doesn't
 			// disarm), so a late fire must not start a fetch during shutdown.
 			if !fetching && !shutting && len(outbox) == 0 {
-				// This fetch covers the wakes already queued, such as both
-				// channels' when they are listened to again after a
-				// reconnect: drop them rather than fetch again.
-				drainWakes(topicCh)
-				drainWakes(queueCh)
+				// This fetch covers the wakes already queued: drop them
+				// rather than fetch again.
+				drainWakes(wakeCh)
 				fetching = true
 				go c.fetchInto()
 			}
@@ -459,7 +444,7 @@ func (c *Consumer) Messages() <-chan *Message {
 //  5. Cancels the StoppedCtx context on all in-flight messages to signal the
 //     application that shutdown is in progress.
 //  6. Waits for all in-flight messages to be completed (Ack/Nack/Release).
-//  7. Closes the consumer's event-listener handles.
+//  7. Closes the consumer's event-listener handle.
 //
 // This method is safe to call multiple times - subsequent calls are no-ops.
 //
@@ -486,11 +471,8 @@ func (c *Consumer) Messages() <-chan *Message {
 func (c *Consumer) Stop() {
 	c.cancel()
 	<-c.done
-	if c.topicHandle != nil {
-		c.topicHandle.Close()
-	}
-	if c.queueHandle != nil {
-		c.queueHandle.Close()
+	if c.wakeHandle != nil {
+		c.wakeHandle.Close()
 	}
 }
 

@@ -201,7 +201,7 @@ func (c *Connection) Close() error {
 		c.cancel()
 
 		// Stop the event listener first. This closes every consumer's wake
-		// channels, so consumers stop pulling new messages immediately while
+		// channel, so consumers stop pulling new messages immediately while
 		// they finish processing whatever they already prefetched. Their
 		// Stop() calls below then become a clean drain.
 		c.eventListener.Close()
@@ -452,12 +452,10 @@ func (c *Connection) Consume(queue string, opts ...ConsumeOption) (*Consumer, er
 	if err := c.checkClosed(); err != nil {
 		return nil, err
 	}
-	topicHandle := c.eventListener.AddTopicListener(topic)
-	queueHandle := c.eventListener.AddQueueListener(queue)
-	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, topicHandle, queueHandle, options)
+	wakeHandle := c.eventListener.addConsumerListener(topic, queue)
+	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, wakeHandle, options)
 	if err != nil {
-		topicHandle.Close()
-		queueHandle.Close()
+		wakeHandle.Close()
 		return nil, err
 	}
 	c.consumers = append(c.consumers, consumer)
@@ -542,12 +540,10 @@ func (c *Connection) ConsumeHandler(
 		return nil, err
 	}
 
-	topicHandle := c.eventListener.AddTopicListener(topic)
-	queueHandle := c.eventListener.AddQueueListener(queue)
-	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, topicHandle, queueHandle, options.consumeOptions)
+	wakeHandle := c.eventListener.addConsumerListener(topic, queue)
+	consumer, err := newConsumerFromOptions(c.ctx, c, c.logger, queue, wakeHandle, options.consumeOptions)
 	if err != nil {
-		topicHandle.Close()
-		queueHandle.Close()
+		wakeHandle.Close()
 		return nil, err
 	}
 
