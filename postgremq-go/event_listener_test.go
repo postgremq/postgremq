@@ -764,8 +764,8 @@ func (c *consumeCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data 
 func (c *consumeCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
 
 // TestEventListener_ReconnectFetchesOnce kills the LISTEN session: the new
-// session wakes a consumer on both its channels (topic and queue), and the
-// consumer fetches once for the two.
+// session listens again to both of a consumer's channels (topic and queue)
+// and wakes the consumer once for the two, so it fetches once.
 func TestEventListener_ReconnectFetchesOnce(t *testing.T) {
 	t.Parallel()
 	pool, ctx := setupTestConnection(t)
@@ -839,6 +839,49 @@ func TestEventListener_NewChannelWakesItsSubscribers(t *testing.T) {
 		t.Fatal("a channel already listened to was woken")
 	case <-time.After(200 * time.Millisecond):
 	}
+}
+
+// TestEventListener_ConsumerHandleWokenOnce subscribes one handle to two
+// channels, as a consumer does: once both are listened to, it is woken once,
+// not once per channel, and a NOTIFY on either of them wakes it. Closing the
+// listener closes its wake channel once.
+func TestEventListener_ConsumerHandleWokenOnce(t *testing.T) {
+	t.Parallel()
+	pool, _ := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	el := conn.EventListener()
+	el.Start()
+
+	h := el.AddConsumerListener("OnceTopic", "OnceQueue")
+	select {
+	case <-h.Wake():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the handle was not woken once its channels were listened to")
+	}
+	select {
+	case <-h.Wake():
+		t.Fatal("the handle was woken once per channel")
+	case <-time.After(200 * time.Millisecond):
+	}
+	for _, channel := range []string{"pmq:t:OnceTopic", "pmq:q:OnceQueue"} {
+		_, err := pool.Exec(context.Background(), "SELECT pg_notify($1, '')", channel)
+		require.NoError(t, err)
+		select {
+		case <-h.Wake():
+		case <-time.After(5 * time.Second):
+			t.Fatalf("a NOTIFY on %s did not wake the handle", channel)
+		}
+	}
+
+	require.NoError(t, conn.Close())
+	_, ok := <-h.Wake()
+	assert.False(t, ok, "closing the listener closes the handle's wake channel")
+	h.Close()
 }
 
 // TestEventListener_SubscribeWhilePoolExhausted subscribes to a new channel

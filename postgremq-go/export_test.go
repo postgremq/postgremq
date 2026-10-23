@@ -23,6 +23,12 @@ func (el *EventListener) SubscriberCount(channel string) int {
 	return el.desired[channel]
 }
 
+// AddConsumerListener exposes addConsumerListener, the one handle a consumer
+// subscribes to its topic and queue channels with. Tests only.
+func (el *EventListener) AddConsumerListener(topic, queue string) *ListenerHandle {
+	return el.addConsumerListener(topic, queue)
+}
+
 // StoppedChan returns the current el.stopped channel for identity comparison
 // in tests. newEventListener seeds it with an already-closed channel; Start
 // replaces it with a fresh open one when it actually launches goroutines.

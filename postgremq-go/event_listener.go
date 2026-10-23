@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"slices"
 	"sync"
 	"time"
 
@@ -43,8 +44,9 @@ type EventListener struct {
 	stopped chan struct{}
 }
 
-// ListenerHandle is returned by AddTopicListener / AddQueueListener and gives
-// the caller a wake channel plus a Close function to drop the subscription.
+// ListenerHandle is returned by AddTopicListener / AddQueueListener (and, for
+// a consumer, addConsumerListener) and gives the caller a wake channel plus a
+// Close function to drop the subscription.
 //
 // Synchronization. The wake channel is closed exactly once, by whichever of
 // `handle.Close()` or `EventListener.Close()` reaches the handle first. The
@@ -55,14 +57,14 @@ type EventListener struct {
 //     wake channel under the same lock; once it returns, no further dispatch
 //     will see this handle.
 type ListenerHandle struct {
-	el      *EventListener
-	channel string
-	ch      chan struct{}
+	el       *EventListener
+	channels []string
+	ch       chan struct{}
 }
 
-// Wake returns a channel that fires whenever a NOTIFY for this handle's
-// channel arrives, and once, without a NOTIFY, when the listener starts
-// listening to the channel (on a new session or a new subscription), since a
+// Wake returns a channel that fires whenever a NOTIFY for one of this
+// handle's channels arrives, and once, without a NOTIFY, when the listener
+// starts listening to them (on a new session or a new subscription), since a
 // message published before the LISTEN is never notified. It carries no
 // payload — wakes are signals; consumers re-fetch via consume_message on
 // receipt. The channel is closed when the handle is closed (either
@@ -106,18 +108,30 @@ func (el *EventListener) AddQueueListener(queue string) *ListenerHandle {
 	return el.addListener("pmq:q:" + queue)
 }
 
-func (el *EventListener) addListener(channel string) *ListenerHandle {
+// addConsumerListener subscribes one handle to both of a consumer's
+// channels, so the wake when the listener starts listening to them is one
+// wake, not one per channel: a consumer woken by the first could start
+// fetching before the second and fetch again for it.
+func (el *EventListener) addConsumerListener(topic, queue string) *ListenerHandle {
+	return el.addListener("pmq:t:"+topic, "pmq:q:"+queue)
+}
+
+// addListener subscribes one handle to channels, which are distinct and at
+// least one.
+func (el *EventListener) addListener(channels ...string) *ListenerHandle {
 	h := &ListenerHandle{
-		el:      el,
-		channel: channel,
-		ch:      make(chan struct{}, 8),
+		el:       el,
+		channels: channels,
+		ch:       make(chan struct{}, 8),
 	}
 	el.mu.Lock()
 	defer el.mu.Unlock()
-	el.desired[channel]++
-	el.handles[channel] = append(el.handles[channel], h)
-	if el.desired[channel] == 1 {
-		el.markChanged()
+	for _, channel := range channels {
+		el.desired[channel]++
+		el.handles[channel] = append(el.handles[channel], h)
+		if el.desired[channel] == 1 {
+			el.markChanged()
+		}
 	}
 	return h
 }
@@ -137,39 +151,36 @@ func (el *EventListener) removeAndClose(h *ListenerHandle) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
 
-	subscribers := el.handles[h.channel]
-	idx := -1
-	for i, s := range subscribers {
-		if s == h {
-			idx = i
-			break
-		}
-	}
-	if idx < 0 {
+	// A handle is on all its channels or (removed) on none.
+	if !slices.Contains(el.handles[h.channels[0]], h) {
 		// Already removed — wake channel was closed by whoever removed it.
 		return
 	}
 
-	// Remove from the subscriber list (order doesn't matter; dispatch
-	// iterates all entries).
-	subscribers[idx] = subscribers[len(subscribers)-1]
-	subscribers = subscribers[:len(subscribers)-1]
-	if len(subscribers) == 0 {
-		delete(el.handles, h.channel)
-	} else {
-		el.handles[h.channel] = subscribers
+	for _, channel := range h.channels {
+		// Remove from the subscriber list (order doesn't matter; dispatch
+		// iterates all entries).
+		subscribers := el.handles[channel]
+		idx := slices.Index(subscribers, h)
+		subscribers[idx] = subscribers[len(subscribers)-1]
+		subscribers = subscribers[:len(subscribers)-1]
+		if len(subscribers) == 0 {
+			delete(el.handles, channel)
+		} else {
+			el.handles[channel] = subscribers
+		}
+
+		el.desired[channel]--
+		if el.desired[channel] <= 0 {
+			delete(el.desired, channel)
+			// Reconcile will pick up the now-removed channel and issue UNLISTEN.
+			el.markChanged()
+		}
 	}
 
 	// Close the wake channel under the lock so dispatch (which holds the
 	// same lock during its sends) cannot race us.
 	close(h.ch)
-
-	el.desired[h.channel]--
-	if el.desired[h.channel] <= 0 {
-		delete(el.desired, h.channel)
-		// Reconcile will pick up the now-removed channel and issue UNLISTEN.
-		el.markChanged()
-	}
 }
 
 // markChanged records a subscription change and interrupts the session's
@@ -373,8 +384,9 @@ func (el *EventListener) reconcile(ctx context.Context, conn *pgxpool.Conn, actu
 }
 
 // dispatch delivers a wake event to every subscriber currently registered on
-// the given channels. Sends are non-blocking; full subscriber buffers drop the
-// event, since the wake is informational.
+// the given channels, once per subscriber even if it is on several of them.
+// Sends are non-blocking; full subscriber buffers drop the event, since the
+// wake is informational.
 //
 // `el.mu` is held for the entire send loop. The sends are non-blocking so
 // the lock is held only as long as it takes to iterate subscribers and
@@ -387,8 +399,13 @@ func (el *EventListener) reconcile(ctx context.Context, conn *pgxpool.Conn, actu
 func (el *EventListener) dispatch(channels ...string) {
 	el.mu.Lock()
 	defer el.mu.Unlock()
+	woken := make(map[*ListenerHandle]bool)
 	for _, channel := range channels {
 		for _, h := range el.handles[channel] {
+			if woken[h] {
+				continue
+			}
+			woken[h] = true
 			select {
 			case h.ch <- struct{}{}:
 			default:
@@ -410,9 +427,13 @@ func (el *EventListener) Close() {
 
 	el.mu.Lock()
 	defer el.mu.Unlock()
+	closed := make(map[*ListenerHandle]bool)
 	for _, subs := range el.handles {
 		for _, h := range subs {
-			close(h.ch)
+			if !closed[h] {
+				closed[h] = true
+				close(h.ch)
+			}
 		}
 	}
 	el.handles = make(map[string][]*ListenerHandle)
