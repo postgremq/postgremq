@@ -50,11 +50,17 @@ golang-migrate's: the version table `postgremq.postgremq_migrations` (one row,
 `version` and `dirty`), the same advisory lock, and a `dirty` flag set while a
 migration runs. Any of them can therefore upgrade a database another one
 installed. Migrations only go up, to the latest version the client embeds; a
-database already at a newer version is left unchanged, and a dirty one is an
-error. `GetMigrationStatus` / `getMigrationStatus` / `migration_status` and
-`postgremq status` only read, and work before installation too. To use the
-golang-migrate CLI directly, create the schema first and point it at the
-numbered migrations (an mq release's `postgremq-migrations-vX.Y.Z.tar.gz`, or
+database already at a newer version is left unchanged. A dirty one is an
+error, and so is a recorded version below the latest that is none of the
+migrations (no upgrade from it is known). A failed migration leaves its version
+dirty (it is rolled back when the database reports the error; after a lost
+connection its outcome is unknown), and its error gives the version and, when
+PostgreSQL reports a position the client can map, the line and column in the
+migration's file. Every client reports these three as typed errors.
+`GetMigrationStatus` / `getMigrationStatus` / `migration_status` and `postgremq
+status` only read, and work before installation too. To use the golang-migrate
+CLI directly, create the schema first and point it at the numbered migrations
+(an mq release's `postgremq-migrations-vX.Y.Z.tar.gz`, or
 `postgremq-go/migrations/` in the repository) and the same version table:
 
 ```sh

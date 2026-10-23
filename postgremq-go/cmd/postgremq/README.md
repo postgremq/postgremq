@@ -76,9 +76,8 @@ postgremq migrate --dsn <connection-string>
 
 `migrate` first prints the current and latest versions. It then:
 
-- exits with an error if the database is in a dirty state (see [Dirty state](#dirty-state));
-- prints `✓ Database is up to date` and exits if no migration is pending. This includes a database already at a newer version than the CLI's latest (migrated by a newer release), which is left unchanged;
-- otherwise prints `Running migrations...`, creates the `postgremq` schema if needed, and applies the pending migrations up to the latest version.
+- prints `✓ Database is up to date` and exits if no migration is pending and the database is not dirty. This includes a database already at a newer version than the CLI's latest (migrated by a newer release), which is left unchanged;
+- otherwise prints `Running migrations...`, waits for any migration another process is running (the version reads dirty while it does), creates the `postgremq` schema if needed, and applies the pending migrations up to the latest version. It exits with an error if the database is still dirty then (see [Dirty state](#dirty-state)).
 
 ```bash
 postgremq migrate --dsn "postgres://postgres:postgres@localhost:5432/mydb"
@@ -146,7 +145,7 @@ The version is stored in the single-row table `postgremq.postgremq_migrations`, 
 | `version` | `bigint` (primary key) | Last applied migration's mq version, as X×10⁸ + Y×10⁴ + Z |
 | `dirty` | `boolean` | `true` if that migration started but did not finish |
 
-Migrations are applied with [golang-migrate](https://github.com/golang-migrate/migrate) from the SQL files embedded from the Go client's copy of `mq/migrations/` (`postgremq-go/migrations/`, under numbered names such as `000010000_0.1.0.up.sql`).
+Migrations are applied by the Go client's built-in runner from the SQL files embedded from its copy of `mq/migrations/` (`postgremq-go/migrations/`, under numbered names such as `000010000_0.1.0.up.sql`). It follows [golang-migrate](https://github.com/golang-migrate/migrate)'s protocol (this version table, its advisory lock and dirty flag), as the TypeScript and Rust clients do, so a database that golang-migrate or another client migrated can be upgraded by any of them.
 
 ## Required privileges
 
@@ -196,20 +195,31 @@ Common messages:
 | `failed to get migration status: failed to connect to ...` | The server cannot be reached, or authentication failed |
 | `failed to get migration status: ERROR: permission denied for schema postgremq ...` | The role cannot use the `postgremq` schema |
 | `database is in dirty state - manual intervention required` | See [Dirty state](#dirty-state) |
-| `migration failed: migration failed: ...` | A migration failed |
-| `migration failed: failed to create queue schema: ...` | The role lacks `CREATE` on the database |
+| `postgremq: migration 0.2.0 (schema version 20000) failed at line 12, column 3: ERROR: ... (SQLSTATE ...)` | A migration failed and its version is left dirty (see [Dirty state](#dirty-state)). The line and column are in that migration's file, `mq/migrations/0.2.0.up.sql`, when PostgreSQL reports a position the client can map (errors in a function's definition included; not with a multibyte database or client encoding other than UTF8, such as EUC_JP). An `ERROR ... (SQLSTATE ...)` from the server means the migration was rolled back; after a lost connection or timeout, check what it changed. The server's `detail`, `hint`, the failing `query` inside a function and the `context` follow when it sends them |
+| `migration failed: failed to create queue schema: ...` | The role lacks `CREATE` on the database (the `postgremq` schema is missing) or on the `postgremq` schema (its version table is missing) |
+| `postgremq: database schema version N (mq X.Y.Z) is not one of this client's migrations, so no upgrade from it is known` | The recorded version is below this release's latest migration but is none of them, so no migration path from it is known; no migration is applied |
 
 ### Dirty state
 
-If a migration fails partway, golang-migrate leaves `dirty = true` with `version` set to the migration that failed. `migrate` refuses to run until you fix it:
+If a migration fails, or `migrate` is killed or loses its connection while it runs, the database is left with `dirty = true` and `version` set to that migration. `migrate` refuses to run until you fix it:
 
-1. Inspect the version row and the `postgremq` schema to see what the failed migration actually changed:
+1. Make sure no migration is still running. A killed `migrate`'s server session usually keeps running the migration file, which is one transaction, and commits it at the end; it rolls it back instead if it notices the lost client first (for example when a statement sends a notice). Either way the version stays dirty. The migrating session holds an advisory lock:
+
+   ```sql
+   SELECT a.pid, a.state, a.query_start, left(a.query, 60)
+   FROM pg_locks l JOIN pg_stat_activity a USING (pid)
+   WHERE l.locktype = 'advisory' AND l.granted AND a.datname = current_database();
+   ```
+
+   Wait for it to finish, or end it with `SELECT pg_terminate_backend(<pid>)`, which rolls the migration back.
+
+2. Inspect the version row and the `postgremq` schema to see what the failed migration actually changed:
 
    ```sql
    SELECT version, dirty FROM postgremq.postgremq_migrations;
    ```
 
-2. Bring the schema to a consistent state, then record that state:
+3. Bring the schema to a consistent state, then record that state:
 
    - If the failed migration's changes are fully in place, clear the flag:
 
@@ -225,7 +235,7 @@ If a migration fails partway, golang-migrate leaves `dirty = true` with `version
      DELETE FROM postgremq.postgremq_migrations;
      ```
 
-3. Run `postgremq migrate` again.
+4. Run `postgremq migrate` again.
 
 Do not just clear the flag when the migration did not complete. `migrate` and `status` would then report the database as up to date while it is missing the schema changes.
 

@@ -47,8 +47,15 @@ version table and advisory lock as the Go client and the
 [migration CLI](https://github.com/postgremq/postgremq/blob/main/postgremq-go/cmd/postgremq/README.md),
 so concurrent callers are safe and any of them can upgrade a database another
 one installed. A database already at a newer version (migrated by a newer
-release) is left unchanged. A dirty database (a migration failed partway) is
-`Error::DirtySchema`. `migrate` creates the `postgremq` schema when it is
+release) is left unchanged. A failed migration is `Error::Migration` (its
+version is left dirty, and it was rolled back when the database reported the
+error; it has the `version`, and the `position` (line and column) in the
+migration's file when PostgreSQL reports one it can map; the database error
+is its source, and the message adds its detail, hint, failing query inside a
+function and context). A dirty database (a migration failed
+partway) is `Error::DirtySchema`, and a recorded version below the latest
+that is none of the migrations, from which no upgrade is known, is
+`Error::UnknownSchemaVersion`. `migrate` creates the `postgremq` schema when it is
 missing, which needs the `CREATE` privilege on the database. You can also
 install the schema from
 [`mq/sql/latest.sql`](https://github.com/postgremq/postgremq/blob/main/mq/sql/latest.sql)
@@ -526,6 +533,10 @@ SQLSTATE when the error came from the database.
 | `Busy` | `55P03`: a row lock was contended after retries; lease ownership is unaffected, retry within the lease |
 | `QueueGone` | The consumer's queue is gone; ends the consumer |
 | `Payload` | A payload could not be serialized or deserialized as JSON |
+| `Incompatible` | The database's PostgreMQ schema is on an mq line this client does not support, or is not installed |
+| `Migration` | A migration failed in `migrate`; its version is left dirty. `position` (a `SqlPosition`) locates the error in the migration's file when PostgreSQL reports a position it can map (not in an EUC_JIS_2004 database); the database error is the source |
+| `DirtySchema` | `migrate` found a migration that failed partway; the schema needs manual repair |
+| `UnknownSchemaVersion` | `migrate` found a recorded version below its latest migration that is none of its migrations; nothing is applied |
 | `Closed` | The connection is closing or closed, or the shutdown deadline abandoned the call |
 | `Sqlx` | Any other database or driver error |
 
@@ -627,7 +638,7 @@ cargo test --all-features   # also runs the metrics contract tests
 Without further setup, the tests start (or reuse) a `postgres:15` container
 named `postgremq-rs-test` through testcontainers and keep it for later runs
 (remove it with `docker rm -f postgremq-rs-test`). To use an existing
-PostgreSQL 15+ server instead, whose user can create databases:
+PostgreSQL 15+ server instead, whose user can create databases and roles:
 
 ```sh
 export POSTGREMQ_TEST_DATABASE_URL=postgres://postgres:postgres@localhost:5432/postgres

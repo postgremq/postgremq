@@ -2,9 +2,9 @@
 //! with `mq/sql/latest.sql` installed.
 //!
 //! The server is `POSTGREMQ_TEST_DATABASE_URL` when set (a PostgreSQL 15+
-//! server whose user can create databases); otherwise the harness starts (or
-//! reuses) a `postgres:15` container named `postgremq-rs-test` itself (Docker
-//! required). It is kept for later runs; remove it with
+//! server whose user can create databases and roles); otherwise the harness
+//! starts (or reuses) a `postgres:15` container named `postgremq-rs-test`
+//! itself (Docker required). It is kept for later runs; remove it with
 //! `docker rm -f postgremq-rs-test`.
 //! The template is named after a hash of the schema, so a schema change gets
 //! a fresh template.
@@ -179,9 +179,21 @@ impl TestDb {
 
     /// A fresh database WITHOUT the PostgreMQ schema (for migration tests).
     pub(crate) async fn empty() -> Self {
+        Self::create_empty(String::new()).await
+    }
+
+    /// Like [`empty`](Self::empty), in the given database encoding.
+    pub(crate) async fn empty_with_encoding(encoding: &str) -> Self {
+        Self::create_empty(format!(
+            " ENCODING '{encoding}' LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"
+        ))
+        .await
+    }
+
+    async fn create_empty(options: String) -> Self {
         let name = format!("pmq_rs_empty_{}", uuid::Uuid::new_v4().simple());
         let mut admin = admin().await;
-        ddl(&mut admin, format!("CREATE DATABASE {name}"))
+        ddl(&mut admin, format!("CREATE DATABASE {name}{options}"))
             .await
             .unwrap();
         admin.close().await.unwrap();

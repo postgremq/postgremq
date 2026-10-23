@@ -30,7 +30,7 @@ func setupSkewedDatabase(t *testing.T, skew time.Duration) (plain, skewed *pgxpo
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		plain.Close()
-		_, _ = sharedContainer.adminPool.Exec(context.Background(), fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", dbName))
+		_, _ = sharedServer.adminPool.Exec(context.Background(), fmt.Sprintf("DROP DATABASE IF EXISTS %s WITH (FORCE)", dbName))
 	})
 	_, err = plain.Exec(ctx, fmt.Sprintf(`
 		CREATE SCHEMA skew;

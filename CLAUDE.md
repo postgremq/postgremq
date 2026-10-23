@@ -91,11 +91,11 @@ go test -v -run TestConsumer_BasicFlow
 # Run benchmarks
 go test -bench=. -benchmem
 
-# Run integration tests (uses testcontainers)
+# Run integration tests (a postgres:15 container, or POSTGREMQ_TEST_DATABASE_URL)
 go test -v -tags=integration ./...
 ```
 
-**Note**: Go tests also use testcontainers for PostgreSQL. Integration tests may take longer on first run due to container image pulls.
+**Note**: Go tests use `POSTGREMQ_TEST_DATABASE_URL` when set; otherwise `internal/testserver` builds and runs a launcher (a separate module, `internal/testserver/launcher`, so testcontainers-go stays out of the library's go.mod) that starts a `postgres:15` container and removes it when its stdin closes. The first run may take longer due to the image pull.
 
 ### SQL/Core (mq/)
 
@@ -113,7 +113,7 @@ pytest tests/tests.py -v --cov
 ## Testing Patterns
 
 ### Both clients use testcontainers
-- PostgreSQL 15 container spins up automatically for tests
+- PostgreSQL 15 container spins up automatically for tests (Go, TypeScript and Rust use the server of `POSTGREMQ_TEST_DATABASE_URL` instead when it is set, creating their own databases on it)
 - Each test session creates a unique test database
 - Schema loaded from `mq/sql/latest.sql`
 - Tests are isolated and can be run in parallel (except TypeScript which runs serially)

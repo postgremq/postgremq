@@ -34,6 +34,8 @@ export {
   ConnectionClosedError,
   QueueFatalError,
   DirtySchemaError,
+  UnknownSchemaVersionError,
+  MigrationError,
   CompatibilityError,
   ErrCodeLeaseLost,
   ErrCodeQueueNotFound,

@@ -5,30 +5,30 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"hash/crc32"
 	"os"
 	"os/exec"
 	"regexp"
 	"strconv"
-	"strings"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+
+	"postgremq.dev/postgremq-go/internal/testserver"
 )
 
-type postgresContainer struct {
-	container testcontainers.Container
-	dsn       string
-	pool      *pgxpool.Pool
+type testServer struct {
+	server *testserver.Server
+	pool   *pgxpool.Pool
 }
 
 var (
-	sharedContainer *postgresContainer
-	cliBinary       string
+	sharedServer *testServer
+	cliBinary    string
 )
 
 func TestMain(m *testing.M) {
@@ -42,10 +42,10 @@ func TestMain(m *testing.M) {
 	}
 	cliBinary = tmpBinary
 
-	// Start PostgreSQL container
-	sharedContainer, err = newPostgresContainer(ctx)
+	// Connect to POSTGREMQ_TEST_DATABASE_URL, or start a PostgreSQL container
+	sharedServer, err = newTestServer(ctx)
 	if err != nil {
-		fmt.Printf("Failed to start postgres container: %v\n", err)
+		fmt.Printf("Failed to start the test server: %v\n", err)
 		os.RemoveAll(cliBinary)
 		os.Exit(1)
 	}
@@ -54,9 +54,7 @@ func TestMain(m *testing.M) {
 	exitCode := m.Run()
 
 	// Cleanup
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	sharedContainer.cleanup(cleanupCtx)
+	sharedServer.cleanup()
 	os.RemoveAll(cliBinary)
 
 	os.Exit(exitCode)
@@ -83,61 +81,29 @@ func buildCLI() (string, error) {
 	return binaryPath, nil
 }
 
-func newPostgresContainer(ctx context.Context) (*postgresContainer, error) {
-	req := testcontainers.ContainerRequest{
-		Image:        "postgres:15",
-		ExposedPorts: []string{"5432/tcp"},
-		Env: map[string]string{
-			"POSTGRES_USER":     "postgres",
-			"POSTGRES_PASSWORD": "postgres",
-			"POSTGRES_DB":       "postgres",
-		},
-		WaitingFor: wait.ForAll(
-			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
-			wait.ForListeningPort("5432/tcp"),
-		).WithDeadline(30 * time.Second),
+func newTestServer(ctx context.Context) (*testServer, error) {
+	server, err := testserver.Start(ctx)
+	if err != nil {
+		return nil, err
 	}
 
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
+	pool, err := pgxpool.New(ctx, server.URL)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start container: %w", err)
-	}
-
-	mappedPort, err := container.MappedPort(ctx, "5432")
-	if err != nil {
-		_ = container.Terminate(ctx)
-		return nil, fmt.Errorf("failed to get mapped port: %w", err)
-	}
-
-	host, err := container.Host(ctx)
-	if err != nil {
-		_ = container.Terminate(ctx)
-		return nil, fmt.Errorf("failed to get host: %w", err)
-	}
-
-	dsn := fmt.Sprintf("postgres://postgres:postgres@%s:%s/postgres?sslmode=disable", host, mappedPort.Port())
-
-	pool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		_ = container.Terminate(ctx)
+		_ = server.Close()
 		return nil, fmt.Errorf("failed to create pool: %w", err)
 	}
 
-	return &postgresContainer{
-		container: container,
-		dsn:       dsn,
-		pool:      pool,
+	return &testServer{
+		server: server,
+		pool:   pool,
 	}, nil
 }
 
-func (pc *postgresContainer) cleanup(ctx context.Context) error {
-	if pc.pool != nil {
-		pc.pool.Close()
+func (ts *testServer) cleanup() error {
+	if ts.pool != nil {
+		ts.pool.Close()
 	}
-	return pc.container.Terminate(ctx)
+	return ts.server.Close()
 }
 
 func createTestDatabase(t *testing.T) string {
@@ -146,17 +112,19 @@ func createTestDatabase(t *testing.T) string {
 
 	dbName := fmt.Sprintf("cli_test_%d", time.Now().UnixNano())
 
-	_, err := sharedContainer.pool.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", dbName))
+	_, err := sharedServer.pool.Exec(ctx, fmt.Sprintf("CREATE DATABASE %s", dbName))
 	require.NoError(t, err)
 
 	t.Cleanup(func() {
 		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		_, _ = sharedContainer.pool.Exec(cleanupCtx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
+		_, _ = sharedServer.pool.Exec(cleanupCtx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
 	})
 
 	// Build DSN for the test database
-	return strings.Replace(sharedContainer.dsn, "/postgres?", "/"+dbName+"?", 1)
+	dsn, err := testserver.DatabaseURL(sharedServer.server.URL, dbName)
+	require.NoError(t, err)
+	return dsn
 }
 
 // exitCode is the CLI's exit status in a runCLI error.
@@ -243,6 +211,114 @@ func TestCLI_MigrateIdempotent(t *testing.T) {
 	require.NoError(t, err, "second migrate stderr: %s", stderr)
 
 	assert.Contains(t, stdout, "Database is up to date")
+}
+
+func TestCLI_MigrateRefusesADirtyDatabase(t *testing.T) {
+	dsn := createTestDatabase(t)
+	_, stderr, err := runCLI("migrate", "--dsn", dsn)
+	require.NoError(t, err, "stderr: %s", stderr)
+	conn, err := pgx.Connect(context.Background(), dsn)
+	require.NoError(t, err)
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(context.Background(), "UPDATE postgremq.postgremq_migrations SET dirty = true")
+	require.NoError(t, err)
+
+	_, stderr, err = runCLI("migrate", "--dsn", dsn)
+	require.Error(t, err)
+	assert.Contains(t, stderr, "database is in dirty state - manual intervention required")
+}
+
+// A migration in progress records its version as dirty while it runs, under
+// the migration lock. migrate must wait for it, not call the database dirty.
+func TestCLI_MigrateWaitsForAMigrationInProgress(t *testing.T) {
+	ctx := context.Background()
+	dsn := createTestDatabase(t)
+	_, stderr, err := runCLI("migrate", "--dsn", dsn)
+	require.NoError(t, err, "stderr: %s", stderr)
+
+	// Another migrator, partway through its migration.
+	migrator, err := pgx.Connect(ctx, dsn)
+	require.NoError(t, err)
+	defer migrator.Close(ctx)
+	var database string
+	require.NoError(t, migrator.QueryRow(ctx, "SELECT current_database()").Scan(&database))
+	// golang-migrate's lock key for the version table, which every client takes.
+	key := int64(crc32.ChecksumIEEE([]byte("postgremq\x00postgremq_migrations\x00"+database)) * 1_486_364_155)
+	_, err = migrator.Exec(ctx, "SELECT pg_advisory_lock($1)", key)
+	require.NoError(t, err)
+	_, err = migrator.Exec(ctx, "UPDATE postgremq.postgremq_migrations SET dirty = true")
+	require.NoError(t, err)
+
+	type result struct {
+		stdout, stderr string
+		err            error
+	}
+	done := make(chan result, 1)
+	go func() {
+		stdout, stderr, err := runCLI("migrate", "--dsn", dsn)
+		done <- result{stdout, stderr, err}
+	}()
+	require.Eventually(t, func() bool {
+		select {
+		case r := <-done:
+			done <- r
+			return true
+		default:
+		}
+		var waiting bool
+		err := migrator.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_locks
+			WHERE locktype = 'advisory' AND NOT granted AND objid = $1::bigint % 4294967296)`, key).Scan(&waiting)
+		return err == nil && waiting
+	}, 10*time.Second, 20*time.Millisecond)
+	select {
+	case r := <-done:
+		t.Fatalf("migrate did not wait for the migration in progress: %v\nstdout: %s\nstderr: %s", r.err, r.stdout, r.stderr)
+	default:
+	}
+
+	// The other migrator finishes.
+	_, err = migrator.Exec(ctx, "UPDATE postgremq.postgremq_migrations SET dirty = false")
+	require.NoError(t, err)
+	_, err = migrator.Exec(ctx, "SELECT pg_advisory_unlock($1)", key)
+	require.NoError(t, err)
+	select {
+	case r := <-done:
+		require.NoError(t, r.err, "stdout: %s\nstderr: %s", r.stdout, r.stderr)
+	case <-time.After(10 * time.Second):
+		t.Fatal("migrate did not finish after the migration in progress did")
+	}
+}
+
+func TestCLI_MigratePrintsAFailedMigration(t *testing.T) {
+	dsn := createTestDatabase(t)
+	conn, err := pgx.Connect(context.Background(), dsn)
+	require.NoError(t, err)
+	defer conn.Close(context.Background())
+	// The first migration creates this table.
+	_, err = conn.Exec(context.Background(), "CREATE SCHEMA postgremq; CREATE TABLE postgremq.topics (id int)")
+	require.NoError(t, err)
+
+	_, stderr, err := runCLI("migrate", "--dsn", dsn)
+
+	require.Error(t, err)
+	assert.Contains(t, stderr, `Error: postgremq: migration 0.0.1 (schema version 1) failed`)
+	assert.Contains(t, stderr, `relation "topics" already exists (SQLSTATE 42P07)`)
+}
+
+func TestCLI_MigratePrintsAnUnknownVersion(t *testing.T) {
+	dsn := createTestDatabase(t)
+	_, stderr, err := runCLI("migrate", "--dsn", dsn)
+	require.NoError(t, err, "stderr: %s", stderr)
+	conn, err := pgx.Connect(context.Background(), dsn)
+	require.NoError(t, err)
+	defer conn.Close(context.Background())
+	_, err = conn.Exec(context.Background(), "UPDATE postgremq.postgremq_migrations SET version = 2")
+	require.NoError(t, err)
+
+	_, stderr, err = runCLI("migrate", "--dsn", dsn)
+
+	require.Error(t, err)
+	assert.Contains(t, stderr, "Error: postgremq: database schema version 2 (mq 0.0.2) is not one of this client's migrations")
 }
 
 func TestCLI_MissingDSN(t *testing.T) {

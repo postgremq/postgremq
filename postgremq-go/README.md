@@ -20,7 +20,7 @@ Install the SQL schema in the same database as your application. All queue objec
 
 - the CLI: `postgremq migrate --dsn "$DATABASE_URL"` (see [cmd/postgremq](cmd/postgremq/README.md); `go install postgremq.dev/postgremq-go/cmd/postgremq@latest`);
 - `psql "$DATABASE_URL" -v ON_ERROR_STOP=1 -f mq/sql/latest.sql`;
-- the Go API: `postgremq.Migrate(pool)` and `postgremq.GetMigrationStatus(pool)` (see [examples/migration](examples/migration/main.go)). Versions are schema versions: the mq version stored as one number (10000 is mq 0.1.0); `postgremq.FormatSchemaVersion` turns one back into the mq version.
+- the Go API: `postgremq.Migrate(pool)` and `postgremq.GetMigrationStatus(pool)` (see [examples/migration](examples/migration/main.go)). `Migrate` returns typed errors (see [Errors](#errors)): a failed migration is a `*MigrationError` with its version and, when PostgreSQL reports a position it can map, the line and column in its file (its message adds the server's detail, hint, failing query inside a function and context; the `*pgconn.PgError` stays in the chain), a dirty database a `*DirtySchemaError`, and a recorded version none of the migrations knows an `*UnknownSchemaVersionError`. Versions are schema versions: the mq version stored as one number (10000 is mq 0.1.0); `postgremq.FormatSchemaVersion` turns one back into the mq version.
 
 `latest.sql` is for fresh databases only (it refuses to run on an existing installation) and records the migration version it installs, so `Migrate` can upgrade it later.
 
@@ -381,6 +381,9 @@ Use `errors.Is` with these sentinels. Methods that map SQLSTATEs to sentinels ke
 | `ErrQueueNotFound` (`PMQ02`) | Publishing to a missing topic, creating a queue on a missing topic, re-creating an expired exclusive queue, or `Consume`/`ConsumeHandler` on a queue whose topic is unknown to this connection or that does not exist. |
 | `ErrValidation` (`PMQ03`) | A rejected request: an invalid or too long name, an empty or too long group key, a negative max delivery attempts, a queue re-created with different parameters, deleting a topic that still has messages, and similar. |
 | `ErrQueueGone` | A consumer's queue is gone. Delivered as `*QueueFatalError{Queue, Err}` through `NotifyClose` and `WithQueueFatalHandler`. |
+| `ErrMigrationFailed` | A migration failed in `Migrate` and its version is left dirty. When the database reported the error (`Err` is a `*pgconn.PgError`) the migration was rolled back; after a connection failure its outcome is unknown. Returned as `*MigrationError{Version, Line, Column, Err}`: `Line` and `Column` locate the error in the migration's file (0 when PostgreSQL reports no position, or one that cannot be mapped to the file: with a multibyte database or client encoding other than UTF8, such as EUC_JP), `Err` is the database error. |
+| `ErrDirtySchema` | `Migrate` found the recorded schema version marked dirty: a migration failed partway and needs manual repair ([Dirty state](cmd/postgremq/README.md#dirty-state)). Returned as `*DirtySchemaError{Version}`. |
+| `ErrUnknownSchemaVersion` | `Migrate` found a recorded version below its latest migration that is none of its migrations, so it knows no upgrade from it; nothing is applied. Returned as `*UnknownSchemaVersionError{Version}`. |
 
 The sentinels are mapped by `CreateTopic`, `CreateQueue`, `Publish`, `PublishWithTx`, `Ack`, `Nack`, `Release`, `AckWithTx`, `SetVT`, `SetVTBatchMulti` and `DeleteTopic`, and by consumers' fetches. The other administration, inspection and maintenance methods return the database error as is: use `errors.As` with `*pgconn.PgError` and check `Code` (for example `PMQ03` from `DeleteQueue` or `CleanUpTopic` while DLQ entries exist).
 
@@ -448,7 +451,9 @@ Delivery is at least once. Use idempotency keys for side effects, and treat a pu
 
 ## Development
 
-Tests use [testcontainers-go](https://github.com/testcontainers/testcontainers-go). Docker must be running. A single `postgres:15` container is shared, and each test gets its own database.
+Tests run against `POSTGREMQ_TEST_DATABASE_URL` when it is set: a `postgres://` URL of a PostgreSQL 15+ server whose user can create databases and roles, with `max_connections` of 200 or more. The tests connect to the URL's database (normally `/postgres`) to create and drop their own; a Unix socket goes in `?host=/path`. Otherwise each test package starts a `postgres:15` container with [testcontainers-go](https://github.com/testcontainers/testcontainers-go) (Docker must be running) and removes it when the package's tests finish. Each test gets its own database.
+
+testcontainers-go is not a dependency of this module: the container is started by a small launcher in [internal/testserver/launcher](internal/testserver/launcher), a separate module that the tests build and run.
 
 ```bash
 go test ./...                      # all tests

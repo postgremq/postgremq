@@ -271,6 +271,12 @@
 //   - ErrValidation: the request was rejected (invalid name, parameter mismatch,
 //     and similar).
 //   - ErrQueueGone: a consumer's queue is gone (see above).
+//   - ErrMigrationFailed: a migration failed in Migrate; the error is a
+//     *MigrationError with its version and its line and column in the file.
+//   - ErrDirtySchema: Migrate found a migration that failed partway; the
+//     error is a *DirtySchemaError with the version.
+//   - ErrUnknownSchemaVersion: Migrate knows no upgrade from the recorded
+//     version; the error is an *UnknownSchemaVersionError.
 //
 // Check settle errors:
 //

@@ -22,6 +22,7 @@ check:
 	@test -z "$$(gofmt -l .)" || (echo "Code is not formatted. Run 'make fmt' to fix." && gofmt -l . && exit 1)
 	@echo "Running go vet..."
 	@go vet ./...
+	@cd internal/testserver/launcher && GOWORK=off go vet ./...
 	@echo "Running staticcheck (if available)..."
 	@which staticcheck > /dev/null && staticcheck ./... || echo "staticcheck not installed, skipping (optional)"
 	@echo "✓ All checks passed!"

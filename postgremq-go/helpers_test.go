@@ -9,19 +9,19 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/testcontainers/testcontainers-go"
-	"github.com/testcontainers/testcontainers-go/wait"
+
+	"postgremq.dev/postgremq-go/internal/testserver"
 )
 
-type postgresContainer struct {
-	container testcontainers.Container
+type testServer struct {
+	server    *testserver.Server
 	config    *pgxpool.Config
 	adminPool *pgxpool.Pool
 }
 
 // Global variables
 var (
-	sharedContainer *postgresContainer
+	sharedServer *testServer
 )
 
 // TestMain handles setup and teardown for all tests in this package
@@ -30,21 +30,19 @@ func TestMain(m *testing.M) {
 	ctx := context.Background()
 	var err error
 
-	// Set up the container before any tests run
-	sharedContainer, err = newPostgresContainer(ctx)
+	// Set up the server before any tests run
+	sharedServer, err = newTestServer(ctx)
 	if err != nil {
-		fmt.Printf("Failed to start postgres container: %v\n", err)
+		fmt.Printf("Failed to start the test server: %v\n", err)
 		os.Exit(1)
 	}
 
 	// Run the tests
 	exitCode := m.Run()
 
-	// Teardown - clean up the container after all tests finish
-	cleanupCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	if err := sharedContainer.cleanup(cleanupCtx); err != nil {
-		fmt.Printf("Warning: Failed to cleanup postgres container: %v\n", err)
+	// Teardown - remove the container (if one was started) after all tests finish
+	if err := sharedServer.cleanup(); err != nil {
+		fmt.Printf("Warning: Failed to stop the test server: %v\n", err)
 	}
 
 	os.Exit(exitCode)
@@ -57,54 +55,16 @@ func skipIfShort(t *testing.T) {
 	}
 }
 
-func newPostgresContainer(ctx context.Context) (*postgresContainer, error) {
-	req := testcontainers.ContainerRequest{
-		Image:        "postgres:15",
-		ExposedPorts: []string{"5432/tcp"},
-		Env: map[string]string{
-			"POSTGRES_USER":     "postgres",
-			"POSTGRES_PASSWORD": "postgres",
-			"POSTGRES_DB":       "postgres",
-		},
-		Cmd: []string{
-			"postgres",
-			"-c", "max_connections=200", // Increase max connections for parallel tests
-		},
-		WaitingFor: wait.ForAll(
-			// First, we wait for the container to log readiness twice.
-			// This is because it will restart itself after the first startup.
-			wait.ForLog("database system is ready to accept connections").WithOccurrence(2),
-			// Then, we wait for docker to actually serve the port on localhost.
-			// For non-linux OSes like Mac and Windows, Docker or Rancher Desktop will have to start a separate proxy.
-			// Without this, the tests will be flaky on those OSes!
-			wait.ForListeningPort("5432/tcp"),
-		).WithDeadline(30 * time.Second),
-	}
-
-	container, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
-		ContainerRequest: req,
-		Started:          true,
-	})
+// newTestServer connects to POSTGREMQ_TEST_DATABASE_URL, or starts a
+// postgres:15 container when it is unset (package testserver).
+func newTestServer(ctx context.Context) (*testServer, error) {
+	server, err := testserver.Start(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("failed to start container: %w", err)
+		return nil, err
 	}
-
-	mappedPort, err := container.MappedPort(ctx, "5432")
+	config, err := pgxpool.ParseConfig(server.URL)
 	if err != nil {
-		_ = container.Terminate(ctx)
-		return nil, fmt.Errorf("failed to get mapped port: %w", err)
-	}
-
-	host, err := container.Host(ctx)
-	if err != nil {
-		_ = container.Terminate(ctx)
-		return nil, fmt.Errorf("failed to get host: %w", err)
-	}
-
-	connString := fmt.Sprintf("postgres://postgres:postgres@%s:%s/postgres", host, mappedPort.Port())
-	config, err := pgxpool.ParseConfig(connString)
-	if err != nil {
-		_ = container.Terminate(ctx)
+		_ = server.Close()
 		return nil, fmt.Errorf("failed to parse connection config: %w", err)
 	}
 	// Increase pool size for concurrent test scenarios
@@ -113,22 +73,22 @@ func newPostgresContainer(ctx context.Context) (*postgresContainer, error) {
 	config.MinConns = 10
 	pool, err := pgxpool.NewWithConfig(ctx, config)
 	if err != nil {
-		_ = container.Terminate(ctx)
+		_ = server.Close()
 		return nil, fmt.Errorf("failed to create a pool: %w", err)
 	}
 
-	return &postgresContainer{
-		container: container,
+	return &testServer{
+		server:    server,
 		config:    config,
 		adminPool: pool,
 	}, nil
 }
 
-func (pc *postgresContainer) cleanup(ctx context.Context) error {
-	if pc.adminPool != nil {
-		pc.adminPool.Close()
+func (ts *testServer) cleanup() error {
+	if ts.adminPool != nil {
+		ts.adminPool.Close()
 	}
-	return pc.container.Terminate(ctx)
+	return ts.server.Close()
 }
 
 // createTestDatabase creates a unique database for the test
@@ -136,8 +96,8 @@ func createTestDatabase(t *testing.T, ctx context.Context) (*pgxpool.Pool, strin
 	// Create a unique database name for this test
 	dbName := fmt.Sprintf("pgmq_test_%s_%d", sanitizeTestName(t.Name()), time.Now().UnixNano())
 
-	// Connect to the container's default postgres database
-	adminConn, err := pgxpool.NewWithConfig(ctx, sharedContainer.config)
+	// Connect to the server's admin database
+	adminConn, err := pgxpool.NewWithConfig(ctx, sharedServer.config)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to connect to postgres: %w", err)
 	}
@@ -150,7 +110,7 @@ func createTestDatabase(t *testing.T, ctx context.Context) (*pgxpool.Pool, strin
 	}
 
 	// Update the connection config to point to the new database
-	testConfig := sharedContainer.config.Copy()
+	testConfig := sharedServer.config.Copy()
 	testConfig.ConnConfig.Database = dbName
 	// Increase pool size for concurrent test scenarios
 	testConfig.MaxConns = 50
@@ -220,7 +180,7 @@ func setupTestConnection(t *testing.T) (*pgxpool.Pool, context.Context) {
 		defer cancel()
 
 		// drop the database
-		_, err = sharedContainer.adminPool.Exec(cleanupCtx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
+		_, err = sharedServer.adminPool.Exec(cleanupCtx, fmt.Sprintf("DROP DATABASE IF EXISTS %s", dbName))
 
 		if err != nil {
 			t.Logf("Warning: Failed to drop test database %s: %v", dbName, err)

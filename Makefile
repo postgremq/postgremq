@@ -39,7 +39,7 @@ test: test-sql test-go test-ts test-rs
 test-sql: sync
 	cd mq && $(PYTHON) -m pytest tests/tests.py -v
 
-## test-go: Go client and CLI tests (testcontainers; needs Docker)
+## test-go: Go client and CLI tests (Docker, or POSTGREMQ_TEST_DATABASE_URL)
 test-go: sync
 	cd postgremq-go && GOWORK=off go test ./...
 

@@ -49,9 +49,12 @@ pub(crate) fn error_type(err: &Error) -> &'static str {
         ErrorKind::QueueNotFound | ErrorKind::QueueGone => "queue_not_found",
         ErrorKind::Validation => "validation",
         ErrorKind::Closed => "connection_closed",
-        ErrorKind::Busy | ErrorKind::Payload | ErrorKind::DirtySchema | ErrorKind::Incompatible => {
-            "other"
-        }
+        ErrorKind::Busy
+        | ErrorKind::Payload
+        | ErrorKind::DirtySchema
+        | ErrorKind::UnknownSchemaVersion
+        | ErrorKind::Migration
+        | ErrorKind::Incompatible => "other",
         ErrorKind::Sqlx => match err {
             Error::Sqlx(sqlx) => sqlx_error_type(sqlx),
             _ => "other",

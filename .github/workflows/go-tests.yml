@@ -71,6 +71,13 @@ jobs:
         working-directory: postgremq-go
         args: --timeout=5m
 
+    # The test-server launcher is its own module, outside the lint above.
+    - name: Vet the test-server launcher
+      working-directory: postgremq-go/internal/testserver/launcher
+      env:
+        GOWORK: 'off'
+      run: go vet ./...
+
     # Workspace mode (go.work): the examples use this tree's client.
     - name: Build and vet the examples
       run: |
