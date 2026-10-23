@@ -3,9 +3,14 @@ package postgremq_test
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgconn/ctxwatch"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -13,10 +18,13 @@ import (
 )
 
 // waitForListen probes the given LISTEN channel with test NOTIFYs until the
-// handle receives one — proving that the listener has actually issued LISTEN
-// on the wire and is delivering events to this handle. Without this sync,
-// publish-and-expect-wake tests can race the asynchronous LISTEN registration
-// (control NOTIFY → reconcile → LISTEN command).
+// handle is woken — by a probe, or by the wake the listener sends once the
+// channel's LISTEN is in place. Either proves that the listener has issued
+// LISTEN on the wire and is delivering events to this handle; a probe still
+// in flight wakes the handle later, so callers drain it with drainHandle.
+// Without this sync, publish-and-expect-wake tests can race the asynchronous
+// LISTEN registration (subscription change → interrupted wait → reconcile →
+// LISTEN command).
 func waitForListen(t *testing.T, pool *pgxpool.Pool, handle *postgremq.ListenerHandle, channel string) {
 	t.Helper()
 	deadline := time.Now().Add(2 * time.Second)
@@ -485,12 +493,12 @@ func TestEventListener_DispatchDoesNotPanicOnConcurrentClose(t *testing.T) {
 	<-publisherDone
 }
 
-// TestEventListener_NotifyDrainerCoalescesChurn verifies that rapid
-// Add/Remove churn does not spawn N goroutines per change — the single
-// notifyDrainer goroutine handles all NOTIFYs sequentially. If the drainer
-// were broken (e.g. one goroutine per signal), the test would deadlock or
-// timeout due to pool exhaustion.
-func TestEventListener_NotifyDrainerCoalescesChurn(t *testing.T) {
+// TestEventListener_SubscriptionChurnKeepsTheSession verifies that rapid
+// Add/Remove churn, each change interrupting the session's wait for a
+// notification, coalesces into reconciles that leave the session healthy:
+// it is never lost, and a channel subscribed afterwards is listened to and
+// receives NOTIFYs.
+func TestEventListener_SubscriptionChurnKeepsTheSession(t *testing.T) {
 	t.Parallel()
 	pool, _ := setupTestConnection(t)
 	defer pool.Close()
@@ -500,21 +508,24 @@ func TestEventListener_NotifyDrainerCoalescesChurn(t *testing.T) {
 	defer conn.Close()
 
 	conn.EventListener().Start()
+	steady := conn.EventListener().AddTopicListener("SteadyTopic")
+	defer steady.Close()
+	waitForListen(t, pool, steady, "pmq:t:SteadyTopic")
+	session := listenBackend(t, pool, 0)
 
-	// Issue many subscribe/unsubscribe pairs quickly. The wake-via-NOTIFY
-	// drainer should coalesce these into far fewer NOTIFY round-trips than
-	// the number of changes.
 	const churn = 500
 	for i := 0; i < churn; i++ {
 		h := conn.EventListener().AddTopicListener("CoalesceTopic")
 		h.Close()
 	}
-
-	// Give the drainer time to settle (any in-flight NOTIFY should flush
-	// without exhausting the pool).
 	require.Eventually(t, func() bool {
 		return conn.EventListener().SubscriberCount("pmq:t:CoalesceTopic") == 0
 	}, 2*time.Second, 10*time.Millisecond)
+
+	h := conn.EventListener().AddTopicListener("AfterChurnTopic")
+	defer h.Close()
+	waitForListen(t, pool, h, "pmq:t:AfterChurnTopic")
+	assertBackendAlive(t, pool, session)
 }
 
 // TestEventListener_MultipleSubscribersAllReceive verifies that two
@@ -622,4 +633,345 @@ func TestEventListener_StartAfterCloseIsNoOp(t *testing.T) {
 	default:
 		t.Fatal("el.stopped should remain closed after the post-Close Start no-op")
 	}
+}
+
+// listenBackend returns the pid of this database's LISTEN session once it
+// listens to a topic or queue channel.
+func listenBackend(t *testing.T, pool *pgxpool.Pool, exclude int32) int32 {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var pid int32
+		err := pool.QueryRow(context.Background(),
+			`SELECT pid FROM pg_stat_activity
+			 WHERE datname = current_database() AND pid <> $1
+			   AND (query ILIKE 'LISTEN "pmq:t:%' OR query ILIKE 'LISTEN "pmq:q:%')`,
+			exclude).Scan(&pid)
+		if err == nil {
+			return pid
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatal("no LISTEN session within 10s")
+	return 0
+}
+
+// assertBackendAlive asserts that the LISTEN session with the given pid
+// still exists: a session that fails is closed and replaced.
+func assertBackendAlive(t *testing.T, pool *pgxpool.Pool, pid int32) {
+	t.Helper()
+	var alive bool
+	require.NoError(t, pool.QueryRow(context.Background(),
+		"SELECT EXISTS (SELECT FROM pg_stat_activity WHERE pid = $1)", pid).Scan(&alive))
+	assert.True(t, alive, "the session was lost")
+}
+
+// TestEventListener_ReconnectWakesConsumers kills the LISTEN session and
+// publishes while it is down: the NOTIFY is lost, so only the wake-up the
+// listener sends once the new session listens can deliver the message
+// before the consumer's 30 s poll. A round counts only if the publish
+// finished within the shortest reconnect wait (half the initial 1 s
+// backoff) of the kill; otherwise the NOTIFY may have reached the new
+// session.
+func TestEventListener_ReconnectWakesConsumers(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.CreateTopic(ctx, "GapTopic"))
+	require.NoError(t, conn.CreateQueue(ctx, "GapQueue", "GapTopic", false))
+	consumer, err := conn.Consume("GapQueue", postgremq.WithCheckTimeout(30*time.Second))
+	require.NoError(t, err)
+	defer consumer.Stop()
+
+	var previous int32
+	for attempt, gaps := 1, 0; gaps < 2; attempt++ {
+		require.LessOrEqual(t, attempt, 4, "the publish kept landing after the reconnect")
+		session := listenBackend(t, pool, previous)
+		// Let the initial or reconnect wake-up fetch (empty) finish first.
+		time.Sleep(300 * time.Millisecond)
+		killed := time.Now()
+		_, err := pool.Exec(ctx, "SELECT pg_terminate_backend($1)", session)
+		require.NoError(t, err)
+		_, err = conn.Publish(ctx, "GapTopic", []byte(`{}`))
+		require.NoError(t, err)
+		inGap := time.Since(killed) < 500*time.Millisecond
+
+		select {
+		case msg := <-consumer.Messages():
+			require.NoError(t, msg.Ack(ctx))
+		case <-time.After(5 * time.Second):
+			t.Fatalf("attempt %d: message published during the reconnect gap not delivered within 5s", attempt)
+		}
+		if inGap {
+			gaps++
+		}
+		previous = session
+	}
+}
+
+// TestEventListener_BackoffResetsAfterStableSession kills the LISTEN session
+// three times in quick succession, then once more after it has been
+// listening for 5 s, and times each reconnect from the kill until the new
+// session listens. A reconnect waits at least half its backoff, so the
+// third quick one takes at least 1.125 s (1 s grown ×1.5 twice). After the
+// stable session the backoff starts again from 1 s: under 1.6 s with the
+// reconnect itself, where a backoff that kept growing (3.375 s) would wait
+// at least 1.6875 s.
+func TestEventListener_BackoffResetsAfterStableSession(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	conn.EventListener().Start()
+	h := conn.EventListener().AddTopicListener("BackoffTopic")
+	defer h.Close()
+
+	session := listenBackend(t, pool, 0)
+	reconnect := func() time.Duration {
+		t.Helper()
+		killed := time.Now()
+		_, err := pool.Exec(ctx, "SELECT pg_terminate_backend($1)", session)
+		require.NoError(t, err)
+		session = listenBackend(t, pool, session)
+		return time.Since(killed)
+	}
+	assert.GreaterOrEqual(t, reconnect(), 500*time.Millisecond)
+	assert.GreaterOrEqual(t, reconnect(), 750*time.Millisecond)
+	assert.GreaterOrEqual(t, reconnect(), 1125*time.Millisecond)
+	time.Sleep(6 * time.Second)
+	assert.Less(t, reconnect(), 1600*time.Millisecond)
+}
+
+// consumeCounter counts the consume_message calls on a pool's connections.
+type consumeCounter struct{ n atomic.Int32 }
+
+func (c *consumeCounter) TraceQueryStart(ctx context.Context, _ *pgx.Conn, data pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(data.SQL, "consume_message") {
+		c.n.Add(1)
+	}
+	return ctx
+}
+
+func (c *consumeCounter) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// TestEventListener_ReconnectFetchesOnce kills the LISTEN session: the new
+// session wakes a consumer on both its channels (topic and queue), and the
+// consumer fetches once for the two.
+func TestEventListener_ReconnectFetchesOnce(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	cfg := pool.Config().Copy()
+	fetches := &consumeCounter{}
+	cfg.ConnConfig.Tracer = fetches
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	require.NoError(t, err)
+	defer traced.Close()
+
+	conn, err := postgremq.DialFromPool(ctx, traced)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	require.NoError(t, conn.CreateTopic(ctx, "OnceTopic"))
+	require.NoError(t, conn.CreateQueue(ctx, "OnceQueue", "OnceTopic", false))
+	consumer, err := conn.Consume("OnceQueue", postgremq.WithCheckTimeout(30*time.Second))
+	require.NoError(t, err)
+	defer consumer.Stop()
+
+	session := listenBackend(t, pool, 0)
+	for round := 1; round <= 4; round++ {
+		// Let the previous fetches finish.
+		time.Sleep(300 * time.Millisecond)
+		before := fetches.n.Load()
+		_, err := pool.Exec(ctx, "SELECT pg_terminate_backend($1)", session)
+		require.NoError(t, err)
+		session = listenBackend(t, pool, session)
+		time.Sleep(300 * time.Millisecond)
+		assert.Equal(t, before+1, fetches.n.Load(), "round %d", round)
+	}
+}
+
+// TestEventListener_NewChannelWakesItsSubscribers subscribes to a channel
+// while a session is already running: once its LISTEN is in place its
+// subscriber is woken without any NOTIFY on it, because a message published
+// before the LISTEN is never notified. Subscribers of channels already
+// listened to are not woken.
+func TestEventListener_NewChannelWakesItsSubscribers(t *testing.T) {
+	t.Parallel()
+	pool, _ := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	el := conn.EventListener()
+	el.Start()
+
+	first := el.AddTopicListener("FirstTopic")
+	defer first.Close()
+	// The first session's wake: the channel is listened to.
+	select {
+	case <-first.Wake():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first session did not wake its subscriber")
+	}
+
+	second := el.AddTopicListener("SecondTopic")
+	defer second.Close()
+	select {
+	case <-second.Wake():
+	case <-time.After(5 * time.Second):
+		t.Fatal("a newly listened channel's subscriber was not woken")
+	}
+	select {
+	case <-first.Wake():
+		t.Fatal("a channel already listened to was woken")
+	case <-time.After(200 * time.Millisecond):
+	}
+}
+
+// TestEventListener_SubscribeWhilePoolExhausted subscribes to a new channel
+// while every other connection of the pool is in use: the listener applies
+// the change on its own connection, so the channel is listened to (and its
+// subscriber woken) without needing another pool connection.
+func TestEventListener_SubscribeWhilePoolExhausted(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	cfg := pool.Config().Copy()
+	cfg.MaxConns = 2
+	cfg.MinConns = 0
+	small, err := pgxpool.NewWithConfig(ctx, cfg)
+	require.NoError(t, err)
+	defer small.Close()
+
+	conn, err := postgremq.DialFromPool(ctx, small)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	el := conn.EventListener()
+	el.Start()
+	first := el.AddTopicListener("FirstTopic")
+	defer first.Close()
+	waitForListen(t, pool, first, "pmq:t:FirstTopic")
+
+	// The listener holds one connection, the test the other.
+	held, err := small.Acquire(ctx)
+	require.NoError(t, err)
+	defer held.Release()
+	require.Equal(t, int32(2), small.Stat().AcquiredConns())
+
+	// NOTIFYs sent from another pool reach the new channel.
+	second := el.AddTopicListener("SecondTopic")
+	defer second.Close()
+	waitForListen(t, pool, second, "pmq:t:SecondTopic")
+}
+
+// TestEventListener_ChurnDoesNotLoseNotifications sends NOTIFYs one at a
+// time on a channel while another goroutine keeps subscribing to and
+// unsubscribing from a second channel, interrupting the session's wait
+// over and over: every NOTIFY still wakes its subscriber.
+func TestEventListener_ChurnDoesNotLoseNotifications(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	conn, err := postgremq.DialFromPool(context.Background(), pool)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	el := conn.EventListener()
+	el.Start()
+	handle := el.AddTopicListener("SteadyTopic")
+	defer handle.Close()
+	waitForListen(t, pool, handle, "pmq:t:SteadyTopic")
+	drainHandle(handle)
+	session := listenBackend(t, pool, 0)
+
+	stop := make(chan struct{})
+	churned := make(chan struct{})
+	go func() {
+		defer close(churned)
+		for {
+			select {
+			case <-stop:
+				return
+			default:
+			}
+			el.AddTopicListener("ChurnTopic").Close()
+			time.Sleep(time.Millisecond)
+		}
+	}()
+	defer func() {
+		close(stop)
+		<-churned
+	}()
+
+	for i := range 50 {
+		_, err := pool.Exec(ctx, "SELECT pg_notify('pmq:t:SteadyTopic', '')")
+		require.NoError(t, err)
+		select {
+		case <-handle.Wake():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("NOTIFY %d did not wake its subscriber", i)
+		}
+	}
+	assertBackendAlive(t, pool, session)
+}
+
+// TestEventListener_SubscribeWithCancelRequestHandler runs the connection on
+// a pool whose connections cancel a context by sending the server a cancel
+// request and only then, after a long delay, a deadline: a subscription
+// change must still be applied at once, without waiting for that delay.
+func TestEventListener_SubscribeWithCancelRequestHandler(t *testing.T) {
+	t.Parallel()
+	pool, ctx := setupTestConnection(t)
+	defer pool.Close()
+
+	cfg := pool.Config().Copy()
+	cfg.ConnConfig.BuildContextWatcherHandler = func(pgConn *pgconn.PgConn) ctxwatch.Handler {
+		return &pgconn.CancelRequestContextWatcherHandler{Conn: pgConn, DeadlineDelay: 2 * time.Second}
+	}
+	custom, err := pgxpool.NewWithConfig(ctx, cfg)
+	require.NoError(t, err)
+	defer custom.Close()
+
+	conn, err := postgremq.DialFromPool(ctx, custom)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	el := conn.EventListener()
+	el.Start()
+	first := el.AddTopicListener("FirstTopic")
+	defer first.Close()
+	select {
+	case <-first.Wake():
+	case <-time.After(5 * time.Second):
+		t.Fatal("the first session did not wake its subscriber")
+	}
+	session := listenBackend(t, pool, 0)
+	// Let the session block in its wait, so the change has to interrupt it.
+	time.Sleep(100 * time.Millisecond)
+
+	second := el.AddTopicListener("SecondTopic")
+	defer second.Close()
+	select {
+	case <-second.Wake():
+	case <-time.After(time.Second):
+		t.Fatal("a subscription change waited for the pool's cancel handling")
+	}
+	waitForListen(t, pool, second, "pmq:t:SecondTopic")
+	assertBackendAlive(t, pool, session)
 }

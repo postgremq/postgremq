@@ -34,8 +34,8 @@ type Consumer struct {
 	ctx                context.Context
 	cancel             context.CancelFunc
 	dbCtx              context.Context  // some operations must not be cancelled by consumer stop
-	topicHandle        *ListenerHandle  // wakes on per-topic publish notifications
-	queueHandle        *ListenerHandle  // wakes on nack/release for this queue
+	topicHandle        *ListenerHandle  // wakes on per-topic publish notifications and when its LISTEN is (re)established
+	queueHandle        *ListenerHandle  // wakes on nack/release for this queue and when its LISTEN is (re)established
 	done               chan struct{}    // closed when run() exits
 	fetched            chan fetchResult // a fetch goroutine reports its batch here
 	completed          chan string      // a settled message reports its trackingID here
@@ -273,6 +273,11 @@ func (c *Consumer) run() {
 			// ctx.Done set `shutting` without re-arming (that path doesn't
 			// disarm), so a late fire must not start a fetch during shutdown.
 			if !fetching && !shutting && len(outbox) == 0 {
+				// This fetch covers the wakes already queued, such as both
+				// channels' when they are listened to again after a
+				// reconnect: drop them rather than fetch again.
+				drainWakes(topicCh)
+				drainWakes(queueCh)
 				fetching = true
 				go c.fetchInto()
 			}
@@ -557,3 +562,18 @@ func (c *Consumer) signalClose() {
 }
 
 func (c *Consumer) queueGeneration() string { return c.generation }
+
+// drainWakes drops the wakes queued on ch without blocking. A closed (or nil)
+// ch is left for the consumer loop to handle.
+func drainWakes(ch <-chan struct{}) {
+	for {
+		select {
+		case _, ok := <-ch:
+			if !ok {
+				return
+			}
+		default:
+			return
+		}
+	}
+}

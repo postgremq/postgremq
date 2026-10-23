@@ -9,15 +9,17 @@
 //! when nobody is waiting, so a notification that arrives while a consumer is
 //! busy fetching is not lost.
 //!
-//! Notifications are hints. Once a new session's `LISTEN`s are in place all
-//! subscribers are woken, since notifications sent while the session was down
-//! are gone; likewise a channel's subscribers are woken when it is first
-//! listened to (a message published before that is never notified). Polling
+//! Notifications are hints. A channel's subscribers are woken once its
+//! `LISTEN` is in place, since a message published before that is never
+//! notified: on a new session every channel's (notifications sent while the
+//! session was down are gone), later those of a newly subscribed one. Polling
 //! every `check_timeout` remains the correctness fallback. The task is started
 //! once, connects when the first channel is subscribed, and retries with
-//! bounded backoff for the connection's lifetime.
+//! bounded, jittered backoff for the connection's lifetime.
 
+use std::collections::hash_map::RandomState;
 use std::collections::{HashMap, HashSet};
+use std::hash::{BuildHasher as _, Hasher as _};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::Duration;
 
@@ -25,6 +27,7 @@ use sqlx::PgPool;
 use sqlx::postgres::{PgListener, PgPoolOptions};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::Instrument as _;
 
@@ -32,6 +35,9 @@ use crate::sync::lock;
 
 const MIN_BACKOFF: Duration = Duration::from_millis(250);
 const MAX_BACKOFF: Duration = Duration::from_secs(30);
+/// How long a session must have been listening for the next reconnect to
+/// start again from [`MIN_BACKOFF`].
+const STABLE_AFTER: Duration = Duration::from_secs(5);
 
 /// Channel → subscribers.
 #[derive(Debug, Default)]
@@ -45,15 +51,6 @@ impl Shared {
     fn wake(&self, channel: &str) {
         let subscribers = lock(&self.subscribers);
         for notify in subscribers.get(channel).into_iter().flatten() {
-            if let Some(notify) = notify.upgrade() {
-                notify.notify_one();
-            }
-        }
-    }
-
-    fn wake_all(&self) {
-        let subscribers = lock(&self.subscribers);
-        for notify in subscribers.values().flatten() {
             if let Some(notify) = notify.upgrade() {
                 notify.notify_one();
             }
@@ -207,6 +204,8 @@ async fn run(pool: PgPool, shared: Arc<Shared>, stop: CancellationToken) {
     let mut listening: HashSet<String> = HashSet::new();
     // A new session whose `LISTEN`s are not yet all in place.
     let mut fresh = false;
+    // When the current session's `LISTEN`s were all in place.
+    let mut listening_since: Option<Instant> = None;
     let mut backoff = MIN_BACKOFF;
     while !stop.is_cancelled() {
         let Some(session) = listener.as_mut() else {
@@ -235,12 +234,13 @@ async fn run(pool: PgPool, shared: Arc<Shared>, stop: CancellationToken) {
                     fresh = true;
                 }
                 Err(err) => {
+                    let delay = reconnect_delay(&mut backoff, &mut listening_since);
                     tracing::warn!(
                         error = &err as &dyn std::error::Error,
-                        retry_in = ?backoff,
+                        retry_in = ?delay,
                         "notification listener cannot connect"
                     );
-                    backoff = pause(&stop, backoff).await;
+                    pause(&stop, delay).await;
                 }
             }
             continue;
@@ -251,15 +251,17 @@ async fn run(pool: PgPool, shared: Arc<Shared>, stop: CancellationToken) {
             result = reconcile(session, &shared, &mut listening) => result,
         };
         match reconciled {
-            // Anything sent while we were not listening is lost: wake
-            // everyone, but only now that the `LISTEN`s are in place (a
-            // consumer woken earlier could re-check before them and miss a
-            // message published in between).
-            Ok(_) if fresh => {
-                fresh = false;
-                shared.wake_all();
-            }
+            // Wake the subscribers of the channels newly listened to: a
+            // message published before a channel's `LISTEN` is never
+            // notified (on a new session that is every channel, since
+            // anything sent while we were not listening is lost). Only now
+            // that the `LISTEN`s are in place: a consumer woken earlier could
+            // re-check before them and miss a message published in between.
             Ok(added) => {
+                if fresh {
+                    fresh = false;
+                    listening_since = Some(Instant::now());
+                }
                 for channel in &added {
                     shared.wake(channel);
                 }
@@ -270,7 +272,7 @@ async fn run(pool: PgPool, shared: Arc<Shared>, stop: CancellationToken) {
                     "notification listener lost its session"
                 );
                 listener = None;
-                backoff = pause(&stop, backoff).await;
+                pause(&stop, reconnect_delay(&mut backoff, &mut listening_since)).await;
                 continue;
             }
         }
@@ -285,10 +287,7 @@ async fn run(pool: PgPool, shared: Arc<Shared>, stop: CancellationToken) {
             // cancel-safe"), so it may be cancelled when the subscription set
             // changes. Re-check on every sqlx upgrade.
             received = session.try_recv() => match received {
-                Ok(Some(notification)) => {
-                    backoff = MIN_BACKOFF;
-                    shared.wake(notification.channel());
-                }
+                Ok(Some(notification)) => shared.wake(notification.channel()),
                 // The connection was lost: rebuild the session (which wakes
                 // everyone, since notifications in the gap are gone).
                 Ok(None) => {
@@ -296,7 +295,7 @@ async fn run(pool: PgPool, shared: Arc<Shared>, stop: CancellationToken) {
                     listener = None;
                     // A server that accepts and then drops connections must
                     // not make this a tight reconnect loop.
-                    backoff = pause(&stop, backoff).await;
+                    pause(&stop, reconnect_delay(&mut backoff, &mut listening_since)).await;
                 }
                 Err(err) => {
                     tracing::warn!(
@@ -304,7 +303,7 @@ async fn run(pool: PgPool, shared: Arc<Shared>, stop: CancellationToken) {
                         "notification listener failed"
                     );
                     listener = None;
-                    backoff = pause(&stop, backoff).await;
+                    pause(&stop, reconnect_delay(&mut backoff, &mut listening_since)).await;
                 }
             },
         }
@@ -335,11 +334,36 @@ async fn reconcile(
     Ok(added)
 }
 
-/// Sleeps for `backoff` (unless stopped) and returns the next backoff.
-async fn pause(stop: &CancellationToken, backoff: Duration) -> Duration {
+/// The wait before the next reconnect, jittered within `[backoff/2, backoff]`
+/// so instances that lost their sessions together do not reconnect in
+/// lockstep. Doubles `backoff` for the attempt after, up to [`MAX_BACKOFF`];
+/// a session that had been listening for [`STABLE_AFTER`] starts it again
+/// from [`MIN_BACKOFF`].
+fn reconnect_delay(backoff: &mut Duration, listening_since: &mut Option<Instant>) -> Duration {
+    if listening_since
+        .take()
+        .is_some_and(|since| since.elapsed() >= STABLE_AFTER)
+    {
+        *backoff = MIN_BACKOFF;
+    }
+    let base = *backoff;
+    *backoff = base.saturating_mul(2).min(MAX_BACKOFF);
+    let half = u64::try_from(base.as_nanos() / 2).unwrap_or(u64::MAX);
+    base.saturating_sub(Duration::from_nanos(random() % half.saturating_add(1)))
+}
+
+/// A random `u64` without a `rand` dependency: std documents two
+/// `RandomState`s as unlikely to hash alike (each gets different SipHash
+/// keys). That is enough for jitter, not for anything that needs uniform or
+/// unpredictable values.
+fn random() -> u64 {
+    RandomState::new().build_hasher().finish()
+}
+
+/// Sleeps for `delay` unless stopped.
+async fn pause(stop: &CancellationToken, delay: Duration) {
     tokio::select! {
         () = stop.cancelled() => {}
-        () = tokio::time::sleep(backoff) => {}
+        () = tokio::time::sleep(delay) => {}
     }
-    backoff.saturating_mul(2).min(MAX_BACKOFF)
 }

@@ -386,6 +386,88 @@ async fn the_listener_reconnects_after_its_session_is_killed() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn a_message_published_while_the_listener_is_down_is_delivered_after_the_reconnect() {
+    let db = TestDb::new().await;
+    let app = unique("pmq_gap");
+    let conn = db.connect_tagged(&app, ConnectionOptions::default()).await;
+    let topic = unique("t");
+    let queue = unique("q");
+    conn.create_topic(&topic).await.unwrap();
+    conn.create_queue(&queue, &topic, QueueOptions::default())
+        .await
+        .unwrap();
+    // The NOTIFY is lost, so only the reconnect's wake-up can deliver within
+    // the bound below.
+    let mut consumer = conn
+        .consume(
+            &queue,
+            ConsumeOptions::default().check_timeout(Duration::from_secs(30)),
+        )
+        .await
+        .unwrap();
+    let other = db.connect(ConnectionOptions::default()).await;
+    let new_session = |previous: Option<i32>| {
+        let db = &db;
+        let app = &app;
+        async move {
+            within(10, async {
+                loop {
+                    if let [pid] = db.listen_pids(app).await[..]
+                        && Some(pid) != previous
+                    {
+                        break pid;
+                    }
+                    tokio::time::sleep(Duration::from_millis(50)).await;
+                }
+            })
+            .await
+        }
+    };
+    // A round counts only if the new session's backend started after the
+    // publish committed; otherwise the NOTIFY may have reached it.
+    let mut gaps = 0;
+    let mut session = new_session(None).await;
+    for attempt in 1.. {
+        assert!(attempt <= 4, "the publish kept landing after the reconnect");
+        // Let the initial or reconnect wake-up fetch (empty) finish first.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        sqlx::query("SELECT pg_terminate_backend($1)")
+            .bind(session)
+            .execute(&db.pool)
+            .await
+            .unwrap();
+        other
+            .publish(&topic, &attempt, PublishOptions::default())
+            .await
+            .unwrap();
+        let published: String = sqlx::query_scalar("SELECT clock_timestamp()::text")
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+        let delivery = within(5, consumer.next()).await.unwrap().unwrap();
+        assert_eq!(delivery.payload_as::<i32>().unwrap(), attempt);
+        delivery.ack().await.unwrap();
+        session = new_session(Some(session)).await;
+        let after: bool = sqlx::query_scalar(
+            "SELECT backend_start > $1::timestamptz FROM pg_stat_activity WHERE pid = $2",
+        )
+        .bind(&published)
+        .bind(session)
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+        if after {
+            gaps += 1;
+            if gaps == 2 {
+                break;
+            }
+        }
+    }
+    conn.close().await;
+    other.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn message_ids_beyond_i32_round_trip() {
     let db = TestDb::new().await;
     let conn = db.connect(ConnectionOptions::default()).await;
