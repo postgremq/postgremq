@@ -97,8 +97,9 @@ make check                         # postgremq-go/Makefile: gofmt, go vet, stati
 
 CI also runs `golangci-lint`. The CLI is part of the module
 (`postgremq-go/cmd/postgremq`), so `go test ./...` covers it. The repository
-root has a `go.work` that ties `postgremq-go` and
-`postgremq-go/examples/metrics` together for local development.
+root has a `go.work` that ties `postgremq-go`,
+`postgremq-go/examples/metrics` and `observability/loadgen` (the dashboards'
+demo workload) together for local development.
 
 ### TypeScript
 
@@ -174,9 +175,12 @@ PR title must be a [Conventional Commit](https://www.conventionalcommits.org/)
   release), `perf`, `revert`, `deps` (dependency updates that matter to
   users); `docs`, `test`, `refactor`, `build`, `ci`, `chore` do not appear in
   release notes and release nothing on their own.
-- **Scopes**: `sql`, `go`, `cli`, `ts`, `rs`, `docs`, `ci`, `release`, or
-  several (`sql,go`). The scope is for readers; Release Please decides which
-  clients a commit releases from the paths it changes. A schema commit
+- **Scopes**: `sql`, `go`, `cli`, `ts`, `rs`, `dashboards`, `docs`, `ci`,
+  `release`, or several (`sql,go`). The scope is for readers; Release Please
+  decides which clients a commit releases from the paths it changes. The
+  dashboards (`observability/dashboards/`) are in no release package: a
+  `feat(dashboards): …` PR releases nothing and gets no Release Please
+  changelog entry (note it in the root `CHANGELOG.md` by hand). A schema commit
   (scope `sql`) changes every client (`make sync`), so it releases all of
   them, and mq with them. Its type gives the level of its schema change
   (`fix` patch, `feat` minor, `!` major): exactly, when the scope is `sql`

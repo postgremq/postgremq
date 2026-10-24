@@ -1,4 +1,5 @@
-"""End-to-end: real pinned Collector + PostgreSQL + the three client examples.
+"""End-to-end: real pinned Collector + PostgreSQL + the three client examples,
+and the Grafana dashboards' metric names against what they export.
 
 Run from the repository root:
   .venv/bin/pytest observability/test_collector.py -v
@@ -6,8 +7,10 @@ Requires mq/tests/requirements.txt, Docker, Go, npm ci in postgremq-ts, and a
 Rust toolchain (the Rust example is built on first run if not built already).
 All containers, networks and databases are isolated and removed on exit.
 """
+import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import time
 import urllib.request
@@ -18,6 +21,14 @@ import psycopg2
 
 ROOT = Path(__file__).resolve().parents[1]
 IMAGE = 'otel/opentelemetry-collector-contrib:0.147.0'
+DASHBOARDS = ROOT / 'observability/dashboards/grafana'
+# PromQL words that are not metric names, once strings, label matchers,
+# ranges and grouping label lists are removed.
+KEYWORDS = {'and', 'or', 'unless', 'bool', 'offset', 'by', 'without', 'on', 'ignoring',
+            'group_left', 'group_right', 'inf', 'nan'}
+# Contract counters the client examples never increment: the drift check
+# takes their names from client-contract.json instead of the scenario.
+UNPRODUCED_COUNTERS = ['postgremq.client.renewal.lost']
 
 
 def eventually(fn, timeout=60):
@@ -30,6 +41,83 @@ def eventually(fn, timeout=60):
             last = err
             time.sleep(0.25)
     raise AssertionError(f'Timed out: {last}')
+
+
+def dashboards():
+    return {path.name: json.loads(path.read_text()) for path in sorted(DASHBOARDS.glob('*.json'))}
+
+
+def queries(node):
+    """Every PromQL query in a dashboard: panel targets and variable queries
+    (both the stored `query` and its `definition`)."""
+    if isinstance(node, dict):
+        if node.get('type') == 'datasource':  # its query is a plugin id
+            return
+        for key, value in node.items():
+            if key in ('expr', 'definition', 'query') and isinstance(value, str):
+                yield value
+            else:
+                yield from queries(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from queries(item)
+
+
+def metric_names(query):
+    assert not re.search(r'__name__\s*(=~|!=|!~)', query), f'unsupported metric name matcher: {query}'
+    selected = set(re.findall(r'__name__\s*=\s*"([^"]+)"', query))
+    query = re.sub(r'"(?:[^"\\]|\\.)*"', '""', query)   # string literals
+    query = re.sub(r'\{[^}]*\}|\[[^]]*\]', '', query)       # label matchers, ranges
+    query = re.sub(r'\b(by|without|on|ignoring|group_left|group_right)\s*\([^)]*\)', '', query)
+    query = re.sub(r'label_values\(([^,)]*),[^)]*\)', r'\1', query)
+    query = re.sub(r'\$\w+', '', query)                      # dashboard variables
+    # Not inside a number or duration (0.95, 5m, 1e3).
+    names = re.findall(r'(?<![\w.:])([A-Za-z_:][\w:]*)\s*(\()?', query)
+    return selected | {name for name, call in names if not call and name.lower() not in KEYWORDS}
+
+
+def dashboard_metrics():
+    names = {name for board in dashboards().values() for query in queries(board) for name in metric_names(query)}
+    assert names, 'no metric names found in the dashboards'
+    return names
+
+
+def unproduced_series():
+    """Prometheus names of the contract counters the client examples never
+    increment (classic translation of a `{unit}` counter: underscores, _total)."""
+    contract = json.loads((ROOT / 'observability/client-contract.json').read_text())['metrics']
+    assert set(UNPRODUCED_COUNTERS) <= contract.keys()
+    return {name.replace('.', '_') + '_total' for name in UNPRODUCED_COUNTERS}
+
+
+def test_metric_names_are_extracted_from_promql():
+    assert metric_names('sum by (le, messaging_destination_name) (rate(a_bucket{x="b{c}", y=~"$v"}[$__rate_interval]))'
+                        ' and on (messaging_destination_name) label_replace(b_ratio{q="1"}, "d", "$1", "q", "(.+)")'
+                        ' / ignoring(le) c_total offset 5m > NaN') == {'a_bucket', 'b_ratio', 'c_total'}
+    assert metric_names('label_values(m_ratio{a=~"$a", b="x"}, messaging_destination_name)') == {'m_ratio'}
+    assert metric_names('sum(rate({__name__="d_total", a="b"}[5m]))') == {'d_total'}
+    assert set(queries({'templating': {'list': [
+        {'type': 'datasource', 'query': 'prometheus'},
+        {'type': 'query', 'definition': 'label_values(e_ratio, a)', 'query': {'query': 'label_values(f_ratio, a)'}},
+    ]}})) == {'label_values(e_ratio, a)', 'label_values(f_ratio, a)'}
+
+
+def test_dashboards_link_to_each_other():
+    boards = dashboards()
+    assert set(boards) == {'postgremq-overview.json', 'postgremq-topic.json', 'postgremq-queue.json',
+                           'postgremq-clients.json'}
+    uids = {board['uid'] for board in boards.values()}
+    assert len(uids) == len(boards)
+    links = {(name, uid) for name, board in boards.items()
+             for uid in re.findall(r'/d/([^/?"]+)', json.dumps(board))}
+    assert {('postgremq-overview.json', 'postgremq-topic'), ('postgremq-overview.json', 'postgremq-queue'),
+            ('postgremq-topic.json', 'postgremq-queue')} <= links
+    assert {uid for _, uid in links} <= uids
+    for board in boards.values():
+        # Portable: every query names the datasource through the dashboard's variable.
+        assert '__inputs' not in board
+        datasources = re.findall(r'"datasource": (\{[^}]*\})', json.dumps(board))
+        assert datasources and all('${datasource}' in d or '-- Grafana --' in d for d in datasources)
 
 
 def test_collector_sql_and_client_examples():
@@ -129,6 +217,11 @@ def test_collector_sql_and_client_examples():
                                    for l in text.splitlines()), (counter, service, text)
 
             eventually(check_clients)
+            # Drift: every metric a dashboard queries is exported by the scenario,
+            # or is a contract counter the examples never increment.
+            exported = {line.split('{')[0].split(' ')[0] for line in fetch().splitlines() if not line.startswith('#')}
+            unexported = dashboard_metrics() - exported
+            assert unexported <= unproduced_series(), f'dashboard metrics not exported: {unexported - unproduced_series()}'
             # Verify changes reach the next scrape, including zero for an empty queue.
             with connection.cursor() as cur:
                 cur.execute('DELETE FROM postgremq.queue_messages')

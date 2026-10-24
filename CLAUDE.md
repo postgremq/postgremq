@@ -219,8 +219,9 @@ plus mq when the release commit carries a new migration:
   `<type>(<scope>)[!]: <subject>`, subject lowercase, imperative, no period,
   under ~72 chars. Types: `feat` (minor release), `fix` (patch), `perf`,
   `revert`, `deps`; `docs`, `test`, `refactor`, `build`, `ci`, `chore` never
-  release anything. Scopes: `sql`, `go`, `cli`, `ts`, `rs`, `docs`, `ci`,
-  `release`, or several (`sql,go`). Body: what and why, wrapped at 72.
+  release anything. Scopes: `sql`, `go`, `cli`, `ts`, `rs`, `dashboards`
+  (`observability/dashboards/`, releases nothing), `docs`, `ci`, `release`, or
+  several (`sql,go`). Body: what and why, wrapped at 72.
 - **Breaking change**: `!` after the scope AND a `BREAKING CHANGE: <what
   breaks and how to migrate>` footer. Pre-1.0 it is a minor bump. API
   signature changes, renamed packages/modules, changed SQL contracts are
