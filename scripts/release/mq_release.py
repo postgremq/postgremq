@@ -39,7 +39,9 @@ import schema  # noqa: E402
 from schema import Version  # noqa: E402
 
 SUBJECT = re.compile(r'^(?P<type>\w+)(?:\((?P<scope>[^)]*)\))?(?P<bang>!)?: (?P<subject>.+)$')
-BREAKING = re.compile(r'^BREAKING[ -]CHANGE: (.+?)(?=^\S[\w-]*: |\Z)', re.M | re.S)
+# The note ends at a blank line (as in Release Please's notes) or at the next
+# footer token, a word that starts with a letter (not `code: ...` text).
+BREAKING = re.compile(r'^BREAKING[ -]CHANGE: (.+?)(?=\n[ \t]*\n|^[A-Za-z][\w-]*: |\Z)', re.M | re.S)
 SECTIONS = [('feat', 'Features'), ('fix', 'Bug Fixes'), ('perf', 'Performance Improvements'),
             ('revert', 'Reverts'), ('deps', 'Dependencies')]
 MARKER = '<!-- postgremq:mq-release -->'
