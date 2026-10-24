@@ -17,7 +17,9 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version: '1.26'
-          cache-dependency-path: postgremq-go/**/go.sum
+          cache-dependency-path: |
+            postgremq-go/**/go.sum
+            observability/loadgen/go.sum
       - uses: actions/setup-node@v7
         with:
           node-version: '22'
@@ -42,4 +44,6 @@ jobs:
       # Built ahead of the test, so its run fits the test's per-client timeout.
       - run: cargo build --locked --example metrics --features otel
         working-directory: postgremq-rs
+      # Workspace mode (go.work): the dashboards' demo workload uses this tree's client.
+      - run: go vet ./observability/loadgen/...
       - run: pytest observability/test_collector.py -v

@@ -19,3 +19,6 @@ GitHub releases carry the same notes per tag.
 - A shared client metrics contract (`docs/observability.md`,
   `observability/client-contract.json`), a tested OpenTelemetry Collector
   configuration, and runnable metrics examples for every client.
+- Grafana dashboards (Overview, Topic, Queue, Clients) in
+  `observability/dashboards/grafana/`, with Prometheus and Grafana in the
+  compose demo and a continuous demo workload (`observability/loadgen`).

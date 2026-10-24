@@ -1,0 +1,7 @@
+# Demo only: scrapes the Collector's Prometheus endpoint (observability/compose.yaml).
+global:
+  scrape_interval: 15s
+scrape_configs:
+  - job_name: collector
+    static_configs:
+      - targets: ['collector:8889']

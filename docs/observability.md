@@ -15,10 +15,12 @@ installed:
 docker compose -f observability/compose.yaml up -d
 ```
 
-This starts an isolated PostgreSQL database on localhost:55432 and Collector
-Contrib **0.147.0**, with OTLP/HTTP on localhost:4318 and a Prometheus endpoint on
-localhost:8889. The SQL schema and demo queues are installed automatically.
-Demo credentials are only for this local database.
+This starts an isolated PostgreSQL database on localhost:55432, Collector
+Contrib **0.147.0** with OTLP/HTTP on localhost:4318 and a Prometheus endpoint on
+localhost:8889, Prometheus on localhost:59090, and Grafana with the
+[dashboards](#grafana-dashboards) on <http://localhost:53000>. The SQL schema and
+demo queues are installed automatically. Demo credentials are only for this
+local database.
 
 Run the clients in separate terminals, or sequentially:
 
@@ -52,13 +54,80 @@ Allow up to 15 seconds for queue metrics to appear. Names are translated to
 Prometheus syntax: for example `messaging.client.operation.duration` becomes
 `messaging_client_operation_duration_seconds`, with `_bucket`, `_count`, and
 `_sum` series, counters gain `_total`, and `postgremq.queue.active` (unit `1`)
-becomes `postgremq_queue_active_ratio`. Prometheus can scrape this endpoint; no
-Prometheus server is required to run the example. Stop and remove the demo
-database with:
+becomes `postgremq_queue_active_ratio`. The demo's Prometheus scrapes this
+endpoint every 15 seconds. Stop and remove the demo, with all its data, with:
 
 ```sh
 docker compose -f observability/compose.yaml down
 ```
+
+## Grafana dashboards
+
+[`observability/dashboards/grafana/`](../observability/dashboards/grafana/) has
+four dashboards for a Prometheus datasource, with drill-down links from
+Overview to Topic to Queue:
+
+| Dashboard | Shows |
+|---|---|
+| **PostgreMQ Overview** | Per database: queue count and active queues; ready, processing, delayed, exhausted and dead-letter totals; worst ready age; a per-topic table; backlog and ready age by queue; the top queues by backlog, ready age and DLQ |
+| **PostgreMQ Topic** | The topic's queues (state and ready age, from SQL); its producers' publish rate, latency, failures and transactional share; consume, ack and handler latency per queue |
+| **PostgreMQ Queue** | One queue's state over time; its consume, settlement, redelivery, handler duration and error rates, active handlers and renewal loss |
+| **PostgreMQ Clients** | Per application (`service_name`) and instance: operation rate, latency and errors; sent and consumed messages; handlers; the background renewal and keep-alive calls |
+
+With the demo running, start a continuous workload: publishing and consuming
+at a rate that swings over five minutes, redelivery, delayed and transactional
+publishes, dead-lettering, exhausted deliveries, failed publishes, lost leases
+and renewals, and an exclusive queue:
+
+```sh
+cd observability/loadgen
+go run .
+```
+
+It accepts `-rate` (mean orders per second) and `-duration`, and the same
+`DATABASE_URL` and `OTEL_EXPORTER_OTLP_ENDPOINT` as the examples. The one-shot
+examples are not enough for rate panels: each run exports a new cumulative
+count of 1, and the Collector replaces the previous value with it.
+
+To use the dashboards elsewhere, import the JSON files (Dashboards → New →
+Import) and pick a Prometheus datasource in each dashboard's **Data source**
+selector; each dashboard has its own selector. They need:
+
+- The Prometheus names the Collector's Prometheus exporter produces (classic
+  translation: underscores and unit suffixes, such as
+  `messaging_client_operation_duration_seconds_bucket`). Prometheus's own OTLP
+  receiver produces the same names with its default translation strategy. A
+  UTF-8 or no-suffix translation (`UnderscoreEscapingWithoutSuffixes`,
+  `NoUTF8EscapingWithSuffixes`, `NoTranslation`) does not match.
+- `service_instance_id` on the SQL gauges (the database identity, set by
+  `POSTGREMQ_DATABASE_ID`) and `service_name` on client metrics, as labels. The
+  Collector's exporter adds them with `resource_to_telemetry_conversion`, as in
+  the supplied configuration. Prometheus's OTLP receiver instead maps them to
+  `job` and `instance`, unless you configure
+  `otlp: { promote_resource_attributes: [service.name, service.instance.id] }`.
+  The dashboards do not use `job` or `instance`: a Prometheus that scrapes the
+  Collector replaces them with its own (`exported_job`, `exported_instance`).
+
+Panels built on client metrics are empty unless applications pass a meter
+provider; their descriptions say so. Client metrics carry no database
+identity: same-named topics or queues in different databases are added
+together, and the **Database** selector filters a client panel only through the
+queues it lists (the Topic dashboard's consumer panels), never by the
+application's own database.
+Publish rates count attempts, not committed publications.
+
+The dashboards are developed in the demo. Sign in as `admin` / `admin` to edit
+one, then export it (Export → Export as JSON) and replace the file, without
+the `id` field the export adds. Leave
+"Share dashboard with another instance" ("Export for sharing externally" in
+older versions) off: the dashboards select their datasource through their
+`datasource` variable, which works with both file provisioning and import,
+while an exported `${DS_PROMETHEUS}` input does not load through provisioning.
+Keep each `uid`, which the links use. `pytest observability/test_collector.py`
+checks that every metric a dashboard queries is exported by the clients and the
+Collector, or is defined in the client contract. Listing text and screenshots
+for grafana.com are in
+[`publish/`](../observability/dashboards/grafana/publish/).
 
 ## Database metrics
 
@@ -345,7 +414,9 @@ pytest mq/tests/tests.py observability/test_collector.py -v
 The Collector test starts isolated Docker containers with the pinned image, runs
 the shipped configuration using a restricted database login, verifies SQL metric
 values and their change after a scrape, runs the three client examples, and
-verifies their exported OTLP metrics. It uses dynamic host ports and removes all
+verifies their exported OTLP metrics. It then checks that every metric the Grafana
+dashboards query is in that output or in the client contract, and that the
+dashboards' links point at each other. It uses dynamic host ports and removes all
 containers and networks on exit. It needs `mq/tests/requirements.txt`, Docker,
 Go 1.26+ (it runs `go run .` in `postgremq-go/examples/metrics`), `npm ci` in
 `postgremq-ts`, and a Rust toolchain (it builds the Rust example on first run).

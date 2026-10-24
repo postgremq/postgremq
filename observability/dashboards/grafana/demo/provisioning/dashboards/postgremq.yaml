@@ -1,0 +1,9 @@
+apiVersion: 1
+providers:
+  - name: PostgreMQ
+    folder: PostgreMQ
+    type: file
+    # Edit in the UI, then export the JSON and commit it (docs/observability.md).
+    allowUiUpdates: false
+    options:
+      path: /etc/grafana/dashboards/postgremq
