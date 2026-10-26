@@ -375,15 +375,13 @@ export interface ConsumerOptions {
      */
     extensionThreshold?: number;
     /**
-     * @deprecated Ignored (still validated: must be a positive integer if
-     * set). Auto-extension always re-extends by
+     * @deprecated Ignored. Auto-extension always re-extends by
      * `visibilityTimeoutSec` (matching the Go client) so the granted lease
      * and the next-extension schedule stay consistent.
      */
     extensionSec?: number;
     /**
-     * @deprecated Ignored (still validated: must be a positive integer if
-     * set). The extension batch cap is a connection option
+     * @deprecated Ignored. The extension batch cap is a connection option
      * (`ConnectionOptions.extenderBatchSize`) because auto-extension is
      * connection-level — one actor batches across all consumers, so a
      * per-consumer cap is meaningless.

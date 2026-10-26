@@ -114,9 +114,13 @@ function extKey(queue: string, id: number, token: string): string {
  *  between one and five seconds: an entry about to expire must not fail the call
  *  for the rest of the batch. The SQL leaves out a row whose deadline has passed, so
  *  it is reported lost from the result. */
-function heartbeatBudgetMs(deadlines: Date[]): number {
-  const earliest = Math.min(...deadlines.map((d) => d.getTime() - Date.now()));
-  return Math.max(1000, Math.min(5000, earliest));
+export function heartbeatBudgetMs(deadlines: Date[]): number {
+  const now = Date.now();
+  let budget = 5000;
+  for (const deadline of deadlines) {
+    budget = Math.min(budget, deadline.getTime() - now);
+  }
+  return Math.max(1000, budget);
 }
 
 /**
@@ -254,7 +258,7 @@ export class Connection implements IConnection {
       this.ownsPool = false;
     } else {
       // Create new pool from connection string or config
-      const poolConfig: PoolConfig = options.config || {};
+      const poolConfig: PoolConfig = { ...options.config };
 
       if (options.connectionString) {
         poolConfig.connectionString = options.connectionString;
