@@ -856,71 +856,7 @@
         "x": 0,
         "y": 14,
         "w": 8,
-        "h": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Settlements",
-      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. Client metrics carry no database identity: this panel is not filtered by Database, and same-named queues or topics in different databases are added together. Ack, nack and release calls per second; failed calls carry their error type.",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (messaging_operation_name, error_type) (rate(messaging_client_operation_duration_seconds_count{messaging_system=\"postgremq\", messaging_destination_name=\"$queue\", messaging_operation_name=~\"ack|nack|release\"}[$__rate_interval]))",
-          "refId": "A",
-          "legendFormat": "{{messaging_operation_name}} {{error_type}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisSoftMin": 0
-          },
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "id": 14,
-      "gridPos": {
-        "x": 8,
-        "y": 14,
-        "w": 8,
-        "h": 8
+        "h": 9
       },
       "datasource": {
         "type": "prometheus",
@@ -981,9 +917,221 @@
       },
       "id": 15,
       "gridPos": {
+        "x": 8,
+        "y": 14,
+        "w": 8,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "First-delivery wait",
+      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. Client metrics carry no database identity: this panel is not filtered by Database, and same-named queues or topics in different databases are added together. How long a message waited for its first delivery: from when it became deliverable (its publish, or a later deliver_after) to its first claim, measured by the database clock. Redeliveries after a nack, release or lease expiry are not counted; a DLQ requeue counts as a new delivery.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.5, sum by (le) (rate(postgremq_client_first_delivery_wait_seconds_bucket{messaging_system=\"postgremq\", messaging_destination_name=\"$queue\"}[$__rate_interval])))",
+          "refId": "A",
+          "legendFormat": "p50",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(postgremq_client_first_delivery_wait_seconds_bucket{messaging_system=\"postgremq\", messaging_destination_name=\"$queue\"}[$__rate_interval])))",
+          "refId": "B",
+          "legendFormat": "p95",
+          "range": true
+        },
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "histogram_quantile(0.99, sum by (le) (rate(postgremq_client_first_delivery_wait_seconds_bucket{messaging_system=\"postgremq\", messaging_destination_name=\"$queue\"}[$__rate_interval])))",
+          "refId": "C",
+          "legendFormat": "p99",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "bottom",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 21,
+      "gridPos": {
         "x": 16,
         "y": 14,
         "w": 8,
+        "h": 9
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Settlements",
+      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. Client metrics carry no database identity: this panel is not filtered by Database, and same-named queues or topics in different databases are added together. Ack, nack and release calls per second; failed calls carry their error type.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (messaging_operation_name, error_type) (rate(messaging_client_operation_duration_seconds_count{messaging_system=\"postgremq\", messaging_destination_name=\"$queue\", messaging_operation_name=~\"ack|nack|release\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{messaging_operation_name}} {{error_type}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 14,
+      "gridPos": {
+        "x": 0,
+        "y": 23,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Operation errors",
+      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. Client metrics carry no database identity: this panel is not filtered by Database, and same-named queues or topics in different databases are added together. Failed consume, settle and extend calls per second.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (messaging_operation_name, error_type) (rate(messaging_client_operation_duration_seconds_count{messaging_system=\"postgremq\", messaging_destination_name=\"$queue\", messaging_operation_name!=\"publish\", error_type!=\"\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{messaging_operation_name}} {{error_type}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 19,
+      "gridPos": {
+        "x": 12,
+        "y": 23,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -1066,9 +1214,9 @@
       "id": 16,
       "gridPos": {
         "x": 0,
-        "y": 22,
-        "w": 8,
-        "h": 8
+        "y": 31,
+        "w": 12,
+        "h": 9
       },
       "datasource": {
         "type": "prometheus",
@@ -1129,10 +1277,10 @@
       },
       "id": 17,
       "gridPos": {
-        "x": 8,
-        "y": 22,
-        "w": 8,
-        "h": 8
+        "x": 12,
+        "y": 31,
+        "w": 12,
+        "h": 9
       },
       "datasource": {
         "type": "prometheus",
@@ -1179,7 +1327,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -1193,72 +1341,8 @@
       },
       "id": 18,
       "gridPos": {
-        "x": 16,
-        "y": 22,
-        "w": 8,
-        "h": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Operation errors",
-      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. Client metrics carry no database identity: this panel is not filtered by Database, and same-named queues or topics in different databases are added together. Failed consume, settle and extend calls per second.",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (messaging_operation_name, error_type) (rate(messaging_client_operation_duration_seconds_count{messaging_system=\"postgremq\", messaging_destination_name=\"$queue\", messaging_operation_name!=\"publish\", error_type!=\"\"}[$__rate_interval]))",
-          "refId": "A",
-          "legendFormat": "{{messaging_operation_name}} {{error_type}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisSoftMin": 0
-          },
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "right",
-          "showLegend": true,
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "id": 19,
-      "gridPos": {
         "x": 0,
-        "y": 30,
+        "y": 40,
         "w": 12,
         "h": 8
       },
@@ -1322,7 +1406,7 @@
       "id": 20,
       "gridPos": {
         "x": 12,
-        "y": 30,
+        "y": 40,
         "w": 12,
         "h": 8
       },

@@ -92,7 +92,7 @@ Runnable programs are in [examples/](examples/README.md).
 
 From its first `Consume` or `ConsumeHandler` until `Close`, each `Connection` holds one pooled connection for `LISTEN` (shared by all its consumers), so size the pool for that plus publish, consume, settle and heartbeat traffic. `LISTEN` needs session affinity and does not work through a transaction-mode pooler. If the session fails, the client closes that connection and reconnects after a delay that starts at 1 second and grows ×1.5 per attempt up to 30 seconds, jittered down by up to half, and starts again from 1 second once a session has been listening for 5 seconds. Notifications sent while it is disconnected are lost, so once the new session is listening every consumer is woken to fetch; consumers also poll every `WithCheckTimeout`. Connection methods are safe for concurrent use.
 
-On connect, `Dial` and `DialFromPool` read `postgremq.info()` and check that the installation's schema version is on an mq compatibility line this client implements (`postgremq.SupportedMQVersions()`, currently `["0.2"]`). A line is an mq major, or before 1.0 a major and minor: a breaking schema change bumps the major, or before 1.0 the minor, so a client built for mq 0.2 accepts 0.2.x and rejects 0.1.x and 0.3.0. Otherwise they return a `*postgremq.CompatibilityError` (`errors.Is(err, postgremq.ErrIncompatibleSchema)`) with the schema version and the supported lines; a database without `info()` (not installed, or older than discovery), or whose `info()` reports no schema version, gets the same error saying it needs an installation or upgrade. Connection and permission errors are returned as they are. Within a supported line, a function the installation lacks fails with the database's error (SQLSTATE `42883`) like any other.
+On connect, `Dial` and `DialFromPool` read `postgremq.info()` and check that the installation's schema version is on an mq compatibility line this client implements (`postgremq.SupportedMQVersions()`, currently `["0.3"]`). A line is an mq major, or before 1.0 a major and minor: a breaking schema change bumps the major, or before 1.0 the minor, so a client built for mq 0.3 accepts 0.3.x and rejects 0.2.x and 0.4.0. Otherwise they return a `*postgremq.CompatibilityError` (`errors.Is(err, postgremq.ErrIncompatibleSchema)`) with the schema version and the supported lines; a database without `info()` (not installed, or older than discovery), or whose `info()` reports no schema version, gets the same error saying it needs an installation or upgrade. Connection and permission errors are returned as they are. Within a supported line, a function the installation lacks fails with the database's error (SQLSTATE `42883`) like any other.
 
 | Connection option | Default | Effect |
 |---|---|---|
@@ -437,7 +437,8 @@ Choose intervals with the guidance in [mq/README.md](../mq/README.md#maintenance
 
 - `messaging.client.operation.duration`, `messaging.process.duration`;
 - `messaging.client.sent.messages`, `messaging.client.consumed.messages`;
-- `postgremq.client.handlers.active`, `postgremq.client.renewal.lost`.
+- `postgremq.client.handlers.active`, `postgremq.client.renewal.lost`;
+- `postgremq.client.first_delivery.wait`: how long each message waited for its first delivery, measured by the database.
 
 `messaging.process.duration` and `postgremq.client.handlers.active` cover `ConsumeHandler` handlers only.
 

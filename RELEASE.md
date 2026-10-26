@@ -81,7 +81,7 @@ reports the same number; `FormatSchemaVersion` (Go), `format_schema_version`
 and the CLI shows both.
 
 Each client declares the mq lines it implements (`SupportedMQVersions()` in
-Go, `SUPPORTED_MQ_VERSIONS` in TypeScript and Rust; `["0.2"]` now), checks
+Go, `SUPPORTED_MQ_VERSIONS` in TypeScript and Rust; `["0.3"]` now), checks
 `schema_version` when it connects, and rejects any other line with a typed
 compatibility error that names the schema version and the supported lines
 (Go `*CompatibilityError` / `ErrIncompatibleSchema`, TypeScript

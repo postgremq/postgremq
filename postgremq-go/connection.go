@@ -762,7 +762,8 @@ func (c *Connection) executePublish(ctx context.Context, tx Tx, topic string, pa
 func (c *Connection) consumeMessages(ctx context.Context, queue string, limit int, vt int, generations ...string) (result []*Message, resultErr error) {
 	finishMetric := c.metrics.startOperation(ctx, "consume", queue, false)
 	defer func() { finishMetric(resultErr) }()
-	defer func() { c.metrics.recordConsumed(ctx, queue, result, resultErr) }()
+	var firstWaits []int64
+	defer func() { c.metrics.recordConsumed(ctx, queue, result, firstWaits, resultErr) }()
 	if c.isClosed() {
 		return nil, ErrConnectionClosed
 	}
@@ -783,7 +784,7 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 	}
 	sent := time.Now() // VT is sent plus the time left by the database clock
 	rows, err := c.pool.Query(ctx,
-		"SELECT message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq FROM postgremq.consume_message($1, $2, $3, $4)",
+		"SELECT message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq, first_delivery_wait_ms FROM postgremq.consume_message($1, $2, $3, $4)",
 		queue, vt, limit, generation)
 	if err != nil {
 		return nil, mapPgError(fmt.Errorf("failed to consume messages: %w", err))
@@ -801,12 +802,16 @@ func (c *Connection) consumeMessages(ctx context.Context, queue string, limit in
 			publishedAt      time.Time
 			groupKey         *string
 			groupSeq         *int64
+			firstWaitMs      *int64
 		)
-		if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vtRemainingMs, &publishedAt, &groupKey, &groupSeq); err != nil {
+		if err := rows.Scan(&id, &payload, &consumerToken, &deliveryAttempts, &vtRemainingMs, &publishedAt, &groupKey, &groupSeq, &firstWaitMs); err != nil {
 			// Return successfully-scanned messages alongside the error.
 			// They're already claimed server-side; the caller can deliver
 			// them while still seeing the error and scheduling a retry.
 			return messages, mapPgError(fmt.Errorf("failed to scan message: %w", err))
+		}
+		if firstWaitMs != nil {
+			firstWaits = append(firstWaits, *firstWaitMs)
 		}
 
 		// Create a new Message and ensure all internal fields are initialized.

@@ -17,13 +17,34 @@
     7.5,
     10
   ],
+  "first_delivery_wait_boundaries": [
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.075,
+    0.1,
+    0.25,
+    0.5,
+    0.75,
+    1,
+    2.5,
+    5,
+    7.5,
+    10,
+    30,
+    60,
+    300,
+    900
+  ],
   "metrics": {
     "messaging.client.operation.duration": "s",
     "messaging.process.duration": "s",
     "messaging.client.consumed.messages": "{message}",
     "postgremq.client.handlers.active": "{handler}",
     "postgremq.client.renewal.lost": "{message}",
-    "messaging.client.sent.messages": "{message}"
+    "messaging.client.sent.messages": "{message}",
+    "postgremq.client.first_delivery.wait": "s"
   },
   "scenario_operations": [
     {
@@ -102,6 +123,10 @@
   "received": {
     "first": 2,
     "redelivered": 2
+  },
+  "first_delivery_wait": {
+    "destination": "q",
+    "count": 2
   },
   "sent": [
     {

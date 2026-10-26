@@ -70,8 +70,8 @@ Overview to Topic to Queue:
 | Dashboard | Shows |
 |---|---|
 | **PostgreMQ Overview** | Per database: queue count and active queues; ready, processing, delayed, exhausted and dead-letter totals; worst ready age; a per-topic table; backlog and ready age by queue; the top queues by backlog, ready age and DLQ |
-| **PostgreMQ Topic** | The topic's queues (state and ready age, from SQL); its producers' publish rate, latency, failures and transactional share; consume, ack and handler latency per queue |
-| **PostgreMQ Queue** | One queue's state over time; its consume, settlement, redelivery, handler duration and error rates, active handlers and renewal loss |
+| **PostgreMQ Topic** | The topic's queues (state and ready age, from SQL); its producers' publish rate, latency, failures and transactional share; consume, ack and handler latency per queue; the first-delivery wait across its queues |
+| **PostgreMQ Queue** | One queue's state over time; its consume, settlement, redelivery, handler duration and error rates, active handlers, renewal loss and first-delivery wait |
 | **PostgreMQ Clients** | Per application (`service_name`) and instance: operation rate, latency and errors; sent and consumed messages; handlers; the background renewal and keep-alive calls |
 
 With the demo running, start a continuous workload: publishing and consuming
@@ -285,9 +285,11 @@ scenario.
 | `messaging.client.consumed.messages` | Counter / `{message}` | Each delivery successfully decoded from a consume result |
 | `postgremq.client.handlers.active` | UpDownCounter / `{handler}` | +1 at callback entry, -1 at callback exit |
 | `postgremq.client.renewal.lost` | Counter / `{message}` | The connection's automatic renewal retires a still-registered delivery whose lease it found lost (omitted from a renewal result, or out of confirmed lease) |
+| `postgremq.client.first_delivery.wait` | Histogram / `s` | Each delivery successfully decoded from a consume result that is the message's first on its queue, with the wait the database measured. A row that fails to decode records no wait; its first delivery is already marked, so it is never recorded |
 
 Histogram boundaries in seconds are `0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25,
-0.5, 0.75, 1, 2.5, 5, 7.5, 10`. Applications can override aggregation through SDK
+0.5, 0.75, 1, 2.5, 5, 7.5, 10`; the first-delivery wait adds `30, 60, 300, 900`,
+since a stalled queue waits minutes. Applications can override aggregation through SDK
 views. Histogram counts provide operation and handler counts without duplicate
 counters.
 
@@ -308,7 +310,7 @@ overall.
 ### Attributes
 
 Operation duration, processing duration, active handlers, sent and consumed
-counts share:
+counts and the first-delivery wait share:
 
 - `messaging.system = postgremq`.
 - `messaging.operation.name`: the operation listed above, or `process` for
@@ -317,8 +319,8 @@ counts share:
   for ack/nack/release; otherwise the same value as the operation name (`process`,
   `extend`, `extend_batch`, `keep_alive`).
 - `messaging.destination.name`: the topic for publish, the queue for single-queue
-  operations, processing and consumed counts. Omitted for `extend_batch` and
-  `keep_alive`, which span queues.
+  operations, processing, consumed counts and the first-delivery wait. Omitted
+  for `extend_batch` and `keep_alive`, which span queues.
 
 Operation duration and the sent counter also have `postgremq.transaction`: `true`
 for publish and ack inside a caller-owned transaction, `false` otherwise. A
@@ -371,6 +373,44 @@ recorded once per delivery, not again on processing. A Go partial batch counts t
 rows decoded before the error, with that operation's `error.type` attached; Rust
 skips (and does not count) a claimed row it cannot decode. A response lost entirely
 cannot be counted by the client.
+
+### First-delivery wait
+
+How long a message waited for a consumer: from when it became deliverable on the
+queue to its first delivery there, the claim that leased it to a client (time
+it then spends in the client's buffer is not counted). It shows the waits that no other metric
+reports: a lost or late notification (the consumer finds the message on its next
+poll), every consumer busy or a prefetched batch still being processed, and a
+group head blocking the rest of its group. It is a distribution, unlike
+`postgremq.queue.oldest_ready_age`, a snapshot taken at each scrape.
+
+`consume_message` computes the wait on the database clock and returns it as
+`first_delivery_wait_ms`; the clients record that value without reading their
+own clock, so clock skew between application and database does not affect it.
+The wait starts at the later of the message's distribution to the queue and its
+`deliver_after`: a delayed message's intended delay is not counted, and a
+`deliver_after` in the past counts from the publish. The time of the first
+delivery is kept in `queue_messages.first_delivered_at`, so only the first
+delivery records a sample: redeliveries after a nack, a release or a lease
+expiry record none. A first delivery that is later released still counts. A DLQ
+requeue puts the message back as new (`published_at` and `vt` at the requeue, 0
+attempts, `first_delivered_at` cleared), so its next delivery records the wait
+since the requeue. `first_delivery_wait_ms` is whole milliseconds, rounded down
+and never negative; the clients record it in seconds.
+
+For a publish inside a transaction, `published_at` is set when the message is
+inserted, but the message becomes visible only at commit, so the wait includes
+the time the publishing transaction stayed open after the publish: a real delay
+for consumers. The mq 0.3.0 migration sets `first_delivered_at` to its own time
+on the rows already delivered: processing rows and pending rows with
+`delivery_attempts` above 0; their next claim records nothing.
+A pending row with `delivery_attempts` 0 that was released before the upgrade
+cannot be told from an undelivered one: its next claim records one sample,
+measured from the release. Stop the consumers before migrating: a mq 0.2
+client's claim that is waiting for the migration's locks when it commits still
+runs the 0.2 `consume_message`, which leaves `first_delivered_at` unset, so
+that message's next redelivery records a sample measured from the nack, release
+or lease expiry.
 
 ### Handler processing
 

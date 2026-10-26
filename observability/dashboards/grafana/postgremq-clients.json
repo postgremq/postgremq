@@ -235,7 +235,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -251,7 +251,7 @@
       "gridPos": {
         "x": 0,
         "y": 9,
-        "w": 8,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -299,7 +299,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -313,73 +313,9 @@
       },
       "id": 5,
       "gridPos": {
-        "x": 8,
+        "x": 12,
         "y": 9,
-        "w": 8,
-        "h": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Operation errors",
-      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do.",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (messaging_operation_name, error_type) (rate(messaging_client_operation_duration_seconds_count{messaging_system=\"postgremq\", service_name=~\"$service\", service_instance_id=~\"$instance\", error_type!=\"\"}[$__rate_interval]))",
-          "refId": "A",
-          "legendFormat": "{{messaging_operation_name}} {{error_type}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisSoftMin": 0
-          },
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "id": 6,
-      "gridPos": {
-        "x": 16,
-        "y": 9,
-        "w": 8,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -616,7 +552,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -632,7 +568,7 @@
       "gridPos": {
         "x": 0,
         "y": 27,
-        "w": 8,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -680,7 +616,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -694,73 +630,9 @@
       },
       "id": 12,
       "gridPos": {
-        "x": 8,
+        "x": 12,
         "y": 27,
-        "w": 8,
-        "h": 8
-      },
-      "datasource": {
-        "type": "prometheus",
-        "uid": "${datasource}"
-      }
-    },
-    {
-      "type": "timeseries",
-      "title": "Handler errors",
-      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do.",
-      "targets": [
-        {
-          "datasource": {
-            "type": "prometheus",
-            "uid": "${datasource}"
-          },
-          "expr": "sum by (messaging_destination_name, error_type) (rate(messaging_process_duration_seconds_count{messaging_system=\"postgremq\", service_name=~\"$service\", service_instance_id=~\"$instance\", error_type!=\"\"}[$__rate_interval]))",
-          "refId": "A",
-          "legendFormat": "{{messaging_destination_name}} {{error_type}}",
-          "range": true
-        }
-      ],
-      "fieldConfig": {
-        "defaults": {
-          "unit": "ops",
-          "custom": {
-            "drawStyle": "line",
-            "lineWidth": 1,
-            "fillOpacity": 0,
-            "showPoints": "never",
-            "spanNulls": false,
-            "stacking": {
-              "mode": "none",
-              "group": "A"
-            },
-            "axisSoftMin": 0
-          },
-          "color": {
-            "mode": "palette-classic"
-          }
-        },
-        "overrides": []
-      },
-      "options": {
-        "legend": {
-          "displayMode": "table",
-          "placement": "bottom",
-          "showLegend": true,
-          "calcs": [
-            "lastNotNull",
-            "max"
-          ]
-        },
-        "tooltip": {
-          "mode": "multi",
-          "sort": "desc"
-        }
-      },
-      "id": 13,
-      "gridPos": {
-        "x": 16,
-        "y": 27,
-        "w": 8,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -821,7 +693,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -837,7 +709,7 @@
       "gridPos": {
         "x": 0,
         "y": 36,
-        "w": 6,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -885,7 +757,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -899,9 +771,150 @@
       },
       "id": 16,
       "gridPos": {
-        "x": 6,
+        "x": 12,
         "y": 36,
-        "w": 6,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "row",
+      "title": "Errors",
+      "collapsed": false,
+      "panels": [],
+      "id": 19,
+      "gridPos": {
+        "x": 0,
+        "y": 44,
+        "w": 24,
+        "h": 1
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Operation errors",
+      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (messaging_operation_name, error_type) (rate(messaging_client_operation_duration_seconds_count{messaging_system=\"postgremq\", service_name=~\"$service\", service_instance_id=~\"$instance\", error_type!=\"\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{messaging_operation_name}} {{error_type}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 6,
+      "gridPos": {
+        "x": 0,
+        "y": 45,
+        "w": 12,
+        "h": 8
+      },
+      "datasource": {
+        "type": "prometheus",
+        "uid": "${datasource}"
+      }
+    },
+    {
+      "type": "timeseries",
+      "title": "Handler errors",
+      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do.",
+      "targets": [
+        {
+          "datasource": {
+            "type": "prometheus",
+            "uid": "${datasource}"
+          },
+          "expr": "sum by (messaging_destination_name, error_type) (rate(messaging_process_duration_seconds_count{messaging_system=\"postgremq\", service_name=~\"$service\", service_instance_id=~\"$instance\", error_type!=\"\"}[$__rate_interval]))",
+          "refId": "A",
+          "legendFormat": "{{messaging_destination_name}} {{error_type}}",
+          "range": true
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "ops",
+          "custom": {
+            "drawStyle": "line",
+            "lineWidth": 1,
+            "fillOpacity": 0,
+            "showPoints": "never",
+            "spanNulls": false,
+            "stacking": {
+              "mode": "none",
+              "group": "A"
+            },
+            "axisSoftMin": 0
+          },
+          "color": {
+            "mode": "palette-classic"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "showLegend": true,
+          "calcs": [
+            "lastNotNull",
+            "max"
+          ]
+        },
+        "tooltip": {
+          "mode": "multi",
+          "sort": "desc"
+        }
+      },
+      "id": 13,
+      "gridPos": {
+        "x": 12,
+        "y": 45,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -949,7 +962,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -963,9 +976,9 @@
       },
       "id": 17,
       "gridPos": {
-        "x": 12,
-        "y": 36,
-        "w": 6,
+        "x": 0,
+        "y": 53,
+        "w": 12,
         "h": 8
       },
       "datasource": {
@@ -1013,7 +1026,7 @@
       "options": {
         "legend": {
           "displayMode": "table",
-          "placement": "bottom",
+          "placement": "right",
           "showLegend": true,
           "calcs": [
             "lastNotNull",
@@ -1027,9 +1040,9 @@
       },
       "id": 18,
       "gridPos": {
-        "x": 18,
-        "y": 36,
-        "w": 6,
+        "x": 12,
+        "y": 53,
+        "w": 12,
         "h": 8
       },
       "datasource": {

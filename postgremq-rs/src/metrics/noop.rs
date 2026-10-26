@@ -21,7 +21,14 @@ impl Metrics {
         SendAttempt
     }
 
-    pub(crate) const fn consumed(&self, _queue: &str, _first: u64, _redelivered: u64) {}
+    pub(crate) fn consumed(
+        &self,
+        _queue: &str,
+        _first: u64,
+        _redelivered: u64,
+        _first_waits: impl IntoIterator<Item = i64>,
+    ) {
+    }
 
     pub(crate) const fn handler(&self, _queue: &str) -> HandlerTimer {
         HandlerTimer

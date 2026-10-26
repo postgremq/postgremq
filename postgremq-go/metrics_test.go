@@ -82,8 +82,13 @@ func TestMetricsContractWithTransactionsAndRedelivery(t *testing.T) {
 			Transaction                    bool
 			Count                          uint64
 		} `json:"scenario_operations"`
-		Received struct{ First, Redelivered int64 }
-		Sent     []struct {
+		Received                    struct{ First, Redelivered int64 }
+		FirstDeliveryWaitBoundaries []float64 `json:"first_delivery_wait_boundaries"`
+		FirstDeliveryWait           struct {
+			Destination string
+			Count       uint64
+		} `json:"first_delivery_wait"`
+		Sent []struct {
 			Destination, Error string
 			Transaction        bool
 			Count              int64
@@ -94,7 +99,7 @@ func TestMetricsContractWithTransactionsAndRedelivery(t *testing.T) {
 	scope := data.ScopeMetrics[0]
 	require.Equal(t, contract.Scope, scope.Scope.Name)
 	require.Equal(t, contract.Version, scope.Scope.Version)
-	var operations []metricdata.HistogramDataPoint[float64]
+	var operations, waits []metricdata.HistogramDataPoint[float64]
 	var sent []metricdata.DataPoint[int64]
 	totals := map[bool]int64{}
 	for _, m := range scope.Metrics {
@@ -104,6 +109,8 @@ func TestMetricsContractWithTransactionsAndRedelivery(t *testing.T) {
 			operations = m.Data.(metricdata.Histogram[float64]).DataPoints
 		case "messaging.client.sent.messages":
 			sent = m.Data.(metricdata.Sum[int64]).DataPoints
+		case "postgremq.client.first_delivery.wait":
+			waits = m.Data.(metricdata.Histogram[float64]).DataPoints
 		case "messaging.client.consumed.messages":
 			for _, p := range m.Data.(metricdata.Sum[int64]).DataPoints {
 				v, _ := p.Attributes.Value(attribute.Key("postgremq.redelivered"))
@@ -151,6 +158,57 @@ func TestMetricsContractWithTransactionsAndRedelivery(t *testing.T) {
 	}
 	require.Equal(t, contract.Received.First, totals[false])
 	require.Equal(t, contract.Received.Redelivered, totals[true])
+	require.Len(t, waits, 1)
+	waitAttrs := attribute.NewSet(
+		attribute.String("messaging.system", "postgremq"), attribute.String("messaging.operation.name", "consume"),
+		attribute.String("messaging.operation.type", "receive"), attribute.String("messaging.destination.name", contract.FirstDeliveryWait.Destination),
+	)
+	require.True(t, waits[0].Attributes.Equals(&waitAttrs), "%v", waits[0].Attributes)
+	require.Equal(t, contract.FirstDeliveryWait.Count, waits[0].Count)
+	require.Equal(t, contract.FirstDeliveryWaitBoundaries, waits[0].Bounds)
+}
+
+// The wait comes from the database clock (consume_message's
+// first_delivery_wait_ms) and only for a message's first delivery: a
+// redelivery after a nack or a release records nothing.
+func TestMetricsFirstDeliveryWait(t *testing.T) {
+	pool, ctx := setupTestConnection(t)
+	reader := sdkmetric.NewManualReader()
+	provider := sdkmetric.NewMeterProvider(sdkmetric.WithReader(reader))
+	defer func() { require.NoError(t, provider.Shutdown(ctx)) }()
+	conn, err := postgremq.DialFromPool(context.Background(), pool, postgremq.WithMeterProvider(provider))
+	require.NoError(t, err)
+	defer func() { require.NoError(t, conn.Close()) }()
+	require.NoError(t, conn.CreateTopic(ctx, "wait"))
+	require.NoError(t, conn.CreateQueue(ctx, "q", "wait", false))
+	_, err = conn.Publish(ctx, "wait", []byte(`{}`))
+	require.NoError(t, err)
+	// Two seconds of waiting by the database clock, without sleeping.
+	_, err = pool.Exec(ctx, "UPDATE postgremq.queue_messages SET published_at = published_at - interval '2 seconds', vt = vt - interval '2 seconds'")
+	require.NoError(t, err)
+	take := func() *postgremq.Message {
+		msgs, e := conn.ConsumeMessages(ctx, "q", 1, 30)
+		require.NoError(t, e)
+		require.Len(t, msgs, 1)
+		return msgs[0]
+	}
+	require.NoError(t, take().Nack(ctx))
+	require.NoError(t, take().Release(ctx))
+	require.NoError(t, take().Ack(ctx))
+
+	var data metricdata.ResourceMetrics
+	require.NoError(t, reader.Collect(ctx, &data))
+	var waits []metricdata.HistogramDataPoint[float64]
+	for _, m := range data.ScopeMetrics[0].Metrics {
+		if m.Name == "postgremq.client.first_delivery.wait" {
+			require.Equal(t, "s", m.Unit)
+			waits = m.Data.(metricdata.Histogram[float64]).DataPoints
+		}
+	}
+	require.Len(t, waits, 1)
+	require.EqualValues(t, 1, waits[0].Count)
+	require.GreaterOrEqual(t, waits[0].Sum, 2.0)
+	require.Less(t, waits[0].Sum, 30.0)
 }
 
 func boolInt(v bool) int {

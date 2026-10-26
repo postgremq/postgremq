@@ -150,6 +150,19 @@ def test_fk_columns_not_null(cur: psycopg2.extensions.cursor) -> None:
     """)
     assert cur.fetchone()[0] == 'NO'
 
+def test_published_at_columns_not_null(cur: psycopg2.extensions.cursor) -> None:
+    """Every published_at is NOT NULL (consume_message's wait counts from
+    queue_messages.published_at; payload retention compares
+    messages.published_at); inserts still get clock_timestamp() by default."""
+    cur.execute("""
+        SELECT table_name, is_nullable, column_default FROM information_schema.columns
+        WHERE table_schema = 'postgremq' AND column_name = 'published_at'
+          AND table_name IN ('messages', 'queue_messages', 'dead_letter_queue')
+        ORDER BY table_name
+    """)
+    assert [tuple(row) for row in cur.fetchall()] == [
+        (table, 'NO', 'clock_timestamp()') for table in ('dead_letter_queue', 'messages', 'queue_messages')]
+
 def test_consumer_token_is_uuid(cur: psycopg2.extensions.cursor) -> None:
     """consume_message now mints consumer tokens with gen_random_uuid(); the
     token should parse as a UUID (no more timestamp+random()+txid hack)."""
@@ -1770,6 +1783,171 @@ def test_consume_message_published_at(cur: psycopg2.extensions.cursor) -> None:
     assert msg['published_at'] is not None
     assert abs(msg['published_at'] - before_publish) < timedelta(milliseconds=100)
     assert abs(msg['published_at'] - after_publish) < timedelta(milliseconds=100)
+
+
+def _consume_first_wait(cur, queue: str, vt: int = 30):
+    cur.execute("SELECT message_id, consumer_token, first_delivery_wait_ms "
+                "FROM postgremq.consume_message(%s, %s)", (queue, vt))
+    return cur.fetchone()
+
+
+def _first_delivered_at(cur, queue: str, message_id: int):
+    cur.execute("SELECT first_delivered_at FROM postgremq.queue_messages "
+                "WHERE queue_name = %s AND message_id = %s", (queue, message_id))
+    return cur.fetchone()[0]
+
+
+def test_first_delivery_wait_counts_from_publish(cur):
+    """The first claim returns the wait since the row was distributed, by the
+    database clock, and records the claim time in first_delivered_at."""
+    cur.execute("SELECT postgremq.create_topic('fdw'); SELECT postgremq.create_queue('fdw_q', 'fdw')")
+    cur.execute("SELECT postgremq.publish_message('fdw', '{}'::jsonb)")
+    message_id = cur.fetchone()[0]
+    # Two seconds of waiting, without sleeping.
+    cur.execute("UPDATE postgremq.queue_messages SET published_at = published_at - interval '2 seconds', "
+                "vt = vt - interval '2 seconds' WHERE message_id = %s", (message_id,))
+    row = _consume_first_wait(cur, 'fdw_q')
+    first = _first_delivered_at(cur, 'fdw_q', message_id)
+    cur.execute("SELECT published_at FROM postgremq.queue_messages WHERE message_id = %s", (message_id,))
+    published = cur.fetchone()[0]
+    assert row['message_id'] == message_id
+    assert first is not None
+    assert row['first_delivery_wait_ms'] == (first - published) // timedelta(milliseconds=1)
+    assert row['first_delivery_wait_ms'] >= 2000
+
+
+def test_first_delivery_wait_counts_from_deliver_after(cur):
+    """A delayed message waits from its deliver_after, not its publish; a
+    deliver_after in the past counts from the publish."""
+    cur.execute("SELECT postgremq.create_topic('fdw'); SELECT postgremq.create_queue('fdw_q', 'fdw')")
+    cur.execute("SELECT postgremq.publish_message('fdw', '{}'::jsonb, clock_timestamp() + interval '7 seconds')")
+    delayed = cur.fetchone()[0]
+    # Published 10 s ago, deliverable since 3 s ago: counted from the publish
+    # it would be 10 s or more.
+    cur.execute("UPDATE postgremq.queue_messages SET published_at = published_at - interval '10 seconds', "
+                "vt = vt - interval '10 seconds' WHERE message_id = %s", (delayed,))
+    row = _consume_first_wait(cur, 'fdw_q')
+    assert row['message_id'] == delayed
+    assert 3000 <= row['first_delivery_wait_ms'] < 10_000
+
+    cur.execute("SELECT postgremq.publish_message('fdw', '{}'::jsonb, clock_timestamp() - interval '1 hour')")
+    past = cur.fetchone()[0]
+    row = _consume_first_wait(cur, 'fdw_q')
+    assert row['message_id'] == past
+    # From the deliver_after it would be an hour or more.
+    assert 0 <= row['first_delivery_wait_ms'] < 3_600_000
+
+
+def test_first_delivery_wait_is_never_negative(cur):
+    """A database clock that stepped back since the publish reports 0."""
+    cur.execute("SELECT postgremq.create_topic('fdw'); SELECT postgremq.create_queue('fdw_q', 'fdw')")
+    cur.execute("SELECT postgremq.publish_message('fdw', '{}'::jsonb)")
+    message_id = cur.fetchone()[0]
+    cur.execute("UPDATE postgremq.queue_messages SET published_at = published_at + interval '1 hour' "
+                "WHERE message_id = %s", (message_id,))
+    assert _consume_first_wait(cur, 'fdw_q')['first_delivery_wait_ms'] == 0
+
+
+def test_first_delivery_wait_only_on_the_first_claim(cur):
+    """Redeliveries after a nack, a release or a lease expiry return NULL and
+    keep first_delivered_at."""
+    cur.execute("SELECT postgremq.create_topic('fdw'); SELECT postgremq.create_queue('fdw_q', 'fdw')")
+    cur.execute("SELECT postgremq.publish_message('fdw', '{}'::jsonb)")
+    message_id = cur.fetchone()[0]
+    row = _consume_first_wait(cur, 'fdw_q')
+    assert row['first_delivery_wait_ms'] is not None
+    first = _first_delivered_at(cur, 'fdw_q', message_id)
+
+    cur.execute("SELECT postgremq.nack_message('fdw_q', %s, %s)", (message_id, row['consumer_token']))
+    row = _consume_first_wait(cur, 'fdw_q')
+    assert row['first_delivery_wait_ms'] is None
+
+    cur.execute("SELECT postgremq.release_message('fdw_q', %s, %s)", (message_id, row['consumer_token']))
+    cur.execute("SELECT delivery_attempts FROM postgremq.queue_messages WHERE message_id = %s", (message_id,))
+    assert cur.fetchone()[0] == 1
+    row = _consume_first_wait(cur, 'fdw_q', vt=0)  # expires at once
+    assert row['first_delivery_wait_ms'] is None
+
+    row = _consume_first_wait(cur, 'fdw_q')
+    assert row['message_id'] == message_id
+    assert row['first_delivery_wait_ms'] is None
+    assert _first_delivered_at(cur, 'fdw_q', message_id) == first
+
+
+def test_first_delivery_wait_counts_a_released_first_claim_once(cur):
+    """A first claim released before processing is still the first delivery:
+    claiming it again (delivery_attempts 0 -> 1 again) reports nothing."""
+    cur.execute("SELECT postgremq.create_topic('fdw'); SELECT postgremq.create_queue('fdw_q', 'fdw')")
+    cur.execute("SELECT postgremq.publish_message('fdw', '{}'::jsonb)")
+    message_id = cur.fetchone()[0]
+    row = _consume_first_wait(cur, 'fdw_q')
+    assert row['first_delivery_wait_ms'] is not None
+    cur.execute("SELECT postgremq.release_message('fdw_q', %s, %s)", (message_id, row['consumer_token']))
+    row = _consume_first_wait(cur, 'fdw_q')
+    assert row['message_id'] == message_id
+    assert row['first_delivery_wait_ms'] is None
+
+
+@pytest.mark.parametrize('retire', ['nack', 'maintenance'])
+def test_first_delivery_wait_counts_a_dlq_requeue_as_a_new_delivery(cur, retire):
+    """A DLQ requeue puts the message back as new (published_at and vt at the
+    requeue, delivery_attempts 0, first_delivered_at cleared): its next claim
+    reports the wait since the requeue."""
+    cur.execute("SELECT postgremq.create_topic('fdw'); SELECT postgremq.create_queue('fdw_q', 'fdw', 1)")
+    cur.execute("SELECT postgremq.publish_message('fdw', '{}'::jsonb)")
+    message_id = cur.fetchone()[0]
+    row = _consume_first_wait(cur, 'fdw_q', vt=0 if retire == 'maintenance' else 30)
+    assert row['first_delivery_wait_ms'] is not None
+    if retire == 'nack':
+        cur.execute("SELECT postgremq.nack_message('fdw_q', %s, %s)", (message_id, row['consumer_token']))
+    else:
+        cur.execute("SELECT retired_to_dlq FROM postgremq.pmq_maintenance_fast()")
+        assert cur.fetchone()[0] == 1
+
+    cur.execute("SELECT postgremq.requeue_dlq_messages('fdw_q')")
+    assert _first_delivered_at(cur, 'fdw_q', message_id) is None
+    # Requeued two seconds ago, without sleeping.
+    cur.execute("UPDATE postgremq.queue_messages SET published_at = published_at - interval '2 seconds', "
+                "vt = vt - interval '2 seconds' WHERE message_id = %s "
+                "RETURNING GREATEST(published_at, vt)", (message_id,))
+    requeued = cur.fetchone()[0]  # the two are separate clock_timestamp() calls
+    row = _consume_first_wait(cur, 'fdw_q')
+    first = _first_delivered_at(cur, 'fdw_q', message_id)
+    assert row['message_id'] == message_id
+    assert row['first_delivery_wait_ms'] == (first - requeued) // timedelta(milliseconds=1)
+    assert row['first_delivery_wait_ms'] >= 2000
+
+
+def test_first_delivery_wait_requeue_onto_an_existing_row_is_a_new_delivery(cur):
+    """requeue_dlq_messages resetting an existing row (its ON CONFLICT path)
+    makes it new like an inserted one: published_at and vt at the requeue,
+    first_delivered_at cleared, so the wait counts from the requeue."""
+    cur.execute("SELECT postgremq.create_topic('fdw'); SELECT postgremq.create_queue('fdw_q', 'fdw')")
+    cur.execute("SELECT postgremq.publish_message('fdw', '{}'::jsonb)")
+    message_id = cur.fetchone()[0]
+    _consume_first_wait(cur, 'fdw_q')
+    assert _first_delivered_at(cur, 'fdw_q', message_id) is not None
+    # Published an hour ago, without sleeping.
+    cur.execute("UPDATE postgremq.queue_messages SET published_at = published_at - interval '1 hour' "
+                "WHERE message_id = %s", (message_id,))
+    cur.execute("INSERT INTO postgremq.dead_letter_queue(queue_name, message_id, retry_count) "
+                "VALUES ('fdw_q', %s, 1)", (message_id,))
+    cur.execute("SELECT clock_timestamp()")
+    before = cur.fetchone()[0]
+    cur.execute("SELECT postgremq.requeue_dlq_messages('fdw_q')")
+    assert _first_delivered_at(cur, 'fdw_q', message_id) is None
+    cur.execute("SELECT published_at >= %s, vt >= %s FROM postgremq.queue_messages "
+                "WHERE message_id = %s", (before, before, message_id))
+    assert tuple(cur.fetchone()) == (True, True)
+    # Requeued two seconds ago.
+    cur.execute("UPDATE postgremq.queue_messages SET published_at = published_at - interval '2 seconds', "
+                "vt = vt - interval '2 seconds' WHERE message_id = %s "
+                "RETURNING GREATEST(published_at, vt)", (message_id,))
+    requeued = cur.fetchone()[0]  # the two are separate clock_timestamp() calls
+    row = _consume_first_wait(cur, 'fdw_q')
+    first = _first_delivered_at(cur, 'fdw_q', message_id)
+    assert row['first_delivery_wait_ms'] == (first - requeued) // timedelta(milliseconds=1)
+    assert 2000 <= row['first_delivery_wait_ms'] < 3_600_000
 
 def test_cascade_behavior(cur: psycopg2.extensions.cursor) -> None:
     """Test that CASCADE relationships work correctly between tables."""
@@ -3595,6 +3773,176 @@ def test_recreating_functions_keeps_the_default_public_grant(db_config, admin_co
                                 "acldefault('f', p.proowner))) a WHERE p.oid = %s::regprocedure "
                                 "AND a.grantee = 0 AND a.privilege_type = 'EXECUTE')", (signature,))
                     assert cur.fetchone()[0], f'PUBLIC lost EXECUTE on {signature}'
+    finally:
+        with admin_conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+
+
+def test_first_delivery_migration_marks_rows_already_delivered(db_config, admin_conn):
+    """0.3.0 stamps the rows delivered before it (processing, nacked) with the
+    migration time, so their next claim reports no first-delivery wait;
+    undelivered and completed rows stay NULL, and a DLQ entry requeued after
+    the upgrade is a new delivery."""
+    name = f"mq_first_delivery_{uuid.uuid4().hex[:8]}"
+    _fresh_database(admin_conn, name)
+    migrations = _migration_files()
+    # Found by its change header: the pending migration's version can change.
+    upgrade = next(i for i, (_, path) in enumerate(migrations)
+                   if '-- ── change: first_delivery_wait ·' in path.read_text())
+    try:
+        with psycopg2.connect(**{**db_config, 'dbname': name}) as c:
+            c.autocommit = True
+            with c.cursor() as cur:
+                cur.execute('CREATE SCHEMA postgremq; CREATE TABLE postgremq.postgremq_migrations '
+                            '(version bigint not null primary key, dirty boolean not null)')
+                for _, path in migrations[:upgrade]:
+                    cur.execute(path.read_text())
+                cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('q', 't', 1)")
+                ids = {}
+                for state in ('fresh', 'processing', 'nacked', 'completed', 'dead'):
+                    cur.execute("SELECT postgremq.publish_message('t', %s::jsonb)", (json.dumps(state),))
+                    ids[state] = cur.fetchone()[0]
+                # The states a 0.2.0 consume, nack and ack leave behind.
+                cur.execute("UPDATE postgremq.queue_messages SET status = 'processing', delivery_attempts = 1, "
+                            "consumer_token = 'tok', vt = clock_timestamp() + interval '30 seconds' "
+                            "WHERE message_id <> %s", (ids['fresh'],))
+                cur.execute("UPDATE postgremq.queue_messages SET status = 'pending', consumer_token = NULL, "
+                            "vt = clock_timestamp() WHERE message_id = %s", (ids['nacked'],))
+                cur.execute("SELECT postgremq.ack_message('q', %s, 'tok')", (ids['completed'],))
+                cur.execute("SELECT postgremq.nack_message('q', %s, 'tok')", (ids['dead'],))
+                for _, path in migrations[upgrade:]:
+                    cur.execute(path.read_text())
+                cur.execute('SELECT message_id, first_delivered_at IS NOT NULL FROM postgremq.queue_messages')
+                assert dict(cur.fetchall()) == {ids['fresh']: False, ids['processing']: True,
+                                                ids['nacked']: True, ids['completed']: False}
+                cur.execute("SELECT postgremq.requeue_dlq_messages('q')")
+                # Below the queue's max_delivery_attempts, and the processing
+                # lease expired, so all four are claimable.
+                cur.execute('UPDATE postgremq.queue_messages SET delivery_attempts = 0')
+                cur.execute("UPDATE postgremq.queue_messages SET vt = clock_timestamp() - interval '1 second' "
+                            "WHERE message_id = %s", (ids['processing'],))
+                cur.execute("SELECT message_id, first_delivery_wait_ms IS NOT NULL "
+                            "FROM postgremq.consume_message('q', 30, 10)")
+                assert dict(cur.fetchall()) == {ids['fresh']: True, ids['processing']: False,
+                                                ids['nacked']: False, ids['dead']: True}
+    finally:
+        with admin_conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+
+
+def test_upgrade_to_0_3_0_queues_a_concurrent_publish_behind_it(db_config, admin_conn):
+    """0.3.0 takes its table locks up front, in the order a publish takes them
+    (messages, then queue_messages in the distribution trigger), so a publish
+    that arrives while the migration waits queues behind it instead of
+    deadlocking it (an aborted migration is left dirty)."""
+    name = f"mq_upgrade_locks_{uuid.uuid4().hex[:8]}"
+    _fresh_database(admin_conn, name)
+    migrations = _migration_files()
+    upgrade = next(i for i, (_, path) in enumerate(migrations) if path.name == '0.3.0.up.sql')
+    dsn = {**db_config, 'dbname': name}
+
+    def connect():
+        # Not `with conn`: psycopg2 opens a transaction there even in autocommit.
+        conn = psycopg2.connect(**dsn)
+        conn.autocommit = True
+        return conn
+
+    def waiting_on_a_lock(conn):
+        with admin_conn.cursor() as cur:
+            cur.execute("SELECT wait_event_type = 'Lock' FROM pg_stat_activity WHERE pid = %s",
+                        (conn.get_backend_pid(),))
+            return cur.fetchone()[0]
+
+    def run(conn, sql, errors):
+        try:
+            conn.cursor().execute(sql)
+        except psycopg2.Error as err:
+            errors.append(err)
+
+    conns = []
+    try:
+        setup = connect(); conns.append(setup)
+        cur = setup.cursor()
+        cur.execute('CREATE SCHEMA postgremq; CREATE TABLE postgremq.postgremq_migrations '
+                    '(version bigint not null primary key, dirty boolean not null)')
+        for _, path in migrations[:upgrade]:
+            cur.execute(path.read_text())
+        cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('q', 't')")
+        cur.execute("SELECT postgremq.publish_message('t', '{}'::jsonb)")
+        # A consumer's transaction holds queue_messages.
+        holder = psycopg2.connect(**dsn); conns.append(holder)
+        holder.cursor().execute("UPDATE postgremq.queue_messages SET vt = vt")
+        migrator, publisher = connect(), connect(); conns += [migrator, publisher]
+        errors = []
+        migration = threading.Thread(target=run, args=(
+            migrator, ''.join(path.read_text() for _, path in migrations[upgrade:]), errors))
+        migration.start()
+        for _ in range(100):
+            if waiting_on_a_lock(migrator):
+                break
+            time.sleep(0.05)
+        assert waiting_on_a_lock(migrator)
+        publish = threading.Thread(target=run, args=(
+            publisher, "SELECT postgremq.publish_message('t', '{}'::jsonb)", errors))
+        publish.start()
+        for _ in range(100):
+            if waiting_on_a_lock(publisher):
+                break
+            time.sleep(0.05)
+        assert waiting_on_a_lock(publisher)
+        holder.commit()
+        migration.join(30)
+        publish.join(30)
+        assert not migration.is_alive() and not publish.is_alive()
+        assert errors == []
+        cur.execute("SELECT count(*), count(first_delivered_at) FROM postgremq.queue_messages")
+        assert cur.fetchone() == (2, 0)
+    finally:
+        for conn in conns:
+            conn.close()
+        with admin_conn.cursor() as cur:
+            cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")
+
+
+def test_published_at_migration_fills_nulls(db_config, admin_conn):
+    """0.3.0 sets a NULL published_at (possible only through direct table
+    writes) to the migration time before making the columns NOT NULL; other
+    rows keep theirs."""
+    name = f"mq_published_at_{uuid.uuid4().hex[:8]}"
+    _fresh_database(admin_conn, name)
+    migrations = _migration_files()
+    upgrade = next(i for i, (_, path) in enumerate(migrations)
+                   if '-- ── change: published_at_not_null ·' in path.read_text())
+    try:
+        with psycopg2.connect(**{**db_config, 'dbname': name}) as c:
+            c.autocommit = True
+            with c.cursor() as cur:
+                cur.execute('CREATE SCHEMA postgremq; CREATE TABLE postgremq.postgremq_migrations '
+                            '(version bigint not null primary key, dirty boolean not null)')
+                for _, path in migrations[:upgrade]:
+                    cur.execute(path.read_text())
+                cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('q', 't')")
+                cur.execute("SELECT postgremq.publish_message('t', '{}'::jsonb), "
+                            "postgremq.publish_message('t', '{}'::jsonb)")
+                nulled, kept = cur.fetchone()
+                cur.execute("INSERT INTO postgremq.dead_letter_queue(queue_name, message_id, retry_count) "
+                            "VALUES ('q', %s, 1), ('q', %s, 1)", (nulled, kept))
+                tables = ('messages', 'queue_messages', 'dead_letter_queue')
+                cur.execute("UPDATE postgremq.messages SET published_at = published_at - interval '1 hour'")
+                cur.execute("UPDATE postgremq.queue_messages SET published_at = published_at - interval '1 hour'")
+                cur.execute("UPDATE postgremq.dead_letter_queue SET published_at = published_at - interval '1 hour'")
+                cur.execute("UPDATE postgremq.messages SET published_at = NULL WHERE id = %s", (nulled,))
+                for table in tables[1:]:
+                    cur.execute(f"UPDATE postgremq.{table} SET published_at = NULL WHERE message_id = %s",
+                                (nulled,))
+                for _, path in migrations[upgrade:]:
+                    cur.execute(path.read_text())
+                for table in tables:
+                    key = 'id' if table == 'messages' else 'message_id'
+                    # The kept rows are an hour old.
+                    cur.execute(f"SELECT {key}, published_at > now() - interval '10 minutes' "
+                                f"FROM postgremq.{table}")
+                    assert dict(cur.fetchall()) == {nulled: True, kept: False}, table
     finally:
         with admin_conn.cursor() as cur:
             cur.execute(f"DROP DATABASE IF EXISTS {name} WITH (FORCE)")

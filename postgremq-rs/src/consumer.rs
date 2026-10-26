@@ -309,6 +309,8 @@ struct Claimed {
     published_micros: i64,
     group: Option<(String, i64)>,
     lease: Duration,
+    /// Set on a message's first delivery only (metrics).
+    first_wait_ms: Option<i64>,
 }
 
 /// When to fetch next.
@@ -617,6 +619,7 @@ async fn fetch(
             &queue,
             u64::try_from(first).unwrap_or(u64::MAX),
             u64::try_from(redelivered).unwrap_or(u64::MAX),
+            deliveries.iter().filter_map(|row| row.first_wait_ms),
         );
     }
     let rows = match claimed {
@@ -679,6 +682,7 @@ async fn claim(
             published_micros: row.try_get("published_us")?,
             group: group_key.zip(group_seq),
             lease,
+            first_wait_ms: row.try_get("first_delivery_wait_ms")?,
         })
     });
     Ok(decoded
@@ -717,7 +721,7 @@ async fn claim_on(
         "SELECT message_id, payload, consumer_token::text AS consumer_token, delivery_attempts, \
                 (extract(epoch FROM published_at) * 1000000)::int8 AS published_us, \
                 group_key::text AS group_key, group_seq, \
-                vt_remaining_ms AS lease_ms \
+                vt_remaining_ms AS lease_ms, first_delivery_wait_ms \
          FROM postgremq.consume_message($1, $2, $3, $4)",
     )
     .bind(queue)

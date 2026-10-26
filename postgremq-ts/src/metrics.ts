@@ -44,6 +44,7 @@ export class ClientMetrics {
   private readonly consumed?: Counter;
   private readonly sent?: Counter;
   private readonly active?: UpDownCounter;
+  private readonly firstDeliveryWait?: Histogram;
 
   constructor(provider?: MeterProvider) {
     const meter = provider?.getMeter('postgremq', '1');
@@ -64,6 +65,19 @@ export class ClientMetrics {
     this.renewalLost = meter?.createCounter('postgremq.client.renewal.lost', { unit: '{message}' });
     this.active = meter?.createUpDownCounter('postgremq.client.handlers.active', {
       unit: '{handler}',
+    });
+    // A stalled queue waits minutes: a longer tail than the operation buckets.
+    this.firstDeliveryWait = meter?.createHistogram('postgremq.client.first_delivery.wait', {
+      unit: 's',
+      advice: {
+        explicitBucketBoundaries: [
+          ...options.advice.explicitBucketBoundaries,
+          30,
+          60,
+          300,
+          900,
+        ],
+      },
     });
   }
 
@@ -103,10 +117,17 @@ export class ClientMetrics {
     }
   }
 
-  recordConsumed(queue: string, messages: Array<{ delivery_attempts: number }>): void {
+  recordConsumed(
+    queue: string,
+    messages: Array<{ delivery_attempts: number; first_delivery_wait_ms?: string | null }>,
+  ): void {
     if (!this.consumed) return;
     const redelivered = messages.filter((m) => m.delivery_attempts > 1).length;
     const attrs = attributes('consume', queue);
+    // Only a message's first delivery has a wait, measured by the database.
+    for (const m of messages)
+      if (m.first_delivery_wait_ms != null)
+        this.firstDeliveryWait?.record(Number(m.first_delivery_wait_ms) / 1000, attrs);
     if (messages.length > redelivered)
       this.consumed.add(messages.length - redelivered, {
         ...attrs,

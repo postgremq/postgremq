@@ -1362,7 +1362,7 @@ export class Connection implements IConnection {
           async (client) => {
             const sent = Date.now(); // vt is sent plus the time left by the database clock
             const result = await client.query(
-              'SELECT queue_name, message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq FROM postgremq.consume_message($1, $2, $3, $4)',
+              'SELECT queue_name, message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq, first_delivery_wait_ms FROM postgremq.consume_message($1, $2, $3, $4)',
               [queueName, visibilityTimeout, limit, generation ?? null]
             );
             // message_id is BIGINT; convert at the read boundary so callers see a
