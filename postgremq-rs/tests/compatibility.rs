@@ -32,8 +32,8 @@ async fn fake_info(pool: &sqlx::PgPool, body: &str) {
 }
 
 #[test]
-fn declares_mq_line_0_2() {
-    assert_eq!(SUPPORTED_MQ_VERSIONS, &["0.2"]);
+fn declares_mq_line_0_3() {
+    assert_eq!(SUPPORTED_MQ_VERSIONS, &["0.3"]);
 }
 
 #[tokio::test]
@@ -56,9 +56,9 @@ async fn the_installed_schema_is_on_a_supported_line() {
 async fn other_versions_of_the_same_line_are_accepted() {
     // protocol_major is only for older clients: it is ignored.
     for body in [
-        "SELECT jsonb_build_object('schema_version', 20000, 'protocol_major', 99)",
-        "SELECT jsonb_build_object('schema_version', 29999)",
-        "SELECT jsonb_build_object('schema_version', 20001)",
+        "SELECT jsonb_build_object('schema_version', 30000, 'protocol_major', 99)",
+        "SELECT jsonb_build_object('schema_version', 39999)",
+        "SELECT jsonb_build_object('schema_version', 30001)",
     ] {
         let db = TestDb::new().await;
         fake_info(&db.pool, body).await;
@@ -92,7 +92,7 @@ async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
     let message = err.to_string();
     assert!(
         message.contains("mq 1.2.3 (schema version 100020003)")
-            && message.contains("supports mq [0.2]"),
+            && message.contains("supports mq [0.3]"),
         "{message}"
     );
     assert!(std::error::Error::source(&err).is_none());
@@ -102,7 +102,7 @@ async fn an_unsupported_major_is_rejected_with_the_versions_involved() {
 /// another contract.
 #[tokio::test]
 async fn another_minor_before_1_is_rejected() {
-    for version in [10_002_u64, 30_000, 1, 99_999_999] {
+    for version in [10_002_u64, 20_000, 40_000, 1, 99_999_999] {
         let db = TestDb::new().await;
         fake_info(
             &db.pool,

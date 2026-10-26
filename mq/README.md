@@ -133,10 +133,10 @@ until commit (see [Exclusive queues and keep-alive](#exclusive-queues-and-keep-a
 |---|---|---|
 | `topics` | `name VARCHAR(255)` PK | Root of all data. |
 | `queues` | `name VARCHAR(255)` PK, `generation UUID` (default `gen_random_uuid()`), `topic_name` → `topics`, `max_delivery_attempts INT` (default 0 = unlimited), `exclusive BOOLEAN` (default false), `keep_alive_interval INTERVAL` (default 5 minutes), `keep_alive_until TIMESTAMPTZ` | `keep_alive_until` is NULL for non-exclusive queues. |
-| `messages` | `id BIGSERIAL` PK, `topic_name` → `topics`, `payload JSONB NOT NULL`, `published_at`, `deliver_after`, `group_key VARCHAR(255)`, `group_seq BIGINT` | `group_key` and `group_seq` are both NULL or both set. |
+| `messages` | `id BIGSERIAL` PK, `topic_name` → `topics`, `payload JSONB NOT NULL`, `published_at TIMESTAMPTZ NOT NULL`, `deliver_after`, `group_key VARCHAR(255)`, `group_seq BIGINT` | `group_key` and `group_seq` are both NULL or both set. |
 | `message_groups` | (`topic_name` → `topics`, `group_key`) PK, `last_seq BIGINT` | Per-group sequence allocator. |
-| `queue_messages` | (`queue_name` → `queues`, `message_id` → `messages`) PK, `status`, `published_at`, `vt TIMESTAMPTZ NOT NULL`, `delivery_attempts INT` (≥ 0), `consumer_token VARCHAR(64)`, `processed_at`, `group_key`, `group_seq` | One row per (queue, message). Status is `pending`, `processing` or `completed` (CHECK). `published_at` is when the row was created: at distribution, or at DLQ requeue. |
-| `dead_letter_queue` | (`queue_name` → `queues`, `message_id` → `messages`) PK, `retry_count INT`, `published_at` | `retry_count` is the delivery attempt count at retirement. `published_at` is when the entry entered the DLQ. |
+| `queue_messages` | (`queue_name` → `queues`, `message_id` → `messages`) PK, `status`, `published_at TIMESTAMPTZ NOT NULL`, `vt TIMESTAMPTZ NOT NULL`, `delivery_attempts INT` (≥ 0), `consumer_token VARCHAR(64)`, `processed_at`, `group_key`, `group_seq`, `first_delivered_at TIMESTAMPTZ` | One row per (queue, message). Status is `pending`, `processing` or `completed` (CHECK). `published_at` is when the row was created: at distribution, or at DLQ requeue. `first_delivered_at` is set by the row's first claim (NULL until then), kept through redeliveries and cleared by a DLQ requeue. |
+| `dead_letter_queue` | (`queue_name` → `queues`, `message_id` → `messages`) PK, `retry_count INT`, `published_at TIMESTAMPTZ NOT NULL` | `retry_count` is the delivery attempt count at retirement. `published_at` is when the entry entered the DLQ. |
 
 **Deletion rules.** Deleting a topic cascades to its queues, messages and
 `message_groups` rows. Deleting a queue or a message cascades to its
@@ -283,13 +283,22 @@ publishes to the topic, nacks and redeclarations of the queue wait for it.
   strict FIFO guarantee.
 - Each claimed row is set to `status = 'processing'` and
   `vt = now + vt_seconds`. Its `delivery_attempts` increases by 1, and it gets a
-  new **delivery token**, `consumer_token = gen_random_uuid()::text`.
+  new **delivery token**, `consumer_token = gen_random_uuid()::text`. A row
+  claimed for the first time also gets `first_delivered_at = now`.
 - The result columns are `queue_name`, `message_id`, `payload`, `consumer_token`,
-  `delivery_attempts`, `vt_remaining_ms`, `published_at`, `group_key` and
-  `group_seq`. `vt_remaining_ms` is the time left on the lease by the database
-  clock as the row is returned, in whole milliseconds rounded down. A client
-  adds it to its own clock reading taken before the call, so its deadline never
-  depends on the two clocks agreeing.
+  `delivery_attempts`, `vt_remaining_ms`, `published_at`, `group_key`,
+  `group_seq` and `first_delivery_wait_ms`. `vt_remaining_ms` is the time left
+  on the lease by the database clock as the row is returned, in whole
+  milliseconds rounded down. A client adds it to its own clock reading taken
+  before the call, so its deadline never depends on the two clocks agreeing.
+- `first_delivery_wait_ms` is set only on the row's first claim: how long it
+  waited, by the database clock, from when it became deliverable (the later of
+  `published_at` and its `deliver_after`) to that claim, in whole milliseconds
+  rounded down and never negative. Every later claim returns NULL, including
+  after a nack, a release or a lease expiry (`first_delivered_at` is kept on the
+  row). A DLQ requeue clears it, so the requeued row's next claim reports the
+  wait since the requeue. The clients record it as the
+  `postgremq.client.first_delivery.wait` metric (docs/observability.md).
 - If the queue is missing, expired or of a different generation, the call raises
   `PMQ02`. A queue that exists but is empty returns zero rows.
 - A NULL queue name, `vt_seconds` or `batch_size`, a negative `vt_seconds`, or a
@@ -330,7 +339,8 @@ lease that is still live.
   `dead_letter_queue(queue, message, retry_count)` entry. The DLQ entry keeps the
   payload alive.
 - `requeue_dlq_messages(queue)` moves every DLQ entry of that queue back to
-  `pending` with `vt = now`, 0 attempts and the original group key and sequence.
+  `pending` with `vt = now`, 0 attempts, the original group key and sequence,
+  and no `first_delivered_at`: its next claim is a first delivery again.
 - `purge_dlq()` deletes every DLQ entry in every queue. It takes no queue
   argument.
 
@@ -477,7 +487,7 @@ All functions live in the `postgremq` schema. "now" means `clock_timestamp()`.
 | Function | Returns |
 |---|---|
 | `publish_message(p_topic, p_payload JSONB, p_deliver_after TIMESTAMPTZ DEFAULT now, p_group_key VARCHAR DEFAULT NULL)` | `BIGINT` message ID |
-| `consume_message(p_queue_name, p_vt INT, p_limit INT DEFAULT 1, p_generation UUID DEFAULT NULL)` | `queue_name, message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq` |
+| `consume_message(p_queue_name, p_vt INT, p_limit INT DEFAULT 1, p_generation UUID DEFAULT NULL)` | `queue_name, message_id, payload, consumer_token, delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq, first_delivery_wait_ms` |
 | `ack_message(p_queue_name, p_message_id, p_consumer_token)` | `VOID` |
 | `nack_message(p_queue_name, p_message_id, p_consumer_token, p_delay_ms BIGINT DEFAULT 0)` | `VOID` |
 | `release_message(p_queue_name, p_message_id, p_consumer_token)` | `VOID` |

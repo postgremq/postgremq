@@ -209,7 +209,8 @@ def test_collector_sql_and_client_examples():
                 text = fetch()
                 for service in ('postgremq-go-example', 'postgremq-ts-example', 'postgremq-rs-example'):
                     for metric in ('messaging_client_operation_duration_seconds_count', 'messaging_process_duration_seconds_count',
-                                   'messaging_client_sent_messages_total', 'messaging_client_consumed_messages_total', 'postgremq_client_handlers_active'):
+                                   'messaging_client_sent_messages_total', 'messaging_client_consumed_messages_total', 'postgremq_client_handlers_active',
+                                   'postgremq_client_first_delivery_wait_seconds_count'):
                         assert any(l.startswith(metric + '{') and f'service_name="{service}"' in l for l in text.splitlines()), (metric, service, text)
                     for counter in ('messaging_client_sent_messages_total', 'messaging_client_consumed_messages_total'):
                         assert any(l.startswith(counter + '{') and f'service_name="{service}"' in l

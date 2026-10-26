@@ -15,7 +15,7 @@ import (
 // supportedMQVersions are the mq (schema) compatibility lines this client
 // implements and is tested against. A breaking schema change starts a new
 // line: it bumps the mq major, or before 1.0 the minor.
-var supportedMQVersions = []string{"0.2"}
+var supportedMQVersions = []string{"0.3"}
 
 // SupportedMQVersions returns the mq (schema) compatibility lines this client
 // implements: an mq major ("1"), or before 1.0 a major and minor ("0.1").

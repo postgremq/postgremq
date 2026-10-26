@@ -85,7 +85,7 @@ mod tests {
         drop(metrics.operation(Operation::Consume, Some("q"), false));
         metrics.send_attempt("t", false).finish(None);
         drop(metrics.send_attempt("t", false));
-        metrics.consumed("q", 1, 1);
+        metrics.consumed("q", 1, 1, [1]);
         metrics.handler("q").finish(Some("handler_error"));
         metrics.renewal_lost("q");
     }

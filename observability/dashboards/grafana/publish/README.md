@@ -35,8 +35,9 @@ File: `postgremq-overview.json` · Screenshot: `postgremq-overview.png`
 File: `postgremq-topic.json` · Screenshot: `postgremq-topic.png`
 
 > One PostgreMQ topic: the state of every queue it fans out to, its
-> producers' publish rate, latency, failures and transactional share, and
-> consume, ack and handler latency per queue. Producer and consumer panels need
+> producers' publish rate, latency, failures and transactional share,
+> consume, ack and handler latency per queue, and how long messages wait for
+> their first delivery. Producer and consumer panels need
 > applications instrumented with the PostgreMQ client's OpenTelemetry metrics.
 
 ## PostgreMQ Queue
@@ -46,7 +47,8 @@ File: `postgremq-queue.json` · Screenshot: `postgremq-queue.png`
 > One PostgreMQ queue over time: ready, delayed, processing, exhausted and
 > dead-letter messages and the oldest ready age, with its consumers' delivery,
 > settlement and redelivery rates, handler duration and errors, active
-> handlers and lease-renewal loss (from the client OpenTelemetry metrics).
+> handlers, lease-renewal loss and first-delivery wait (from the client
+> OpenTelemetry metrics).
 
 ## PostgreMQ Clients
 

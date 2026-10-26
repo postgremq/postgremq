@@ -13,11 +13,10 @@ of the PostgreMQ clients.
 
 ## Installation
 
-```toml
-[dependencies]
-postgremq = "0.2"
+```sh
+cargo add postgremq
 # or, with OpenTelemetry client metrics:
-postgremq = { version = "0.2", features = ["otel"] }
+cargo add postgremq --features otel
 ```
 
 The minimum supported Rust version is 1.94 (edition 2024). TLS is rustls with
@@ -97,10 +96,10 @@ runtime.
 
 Both read `postgremq.info()` and check that the installation's schema version
 is on an mq compatibility line this client implements
-(`postgremq::SUPPORTED_MQ_VERSIONS`, currently `["0.2"]`). A line is an mq
+(`postgremq::SUPPORTED_MQ_VERSIONS`, currently `["0.3"]`). A line is an mq
 major, or before 1.0 a major and minor: a breaking schema change bumps the
-major, or before 1.0 the minor, so a client built for mq 0.2 accepts 0.2.x and
-rejects 0.1.x and 0.3.0. Otherwise they return `Error::Incompatible` with the schema
+major, or before 1.0 the minor, so a client built for mq 0.3 accepts 0.3.x and
+rejects 0.2.x and 0.4.0. Otherwise they return `Error::Incompatible` with the schema
 version (the message also shows its mq version and the supported lines). A
 database without `info()` (not installed, or older than discovery), or whose
 `info()` reports no schema version, gets it too, meaning it needs an

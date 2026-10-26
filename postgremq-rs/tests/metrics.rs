@@ -165,11 +165,21 @@ struct Contract {
     scope: String,
     version: String,
     histogram_boundaries: Vec<f64>,
+    first_delivery_wait_boundaries: Vec<f64>,
     metrics: HashMap<String, String>,
     scenario_operations: Vec<ExpectedOperation>,
     received: Received,
+    first_delivery_wait: ExpectedWait,
     sent: Vec<ExpectedOperation>,
 }
+
+#[derive(Deserialize)]
+struct ExpectedWait {
+    destination: String,
+    count: u64,
+}
+
+const FIRST_DELIVERY_WAIT: &str = "postgremq.client.first_delivery.wait";
 
 #[derive(Deserialize)]
 struct ExpectedOperation {
@@ -204,8 +214,13 @@ fn assert_contract_shape(snapshot: &Snapshot) {
         assert_eq!(Some(unit), contract.metrics.get(name), "{name}");
     }
     for (name, points) in &snapshot.histograms {
+        let bounds = if name == FIRST_DELIVERY_WAIT {
+            &contract.first_delivery_wait_boundaries
+        } else {
+            &contract.histogram_boundaries
+        };
         for point in points {
-            assert_eq!(point.bounds, contract.histogram_boundaries, "{name}");
+            assert_eq!(&point.bounds, bounds, "{name}");
         }
     }
 }
@@ -374,6 +389,72 @@ async fn metrics_contract_with_transactions_and_redelivery() {
     };
     assert_eq!(total("false"), contract.received.first);
     assert_eq!(total("true"), contract.received.redelivered);
+    let waits = &snapshot.histograms[FIRST_DELIVERY_WAIT];
+    assert_eq!(waits.len(), 1, "{waits:#?}");
+    let expected: Attributes = [
+        ("messaging.system", "postgremq"),
+        ("messaging.operation.name", "consume"),
+        ("messaging.operation.type", "receive"),
+        (
+            "messaging.destination.name",
+            contract.first_delivery_wait.destination.as_str(),
+        ),
+    ]
+    .into_iter()
+    .map(|(key, value)| (key.to_owned(), value.to_owned()))
+    .collect();
+    assert_eq!(waits[0].attributes, expected);
+    assert_eq!(waits[0].count, contract.first_delivery_wait.count);
+    assert_eq!(waits[0].bounds, contract.first_delivery_wait_boundaries);
+}
+
+/// The wait comes from the database clock (`consume_message`'s
+/// `first_delivery_wait_ms`) and only for a message's first delivery: a
+/// redelivery after a nack or a release records nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn first_delivery_wait() {
+    let db = TestDb::new().await;
+    let telemetry = Telemetry::new();
+    let conn = db
+        .connect(
+            ConnectionOptions::default()
+                .notifications(false)
+                .meter_provider(&telemetry.provider),
+        )
+        .await;
+    conn.create_topic("wait").await.unwrap();
+    conn.create_queue("q", "wait", QueueOptions::default())
+        .await
+        .unwrap();
+    conn.publish("wait", &serde_json::json!({}), PublishOptions::default())
+        .await
+        .unwrap();
+    // Two seconds of waiting by the database clock, without sleeping.
+    sqlx::query(
+        "UPDATE postgremq.queue_messages SET published_at = published_at - interval '2 seconds', \
+         vt = vt - interval '2 seconds'",
+    )
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let (consumer, delivery) = take(&conn, "q").await;
+    delivery.nack(None).await.unwrap();
+    consumer.stop().await;
+    let (consumer, delivery) = take(&conn, "q").await;
+    delivery.release().await.unwrap();
+    consumer.stop().await;
+    let (consumer, delivery) = take(&conn, "q").await;
+    delivery.ack().await.unwrap();
+    consumer.stop().await;
+    conn.close().await;
+
+    let snapshot = telemetry.collect();
+    assert_contract_shape(&snapshot);
+    assert_eq!(snapshot.units[FIRST_DELIVERY_WAIT], "s");
+    let waits = &snapshot.histograms[FIRST_DELIVERY_WAIT];
+    assert_eq!(waits.len(), 1, "{waits:#?}");
+    assert_eq!(waits[0].count, 1);
+    assert!((2.0..30.0).contains(&waits[0].sum), "{}", waits[0].sum);
 }
 
 #[tokio::test(flavor = "multi_thread")]

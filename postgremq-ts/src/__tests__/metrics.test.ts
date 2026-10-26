@@ -148,6 +148,66 @@ test('metrics contract with transactions, empty receive, redelivery and failed s
     expect(
       received.dataPoints.find((p) => p.attributes['postgremq.redelivered'] === true)!.value,
     ).toBe(contract.received.redelivered);
+    const waits = scopes[0].metrics.find(
+      (m) => m.descriptor.name === 'postgremq.client.first_delivery.wait',
+    )!;
+    expect(waits.dataPoints).toHaveLength(1);
+    expect(waits.dataPoints[0].attributes).toEqual({
+      'messaging.system': 'postgremq',
+      'messaging.operation.name': 'consume',
+      'messaging.operation.type': 'receive',
+      'messaging.destination.name': contract.first_delivery_wait.destination,
+    });
+    const wait = waits.dataPoints[0].value as { count: number; buckets: { boundaries: number[] } };
+    expect(wait.count).toBe(contract.first_delivery_wait.count);
+    expect(wait.buckets.boundaries).toEqual(contract.first_delivery_wait_boundaries);
+  } finally {
+    await c.close();
+    await provider.shutdown();
+    await iso.connection.close();
+    await iso.dropDatabase();
+  }
+});
+
+// The wait comes from the database clock (consume_message's
+// first_delivery_wait_ms) and only for a message's first delivery: a
+// redelivery after a nack or a release records nothing.
+test('first-delivery wait', async () => {
+  const iso = await createIsolatedTestConnection(await getSharedTestDatabase());
+  const { exporter, provider } = telemetry();
+  const c = new Connection({ pool: iso.pool, meterProvider: provider });
+  try {
+    await c.connect();
+    await c.createTopic('wait');
+    await c.createQueue('q', 'wait', false);
+    await c.publish('wait', {});
+    // Two seconds of waiting by the database clock, without sleeping.
+    await iso.pool.query(
+      "UPDATE postgremq.queue_messages SET published_at = published_at - interval '2 seconds', vt = vt - interval '2 seconds'",
+    );
+    const take = async () => {
+      const rows = await c.consumeMessages('q', 30, 1);
+      expect(rows).toHaveLength(1);
+      return rows[0];
+    };
+    let row = await take();
+    await c.nackMessage('q', row.message_id, row.consumer_token);
+    row = await take();
+    await c.releaseMessage('q', row.message_id, row.consumer_token);
+    row = await take();
+    await c.ackMessage('q', row.message_id, row.consumer_token);
+    await provider.forceFlush();
+    const waits = exporter
+      .getMetrics()
+      .flatMap((r) => r.scopeMetrics)
+      .flatMap((s) => s.metrics)
+      .find((m) => m.descriptor.name === 'postgremq.client.first_delivery.wait')!;
+    expect(waits.descriptor.unit).toBe('s');
+    expect(waits.dataPoints).toHaveLength(1);
+    const wait = waits.dataPoints[0].value as { count: number; sum: number };
+    expect(wait.count).toBe(1);
+    expect(wait.sum).toBeGreaterThanOrEqual(2);
+    expect(wait.sum).toBeLessThan(30);
   } finally {
     await c.close();
     await provider.shutdown();

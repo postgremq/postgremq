@@ -258,7 +258,7 @@ plus mq when the release commit carries a new migration:
   `FormatSchemaVersion`/`format_schema_version`/`formatSchemaVersion` decode
   it). Clients check its mq compatibility LINE on connect (the major, or
   before 1.0 major.minor; `SupportedMQVersions()` / `SUPPORTED_MQ_VERSIONS`,
-  now `["0.2"]`) and reject others, or a missing version,
+  now `["0.3"]`) and reject others, or a missing version,
   with a typed compatibility error. Change headers declare the kind: `patch`
   fix, `minor` additive, `major` breaking. Before 1.0 a `major` header bumps
   the mq MINOR and the others the patch (Cargo-style), so a breaking SQL change

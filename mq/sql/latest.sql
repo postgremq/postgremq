@@ -163,7 +163,7 @@ CREATE TABLE postgremq.messages (
   id BIGSERIAL PRIMARY KEY,
   topic_name VARCHAR(255) NOT NULL REFERENCES postgremq.topics(name) ON DELETE CASCADE,
   payload JSONB NOT NULL,
-  published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+  published_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   deliver_after TIMESTAMPTZ DEFAULT clock_timestamp(),  -- first visibility time
   -- Message group (ordered delivery). NULL = ungrouped. group_seq is the
   -- dense per-(topic, group_key) sequence allocated by publish_message under
@@ -196,7 +196,7 @@ CREATE TABLE postgremq.queue_messages (
   queue_name VARCHAR(255) REFERENCES postgremq.queues(name) ON DELETE CASCADE,
   message_id BIGINT REFERENCES postgremq.messages(id) ON DELETE CASCADE,
   status VARCHAR(16) DEFAULT 'pending',  -- Allowed: 'pending', 'processing', 'completed'
-  published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+  published_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   -- visibility time: when the row becomes claimable (deliver_after, nack delay
   -- or release/requeue time while pending; lease end while processing)
   vt TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
@@ -207,6 +207,12 @@ CREATE TABLE postgremq.queue_messages (
   -- predicate's group-head check never joins messages.
   group_key VARCHAR(255),
   group_seq BIGINT,
+  -- When the row was first claimed: consume_message sets it once, and its
+  -- first-delivery wait is reported only by that claim. Release, nack and
+  -- lease expiry keep it; a DLQ requeue makes the row new and clears it.
+  -- NULL until then (and on rows completed before mq 0.3.0); rows delivered
+  -- before mq 0.3.0 carry that migration's time.
+  first_delivered_at TIMESTAMPTZ,
   PRIMARY KEY (queue_name, message_id),
   CONSTRAINT queue_messages_group_key_seq_paired
     CHECK ((group_key IS NULL) = (group_seq IS NULL)),
@@ -228,7 +234,7 @@ CREATE TABLE postgremq.dead_letter_queue (
   queue_name VARCHAR(255) REFERENCES postgremq.queues(name) ON DELETE RESTRICT,
   message_id BIGINT REFERENCES postgremq.messages(id) ON DELETE RESTRICT,
   retry_count INT,
-  published_at TIMESTAMPTZ DEFAULT clock_timestamp(),
+  published_at TIMESTAMPTZ NOT NULL DEFAULT clock_timestamp(),
   PRIMARY KEY (queue_name, message_id)
 );
 
@@ -648,7 +654,8 @@ $$ LANGUAGE plpgsql;
  *   whose delivery_attempts is below max_delivery_attempts (when > 0)
  *   qualify; rows another transaction has locked are skipped. Each claimed
  *   row is set to 'processing' with vt = now + p_vt seconds,
- *   delivery_attempts + 1 and a fresh consumer_token. Returns zero rows when
+ *   delivery_attempts + 1 and a fresh consumer_token; a row claimed for the
+ *   first time also gets first_delivered_at = now. Returns zero rows when
  *   nothing is visible.
  *
  * Parameters:
@@ -667,12 +674,19 @@ $$ LANGUAGE plpgsql;
  *
  * Returns:
  *   A table of records with fields: queue_name, message_id, payload, consumer_token,
- *   delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq.
+ *   delivery_attempts, vt_remaining_ms, published_at, group_key, group_seq,
+ *   first_delivery_wait_ms.
  *   vt_remaining_ms is the time left on the lease by the database clock as the
  *   row is returned, rounded down: a client adds it to its own clock reading
  *   taken before the call, so its deadline never depends on the two clocks
  *   agreeing. published_at is when the row entered this queue (distribution
- *   or DLQ requeue).
+ *   or DLQ requeue). first_delivery_wait_ms is how long the row waited for
+ *   this, its first claim, by the database clock, rounded down and never
+ *   negative: from when it became deliverable (published_at, or a later
+ *   deliver_after) to first_delivered_at. It is NULL on every later claim
+ *   (after a nack, release or lease expiry). A DLQ requeue makes the row new
+ *   (published_at, vt, delivery_attempts and first_delivered_at reset), so its
+ *   next claim reports the wait since the requeue.
  *
  * Raises:
  *   - PMQ03 if p_queue_name, p_vt or p_limit is NULL, p_vt < 0 or p_limit <= 0.
@@ -695,7 +709,8 @@ CREATE OR REPLACE FUNCTION postgremq.consume_message(
     vt_remaining_ms BIGINT,
     published_at TIMESTAMPTZ,
     group_key VARCHAR(255),
-    group_seq BIGINT
+    group_seq BIGINT,
+    first_delivery_wait_ms BIGINT
 ) AS $$
 DECLARE
     v_max_attempts INT;
@@ -753,7 +768,11 @@ BEGIN
                qm.message_id,
                qm.status,
                qm.delivery_attempts,
-               qm.published_at
+               qm.published_at,
+               -- Before the update: on a row never claimed, vt is still the
+               -- message's deliver_after (distribute_message sets it).
+               qm.vt,
+               qm.first_delivered_at
         FROM postgremq.queue_messages qm
         WHERE qm.queue_name = p_queue_name
             AND EXISTS (
@@ -801,7 +820,8 @@ BEGIN
         vt = clock_timestamp() + make_interval(secs => p_vt),
         delivery_attempts = qm.delivery_attempts + 1,
         -- Per-lease ownership token: a random v4 UUID, fresh per claim.
-        consumer_token = gen_random_uuid()::text
+        consumer_token = gen_random_uuid()::text,
+        first_delivered_at = COALESCE(qm.first_delivered_at, clock_timestamp())
     FROM next_msg qm
     WHERE queue_messages.queue_name = qm.queue_name
         AND queue_messages.message_id = qm.message_id
@@ -813,7 +833,14 @@ BEGIN
               floor(extract(epoch FROM queue_messages.vt - clock_timestamp()) * 1000)::BIGINT,
               queue_messages.published_at,
               queue_messages.group_key,
-              queue_messages.group_seq;
+              queue_messages.group_seq,
+              -- The wait starts when the row became deliverable: GREATEST of
+              -- its distribution and its deliver_after (a past deliver_after
+              -- counts from the publish).
+              CASE WHEN qm.first_delivered_at IS NULL THEN
+                  GREATEST(floor(extract(epoch FROM queue_messages.first_delivered_at
+                                         - GREATEST(qm.published_at, qm.vt)) * 1000), 0)::BIGINT
+              END;
 END;
 $$ LANGUAGE plpgsql;
 
@@ -1416,7 +1443,9 @@ $$ LANGUAGE plpgsql;
  * Description:
  *   Moves every DLQ entry of p_queue_name back into that queue as 'pending'
  *   with vt = now. The delivery_attempts counter is reset to 0 for these
- *   messages. No entries (or no such queue) is a no-op.
+ *   messages and first_delivered_at cleared: a requeued message is delivered
+ *   as new, and consume_message reports its next claim's wait since the
+ *   requeue. No entries (or no such queue) is a no-op.
  *
  *   A grouped message re-enters with its original group_key/group_seq, so it
  *   becomes the head of its group again (blocking later pending rows of the
@@ -1429,8 +1458,9 @@ $$ LANGUAGE plpgsql;
  *
  *   ON CONFLICT DO UPDATE: if a `queue_messages` row already exists for
  *   the (queue_name, message_id) pair (operator intervention, manual
- *   seed, or future code path), reset it to a clean pending state rather
- *   than aborting the entire requeue. This keeps the function idempotent
+ *   seed, or future code path), reset it to a clean pending state, new like
+ *   an inserted row (published_at at the requeue), rather than aborting the
+ *   entire requeue. This keeps the function idempotent
  *   under partial-state recovery.
  *
  * Parameters:
@@ -1463,10 +1493,12 @@ BEGIN
       SET status = 'pending',
           delivery_attempts = 0,
           consumer_token = NULL,
+          published_at = clock_timestamp(),
           vt = clock_timestamp(),
           processed_at = NULL,
           group_key = EXCLUDED.group_key,
-          group_seq = EXCLUDED.group_seq;
+          group_seq = EXCLUDED.group_seq,
+          first_delivered_at = NULL;
 
     -- Reads ROW_COUNT of the immediately-preceding INSERT (which counts
     -- both inserted and ON-CONFLICT-updated rows). If a future change
@@ -2189,4 +2221,4 @@ $$;
  */
 CREATE TABLE postgremq.postgremq_migrations (version bigint not null primary key, dirty boolean not null);
 
-INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (20000, false);
+INSERT INTO postgremq.postgremq_migrations (version, dirty) VALUES (30000, false);

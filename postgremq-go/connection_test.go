@@ -54,7 +54,7 @@ const discoverySQL = "SELECT postgremq.info()"
 type discoveryRow struct{}
 
 func (discoveryRow) Scan(dest ...any) error {
-	*(dest[0].(*[]byte)) = []byte(`{"schema_version": 20000, "protocol_major": 1}`)
+	*(dest[0].(*[]byte)) = []byte(`{"schema_version": 30000, "protocol_major": 1}`)
 	return nil
 }
 

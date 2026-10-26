@@ -24,6 +24,7 @@ type clientMetrics struct {
 	sent        metric.Int64Counter
 	active      metric.Int64UpDownCounter
 	renewalLost metric.Int64Counter
+	firstWait   metric.Float64Histogram
 }
 
 func newClientMetrics(provider metric.MeterProvider) (*clientMetrics, error) {
@@ -55,6 +56,12 @@ func newClientMetrics(provider metric.MeterProvider) (*clientMetrics, error) {
 		return nil, err
 	}
 	m.renewalLost, err = meter.Int64Counter("postgremq.client.renewal.lost", metric.WithUnit("{message}"))
+	if err != nil {
+		return nil, err
+	}
+	// A stalled queue waits minutes: a longer tail than the operation buckets.
+	m.firstWait, err = meter.Float64Histogram("postgremq.client.first_delivery.wait", metric.WithUnit("s"),
+		metric.WithExplicitBucketBoundaries(.005, .01, .025, .05, .075, .1, .25, .5, .75, 1, 2.5, 5, 7.5, 10, 30, 60, 300, 900))
 	if err != nil {
 		return nil, err
 	}
@@ -115,7 +122,10 @@ func (m *clientMetrics) startOperation(ctx context.Context, operation, destinati
 	}
 }
 
-func (m *clientMetrics) recordConsumed(ctx context.Context, queue string, messages []*Message, err error) {
+// firstWaits are the waits consume_message measured for the messages'
+// first deliveries (first_delivery_wait_ms), one per message delivered for
+// the first time on its queue.
+func (m *clientMetrics) recordConsumed(ctx context.Context, queue string, messages []*Message, firstWaits []int64, err error) {
 	if m == nil {
 		return
 	}
@@ -126,6 +136,10 @@ func (m *clientMetrics) recordConsumed(ctx context.Context, queue string, messag
 		}
 	}
 	attrs := metricAttributes("consume", queue)
+	waitAttrs := metric.WithAttributes(attrs...)
+	for _, waitMs := range firstWaits {
+		m.firstWait.Record(ctx, float64(waitMs)/1000, waitAttrs)
+	}
 	if code := metricError(err); code != "" {
 		attrs = append(attrs, attribute.String("error.type", code))
 	}

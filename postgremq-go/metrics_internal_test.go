@@ -111,14 +111,17 @@ func TestConsumedMetricsPreservePartialReceiveError(t *testing.T) {
 	defer func() { require.NoError(t, provider.Shutdown(context.Background())) }()
 	metrics, err := newClientMetrics(provider)
 	require.NoError(t, err)
-	metrics.recordConsumed(context.Background(), "q", []*Message{{DeliveryAttempt: 1}, {DeliveryAttempt: 2}}, errors.New("truncated response with private detail"))
+	metrics.recordConsumed(context.Background(), "q", []*Message{{DeliveryAttempt: 1}, {DeliveryAttempt: 2}},
+		[]int64{1500}, errors.New("truncated response with private detail"))
 	var data metricdata.ResourceMetrics
 	require.NoError(t, reader.Collect(context.Background(), &data))
 	require.Len(t, data.ScopeMetrics, 1)
-	require.Len(t, data.ScopeMetrics[0].Metrics, 1)
-	m := data.ScopeMetrics[0].Metrics[0]
-	require.Equal(t, "messaging.client.consumed.messages", m.Name)
-	points := m.Data.(metricdata.Sum[int64]).DataPoints
+	byName := map[string]metricdata.Metrics{}
+	for _, m := range data.ScopeMetrics[0].Metrics {
+		byName[m.Name] = m
+	}
+	require.Len(t, byName, 2)
+	points := byName["messaging.client.consumed.messages"].Data.(metricdata.Sum[int64]).DataPoints
 	require.Len(t, points, 2)
 	for _, point := range points {
 		require.EqualValues(t, 1, point.Value)
@@ -126,4 +129,12 @@ func TestConsumedMetricsPreservePartialReceiveError(t *testing.T) {
 		require.True(t, ok)
 		require.Equal(t, "other", code.AsString())
 	}
+	// The scanned first delivery's wait is a measurement, not a failure:
+	// recorded without error.type.
+	waits := byName["postgremq.client.first_delivery.wait"].Data.(metricdata.Histogram[float64]).DataPoints
+	require.Len(t, waits, 1)
+	require.EqualValues(t, 1, waits[0].Count)
+	require.InDelta(t, 1.5, waits[0].Sum, 1e-9)
+	_, hasCode := waits[0].Attributes.Value(attribute.Key("error.type"))
+	require.False(t, hasCode)
 }

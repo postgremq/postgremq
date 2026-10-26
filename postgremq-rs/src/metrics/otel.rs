@@ -1,7 +1,7 @@
 //! The recorders with the `otel` feature.
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use opentelemetry::KeyValue;
 use opentelemetry::metrics::{Counter, Histogram, Meter, UpDownCounter};
@@ -16,6 +16,13 @@ pub(crate) const CONTRACT_VERSION: &str = "1";
 /// Histogram bucket boundaries (seconds) shared by every client.
 const BOUNDARIES: [f64; 14] = [
     0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0,
+];
+
+/// First-delivery wait buckets: a stalled queue waits minutes, so a longer
+/// tail than `BOUNDARIES`.
+const FIRST_DELIVERY_WAIT_BOUNDARIES: [f64; 18] = [
+    0.005, 0.01, 0.025, 0.05, 0.075, 0.1, 0.25, 0.5, 0.75, 1.0, 2.5, 5.0, 7.5, 10.0, 30.0, 60.0,
+    300.0, 900.0,
 ];
 
 const fn name(operation: Operation) -> &'static str {
@@ -83,6 +90,7 @@ struct Instruments {
     consumed: Counter<u64>,
     active: UpDownCounter<i64>,
     renewal_lost: Counter<u64>,
+    first_delivery_wait: Histogram<f64>,
 }
 
 impl Instruments {
@@ -112,6 +120,11 @@ impl Instruments {
             renewal_lost: meter
                 .u64_counter("postgremq.client.renewal.lost")
                 .with_unit("{message}")
+                .build(),
+            first_delivery_wait: meter
+                .f64_histogram("postgremq.client.first_delivery.wait")
+                .with_unit("s")
+                .with_boundaries(FIRST_DELIVERY_WAIT_BOUNDARIES.to_vec())
                 .build(),
         }
     }
@@ -171,12 +184,27 @@ impl Metrics {
         }
     }
 
-    /// Counts deliveries decoded from one consume result.
-    pub(crate) fn consumed(&self, queue: &str, first: u64, redelivered: u64) {
+    /// Counts deliveries decoded from one consume result, and records the
+    /// waits the database measured for its first deliveries
+    /// (`consume_message`'s `first_delivery_wait_ms`).
+    pub(crate) fn consumed(
+        &self,
+        queue: &str,
+        first: u64,
+        redelivered: u64,
+        first_waits: impl IntoIterator<Item = i64>,
+    ) {
         if let Some(instruments) = &self.instruments {
+            let attributes = common("consume", "receive", Some(queue));
+            for wait_ms in first_waits {
+                // Never negative: the database clamps it at 0.
+                let seconds =
+                    Duration::from_millis(u64::try_from(wait_ms).unwrap_or(0)).as_secs_f64();
+                instruments.first_delivery_wait.record(seconds, &attributes);
+            }
             for (count, again) in [(first, false), (redelivered, true)] {
                 if count > 0 {
-                    let mut attributes = common("consume", "receive", Some(queue));
+                    let mut attributes = attributes.clone();
                     attributes.push(KeyValue::new("postgremq.redelivered", again));
                     instruments.consumed.add(count, &attributes);
                 }
