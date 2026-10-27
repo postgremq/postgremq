@@ -371,6 +371,142 @@ test('operation duration counts a retried publication once, including backoff', 
   }
 });
 
+// Fault injection: the first UPDATE of `table` matching `when` fails with a
+// transient serialization error (40001); later ones succeed. The sequence
+// counts the attempts, since sequences survive statement rollback.
+async function failOnce(
+  pool: { query: (sql: string) => Promise<unknown> },
+  name: string,
+  table: string,
+  when: string,
+) {
+  await pool.query(`
+    CREATE SEQUENCE public.${name}_probe;
+    CREATE FUNCTION public.${name}() RETURNS trigger LANGUAGE plpgsql AS $$
+    BEGIN
+      IF nextval('public.${name}_probe') = 1 THEN
+        RAISE EXCEPTION 'injected serialization failure' USING ERRCODE = '40001';
+      END IF;
+      RETURN NEW;
+    END;
+    $$;
+    CREATE TRIGGER ${name} BEFORE UPDATE ON ${table}
+    FOR EACH ROW WHEN (${when}) EXECUTE FUNCTION public.${name}();
+  `);
+}
+
+// The duration data points of one operation, once one without error.type
+// has been recorded (or after `timeoutMs`).
+async function operationPoints(
+  exporter: InMemoryMetricExporter,
+  provider: MeterProvider,
+  operation: string,
+  timeoutMs = 8000,
+) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    await provider.forceFlush();
+    // Each export is cumulative: the latest one holds every sample so far.
+    const points = exporter
+      .getMetrics()
+      .slice(-1)
+      .flatMap((r) => r.scopeMetrics)
+      .flatMap((s) => s.metrics)
+      .filter((m) => m.descriptor.name === 'messaging.client.operation.duration')
+      .flatMap((m) => m.dataPoints as Array<{ attributes: Record<string, unknown> }>)
+      .filter((p) => p.attributes['messaging.operation.name'] === operation);
+    if (points.some((p) => p.attributes['error.type'] === undefined) || Date.now() > deadline)
+      return points;
+    await new Promise((r) => setTimeout(r, 50));
+  }
+}
+
+test('keep-alive records keep_alive and retries a transient error in the same tick', async () => {
+  const iso = await createIsolatedTestConnection(await getSharedTestDatabase());
+  const { exporter, provider } = telemetry();
+  const c = new Connection({ pool: iso.pool, meterProvider: provider });
+  try {
+    await c.connect();
+    await c.createTopic('ka');
+    // First keep-alive tick after half the interval: about two seconds, which
+    // leaves time to install the fault first.
+    await c.createQueue('ka', 'ka', true, { keepAliveInterval: 4 });
+    await failOnce(
+      iso.pool,
+      'ka_fail_once',
+      'postgremq.queues',
+      'OLD.keep_alive_until IS DISTINCT FROM NEW.keep_alive_until',
+    );
+    const points = await operationPoints(exporter, provider, 'keep_alive');
+    // One sample per call, without error.type: the failed attempt was retried
+    // within the call rather than at a later tick.
+    expect(points).toHaveLength(1);
+    expect(points[0].attributes['error.type']).toBeUndefined();
+    expect((points[0] as unknown as { value: { count: number } }).value.count).toBe(1);
+    expect(points[0].attributes).toEqual({
+      'messaging.system': 'postgremq',
+      'messaging.operation.name': 'keep_alive',
+      'messaging.operation.type': 'keep_alive',
+      'postgremq.transaction': false,
+    });
+    expect(
+      Number(
+        (await iso.pool.query('SELECT last_value FROM public.ka_fail_once_probe')).rows[0]
+          .last_value,
+      ),
+    ).toBeGreaterThanOrEqual(2);
+  } finally {
+    await c.close();
+    await provider.shutdown();
+    await iso.connection.close();
+    await iso.dropDatabase();
+  }
+});
+
+test('lease renewal retries a transient error in the same tick and keeps the lease', async () => {
+  const iso = await createIsolatedTestConnection(await getSharedTestDatabase());
+  const { exporter, provider } = telemetry();
+  const c = new Connection({ pool: iso.pool, meterProvider: provider });
+  let consumer: ReturnType<Connection['consume']> | undefined;
+  try {
+    await c.connect();
+    await c.createTopic('rn');
+    await c.createQueue('rn', 'rn', false);
+    consumer = c.consume('rn', {
+      visibilityTimeoutSec: 2,
+      autoExtension: { enabled: true, extensionThreshold: 0.5 },
+    });
+    await failOnce(
+      iso.pool,
+      'rn_fail_once',
+      'postgremq.queue_messages',
+      "OLD.status = 'processing' AND NEW.status = 'processing' AND OLD.vt IS DISTINCT FROM NEW.vt",
+    );
+    await c.publish('rn', {});
+    const it = consumer.messages()[Symbol.asyncIterator]();
+    const msg = (await it.next()).value as Message;
+    // First renewal after half the two-second lease.
+    const points = await operationPoints(exporter, provider, 'extend_batch');
+    expect(points).toHaveLength(1);
+    expect(points[0].attributes['error.type']).toBeUndefined();
+    expect((points[0] as unknown as { value: { count: number } }).value.count).toBe(1);
+    expect(msg.signal.aborted).toBe(false);
+    await msg.ack();
+    expect(
+      Number(
+        (await iso.pool.query('SELECT last_value FROM public.rn_fail_once_probe')).rows[0]
+          .last_value,
+      ),
+    ).toBeGreaterThanOrEqual(2);
+  } finally {
+    await consumer?.stop();
+    await c.close();
+    await provider.shutdown();
+    await iso.connection.close();
+    await iso.dropDatabase();
+  }
+});
+
 test.each([false, true])(
   'metrics are optional and provider remains application-owned: %s',
   async (enabled) => {

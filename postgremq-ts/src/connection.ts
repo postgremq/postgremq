@@ -643,18 +643,38 @@ export class Connection implements IConnection {
    * @param operation - The operation to execute
    * @param retryPolicy - The retry policy to use
    * @param retryable - Which errors are retried (default shouldRetry)
+   * @param budgetMs - Optional bound on the whole call: every attempt and
+   *   backoff ends within it, and close() ends a backoff early. Without it
+   *   each attempt has the default 30 s deadline.
    * @returns The result of the operation
    */
   async executeWithRetry<T>(
     operation: (client: PoolClient) => Promise<T>,
     retryPolicy: RetryPolicy = this.retryPolicy,
-    retryable: (error: any) => boolean = shouldRetry
+    retryable: (error: any) => boolean = shouldRetry,
+    budgetMs?: number
   ): Promise<T> {
     if (!this.connected) {
       throw new ConnectionClosedError('Client is not connected');
     }
+    if (budgetMs === undefined) {
+      return withRetry(() => this.runDatabase(operation), retryPolicy, retryable);
+    }
 
-    return withRetry(() => this.runDatabase(operation), retryPolicy, retryable);
+    const deadline = Date.now() + budgetMs;
+    const stop = new AbortController();
+    const abort = () => stop.abort();
+    this.activeIO.add(abort);
+    try {
+      return await withRetry(
+        () => this.runDatabase(operation, deadline - Date.now()),
+        retryPolicy,
+        retryable,
+        { deadline, signal: stop.signal }
+      );
+    } finally {
+      this.activeIO.delete(abort);
+    }
   }
 
   /** A pooled operation owns acquisition, its deadline, and release. On timeout
@@ -1740,7 +1760,8 @@ export class Connection implements IConnection {
     }, wait);
   }
 
-  /** Extend every due queue in one extend_queue_keep_alive_multi call, then
+  /** Extend every due queue in one extend_queue_keep_alive_multi call (with
+   *  the retry policy, bounded by the earliest confirmed deadline), then
    *  reschedule kept queues / drop+notify permanently-failed ones / bounded-
    *  retry transient failures. @internal */
   private async flushKeepAlive(): Promise<void> {
@@ -1754,33 +1775,17 @@ export class Connection implements IConnection {
     }
     this.keepAliveFlushing = true;
     try {
-      let leases: Map<string, { until: Date; busy: boolean }> | undefined;
+      let leases: Map<string, { until: Date | null; busy: boolean }> | undefined;
       try {
-        leases = await this.runDatabase(
-          async (client) => {
-            // Deadlines are the time left by the database clock, counted from
-            // before the call, so they never depend on the two clocks agreeing.
-            const sent = Date.now();
-            const result = await client.query(
-              'SELECT queue_name, keep_alive_remaining_ms, outcome FROM postgremq.extend_queue_keep_alive_multi($1, $2, $3)',
-              [
-                due.map(([n]) => n),
-                due.map(([, e]) => Math.floor(e.intervalSec * 1000)),
-                due.map(([, e]) => e.generation),
-              ]
-            );
-            return new Map(
-              result.rows.map((r) => [
-                r.queue_name,
-                {
-                  until: new Date(sent + Number(r.keep_alive_remaining_ms)),
-                  busy: r.outcome === 'busy',
-                },
-              ])
-            );
-          },
+        // Deadlines are the time left by the database clock, counted from
+        // before each attempt, so they never depend on the two clocks agreeing.
+        const rows = await this.extendQueueKeepAliveMulti(
+          due.map(([n]) => n),
+          due.map(([, e]) => Math.floor(e.intervalSec * 1000)),
+          due.map(([, e]) => e.generation),
           heartbeatBudgetMs(due.map(([, e]) => e.expiresAt))
         );
+        leases = new Map(rows.map((r) => [r.queue, r]));
       } catch {
         /* Retry only while the last confirmed lease remains live. */
       }
@@ -1788,8 +1793,8 @@ export class Connection implements IConnection {
         if (this.keepAliveEntries.get(name) !== e) continue;
         const lease = leases?.get(name);
         if (lease && !lease.busy) {
-          e.expiresAt = lease.until;
-          e.nextAt = new Date(Date.now() + (lease.until.getTime() - Date.now()) / 2);
+          e.expiresAt = lease.until!; // set on every extended row
+          e.nextAt = new Date(Date.now() + (e.expiresAt.getTime() - Date.now()) / 2);
         } else if ((!leases || lease?.busy) && e.expiresAt.getTime() > Date.now())
           e.nextAt = new Date(Math.min(Date.now() + 100, e.expiresAt.getTime()));
         else {
@@ -1854,17 +1859,19 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Batch keep-alive extension (uses the retry policy). Returns one row per
+   * Batch keep-alive extension, the keep-alive actor's call. Uses the retry
+   * policy, bounded by `budgetMs` when given. Returns one row per
    * requested queue that was extended (`until` = new deadline, `busy: false`)
    * or lock-contended (`until: null`, `busy: true`). A queue omitted from the
    * result is gone, non-exclusive, already expired, or (with `generations`) a
-   * different incarnation. Not used by the keep-alive actor.
+   * different incarnation.
    * @internal
    */
   async extendQueueKeepAliveMulti(
     names: string[],
     intervalsMs: number[],
-    generations?: string[]
+    generations?: string[],
+    budgetMs?: number
   ): Promise<Array<{ queue: string; until: Date | null; busy: boolean }>> {
     return this.telemetry.operation('keep_alive', '', false, async () => {
       if (!this.connected) {
@@ -1886,7 +1893,7 @@ export class Connection implements IConnection {
                 : new Date(sent + Number(row.keep_alive_remaining_ms)),
             busy: row.outcome === 'busy',
           }));
-        });
+        }, undefined, undefined, budgetMs);
       } catch (err) {
         throw mapDbError(err);
       }
@@ -2001,9 +2008,9 @@ export class Connection implements IConnection {
           heartbeatBudgetMs(due.map((e) => e.expiresAt))
         );
       } catch (error) {
-        // Transient failure (setVtBatchMulti makes a single attempt, with no
-        // retry policy): cancel and drop entries whose confirmed lease has
-        // expired; retry the rest in ~1s, never later than expiresAt.
+        // Failure (after the retry policy, within the batch budget): cancel and
+        // drop entries whose confirmed lease has expired; retry the rest in
+        // ~1s, never later than expiresAt.
         // nextExtensionTime sits at `threshold` of the remaining lease, which
         // leaves headroom before the server-side lease lapses.
         for (const e of due) {
@@ -2055,8 +2062,8 @@ export class Connection implements IConnection {
   }
 
   /**
-   * Cross-queue batch visibility-timeout extension: one attempt, no retry
-   * policy, bounded by `budgetMs`. Returns one row per requested delivery
+   * Cross-queue batch visibility-timeout extension: uses the retry policy,
+   * bounded overall by `budgetMs`. Returns one row per requested delivery
    * that was extended (`busy: false`, `vt` = confirmed lease end) or was
    * lock-contended (`busy: true`, `vt` meaningless). A delivery omitted from
    * the result has lost its lease (not owned, not processing, or expired).
@@ -2077,7 +2084,7 @@ export class Connection implements IConnection {
       ids.forEach(checkedMessageId);
       if (queues.length === 0) return [];
       try {
-        return await this.runDatabase(async (client) => {
+        return await this.executeWithRetry(async (client) => {
           const sent = Date.now(); // vt is sent plus the time left by the database clock
           const result = await client.query(
             'SELECT queue_name, message_id, vt_remaining_ms, consumer_token, outcome FROM postgremq.set_vt_batch_multi($1, $2, $3, $4)',
@@ -2090,7 +2097,7 @@ export class Connection implements IConnection {
             token: row.consumer_token,
             busy: row.outcome === 'busy',
           }));
-        }, budgetMs);
+        }, undefined, undefined, budgetMs);
       } catch (err) {
         throw mapDbError(err);
       }

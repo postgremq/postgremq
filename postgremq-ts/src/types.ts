@@ -111,7 +111,8 @@ export interface ConnectionOptions {
    * 55P03, 57P01-03) on single-statement calls: ack/nack/release, setVt and
    * the admin methods. publish retries only 40001/40P01. consume and the
    * *WithTransaction calls are never retried. The background keep-alive and
-   * extension bypass this policy and reschedule failed attempts themselves
+   * extension calls use it within each call's bound (the earliest confirmed
+   * deadline, between 1 and 5 s), then reschedule a call that still failed
    * until the last confirmed deadline. Default: 5 attempts, 100 ms initial backoff, x2, capped at
    * 5000 ms.
    */

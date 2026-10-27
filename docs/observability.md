@@ -297,12 +297,12 @@ counters.
 
 Operation names are `publish`, `consume`, `ack`, `nack`, `release`, `extend`
 (manual extension), `extend_batch` (one automatic renewal call) and `keep_alive`
-(one exclusive-queue keep-alive call). The TypeScript client's automatic
-keep-alive records no `keep_alive` sample; Go and Rust record one per call. Admin
-operations and notification reconnects are not instrumented in contract v1. Duration histograms record one
+(one exclusive-queue keep-alive call). Every client records one `keep_alive`
+sample per automatic keep-alive call. Admin operations and notification
+reconnects are not instrumented in contract v1. Duration histograms record one
 sample per logical operation, not per SQL attempt. Empty consume calls are
-included. A duplicate local settlement rejected before the connection operation is
-invoked produces no operation sample. Batch operations produce one sample per
+included. A duplicate local settlement rejected before the connection operation
+is invoked produces no operation sample. Batch operations produce one sample per
 batch, including batches in which no row was extended. Row-level renewal loss is
 reported by the separate renewal-loss counter, since the SQL batch can succeed
 overall.

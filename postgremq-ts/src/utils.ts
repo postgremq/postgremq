@@ -63,13 +63,17 @@ export function shouldRetry(error: any): boolean {
  *   every attempt, the first one included
  * @param retryable - Which errors are retried (default shouldRetry); any
  *   other error is thrown at once
+ * @param bound - Optional bound on the retries: no attempt starts at or after
+ *   `deadline` (epoch ms), and `signal` ends a backoff early. Either one
+ *   throws the last error instead of retrying.
  * @returns The result of the operation if successful
  * @throws The last error encountered if all retries fail
  */
 export async function withRetry<T>(
   operation: () => Promise<T>,
   retryPolicy: RetryPolicy,
-  retryable: (error: any) => boolean = shouldRetry
+  retryable: (error: any) => boolean = shouldRetry,
+  bound: { deadline?: number; signal?: AbortSignal } = {}
 ): Promise<T> {
   let lastError: Error | null = null;
   let attempt = 0;
@@ -93,8 +97,13 @@ export async function withRetry<T>(
         break;
       }
 
+      // The next attempt would start past the deadline, or the caller stopped.
+      if (Date.now() + backoffMs >= (bound.deadline ?? Infinity) || bound.signal?.aborted) break;
+
       // Calculate backoff time for next attempt
-      await sleep(backoffMs);
+      await sleep(backoffMs, bound.signal);
+      // A late timer can wake past the deadline: no attempt starts there.
+      if (bound.signal?.aborted || Date.now() >= (bound.deadline ?? Infinity)) break;
 
       // Increase backoff for next attempt, up to the maximum
       backoffMs = Math.min(backoffMs * retryPolicy.backoffMultiplier, retryPolicy.maxBackoffMs);
@@ -108,10 +117,20 @@ export async function withRetry<T>(
 /**
  * Sleep for a specified duration
  * @param ms - Time in milliseconds to sleep
+ * @param signal - Resolves the sleep early when aborted
  * @returns A promise that resolves after the specified delay
  */
-export function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+export function sleep(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve) => {
+    const done = () => {
+      clearTimeout(timer);
+      signal?.removeEventListener('abort', done);
+      resolve();
+    };
+    const timer = setTimeout(done, ms);
+    signal?.addEventListener('abort', done, { once: true });
+    if (signal?.aborted) done();
+  });
 }
 
 /**
