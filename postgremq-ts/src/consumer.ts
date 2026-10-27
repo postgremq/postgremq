@@ -25,8 +25,6 @@ export function validateConsumerOptions(options: Partial<ConsumerOptions>): void
     batchSize: options.batchSize,
     visibilityTimeoutSec: options.visibilityTimeoutSec,
     pollingIntervalMs: options.pollingIntervalMs,
-    extensionSec: options.autoExtension?.extensionSec,
-    maxBatchSize: options.autoExtension?.maxBatchSize,
   })) {
     if (value !== undefined && (!Number.isSafeInteger(value) || value > 2147483647))
       throw new ValidationError(`${name} must be a finite integer <= 2147483647`);
@@ -49,12 +47,6 @@ export function validateConsumerOptions(options: Partial<ConsumerOptions>): void
         ext.extensionThreshold >= 1)
     ) {
       throw new ValidationError('extensionThreshold must be in (0, 1)');
-    }
-    if (ext.extensionSec !== undefined && ext.extensionSec <= 0) {
-      throw new ValidationError('extensionSec must be positive');
-    }
-    if (ext.maxBatchSize !== undefined && ext.maxBatchSize <= 0) {
-      throw new ValidationError('autoExtension.maxBatchSize must be positive');
     }
   }
 }
