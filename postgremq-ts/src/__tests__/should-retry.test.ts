@@ -7,8 +7,8 @@
  * Pure function under test — no database needed.
  */
 
-import { describe, test, expect } from '@jest/globals';
-import { shouldRetry } from '../utils';
+import { describe, test, expect, jest } from '@jest/globals';
+import { shouldRetry, withRetry } from '../utils';
 
 describe('shouldRetry', () => {
   describe('Node-level network errors', () => {
@@ -83,5 +83,94 @@ describe('shouldRetry', () => {
     test('error with non-string code is not retryable', () => {
       expect(shouldRetry({ code: 12345 })).toBe(false);
     });
+  });
+});
+
+// The bound used by the background keep-alive and renewal calls: retries stop
+// at the deadline, or when the signal aborts a backoff, with the last error.
+describe('withRetry bound', () => {
+  const transient = Object.assign(new Error('serialization failure'), { code: '40001' });
+  const policy = { maxAttempts: 10, initialBackoffMs: 100, backoffMultiplier: 1, maxBackoffMs: 100 };
+
+  // Fake timers: the clock moves only when the test advances it.
+  test('no attempt starts at or after the deadline', async () => {
+    jest.useFakeTimers();
+    try {
+      let attempts = 0;
+      const result = withRetry(
+        async () => {
+          attempts++;
+          throw transient;
+        },
+        policy,
+        shouldRetry,
+        { deadline: Date.now() + 250 }
+      ).catch((e) => e);
+      // Attempts at 0, 100 and 200 ms; a backoff to 300 ms would end past it.
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(await result).toBe(transient);
+      expect(attempts).toBe(3);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('a backoff that wakes past the deadline starts no attempt', async () => {
+    jest.useFakeTimers();
+    try {
+      let attempts = 0;
+      const result = withRetry(
+        async () => {
+          attempts++;
+          throw transient;
+        },
+        policy,
+        shouldRetry,
+        { deadline: Date.now() + 250 }
+      ).catch((e) => e);
+      // The first backoff (to 100 ms) is pending. The event loop stalls: the
+      // clock jumps 200 ms without firing it, so it wakes at 300 ms.
+      await jest.advanceTimersByTimeAsync(0);
+      jest.setSystemTime(Date.now() + 200);
+      await jest.advanceTimersByTimeAsync(1000);
+      expect(await result).toBe(transient);
+      expect(attempts).toBe(1);
+    } finally {
+      jest.useRealTimers();
+    }
+  });
+
+  test('an abort ends the backoff with the last error', async () => {
+    let attempts = 0;
+    const stop = new AbortController();
+    const started = Date.now();
+    setTimeout(() => stop.abort(), 50);
+    await expect(
+      withRetry(
+        async () => {
+          attempts++;
+          throw transient;
+        },
+        { ...policy, initialBackoffMs: 10000, maxBackoffMs: 10000 },
+        shouldRetry,
+        { signal: stop.signal }
+      )
+    ).rejects.toBe(transient);
+    expect(attempts).toBe(1);
+    expect(Date.now() - started).toBeLessThan(1000);
+  });
+
+  test('without a bound, every attempt of the policy runs', async () => {
+    let attempts = 0;
+    await expect(
+      withRetry(
+        async () => {
+          attempts++;
+          throw transient;
+        },
+        { ...policy, maxAttempts: 3, initialBackoffMs: 1, maxBackoffMs: 1 }
+      )
+    ).rejects.toBe(transient);
+    expect(attempts).toBe(3);
   });
 });

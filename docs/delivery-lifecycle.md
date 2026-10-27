@@ -155,8 +155,8 @@ schedule when it fetches them and deregisters them when they settle.
   `WithExtenderBatchSize`, TypeScript `extenderBatchSize`, Rust
   `renewal_batch_size`). At most one call is in flight.
 - Each call is bounded by the earliest lease deadline in the batch, but by no less
-  than one second and no more than five. Go and Rust apply the connection's retry
-  policy inside that bound; TypeScript sends the call once.
+  than one second and no more than five. Every client applies the connection's
+  retry policy inside that bound.
 - The SQL locks rows with `NOWAIT` and re-reads the wall clock after locking, so a
   contended row cannot delay unrelated rows and an old transaction timestamp cannot
   revive an expired lease.
@@ -230,8 +230,8 @@ one second and 30 days in Rust).
 - The queue is renewed when half of its remaining keep-alive has elapsed. Each
   tick renews every due queue of the connection in one
   `extend_queue_keep_alive_multi` call, bounded by the earliest deadline, but by
-  no less than one second and no more than five. Go and Rust apply the
-  connection's retry policy inside that bound; TypeScript sends the call once.
+  no less than one second and no more than five. Every client applies the
+  connection's retry policy inside that bound.
 - `busy` and transport errors are retried after 100 ms until the last known
   keep-alive deadline.
 - The first deadline after a declaration is the requested interval counted from
@@ -358,7 +358,7 @@ claim (`consume_message`) is never retried.
 | Attempts | 3 | 5 | 3 |
 | Backoff | 100 ms, ×2, up to 2 s | 100 ms, ×2, up to 5 s | 100 ms, ×2, up to 2 s |
 | Settlement and manual extension | retry policy | retry policy | retry policy |
-| Renewal and keep-alive calls | retry policy | not retried | retry policy |
+| Renewal and keep-alive calls | retry policy | retry policy | retry policy |
 | Destructive admin calls | retry policy | retry policy | only `40001`, `40P01`, `55P03` |
 
 Rust's destructive admin calls are `delete_queue`, `delete_topic`, `purge_dlq`,

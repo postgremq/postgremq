@@ -656,7 +656,7 @@
     {
       "type": "timeseries",
       "title": "Background calls",
-      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. extend_batch: one automatic lease-renewal call; keep_alive: one exclusive-queue keep-alive call (Go and Rust; the TypeScript client records none).",
+      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. extend_batch: one automatic lease-renewal call; keep_alive: one exclusive-queue keep-alive call.",
       "targets": [
         {
           "datasource": {
@@ -720,7 +720,7 @@
     {
       "type": "timeseries",
       "title": "Background latency p95",
-      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. extend_batch: one automatic lease-renewal call; keep_alive: one exclusive-queue keep-alive call (Go and Rust; the TypeScript client records none).",
+      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. extend_batch: one automatic lease-renewal call; keep_alive: one exclusive-queue keep-alive call.",
       "targets": [
         {
           "datasource": {
@@ -925,7 +925,7 @@
     {
       "type": "timeseries",
       "title": "Background errors",
-      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. extend_batch: one automatic lease-renewal call; keep_alive: one exclusive-queue keep-alive call (Go and Rust; the TypeScript client records none).",
+      "description": "Needs instrumented clients: applications that pass a meter provider to the PostgreMQ client (docs/observability.md). Empty when none do. extend_batch: one automatic lease-renewal call; keep_alive: one exclusive-queue keep-alive call.",
       "targets": [
         {
           "datasource": {
