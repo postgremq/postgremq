@@ -186,15 +186,29 @@ subscribes a queue to a topic and returns its generation.
 - Redeclaring a queue with identical parameters is idempotent and returns the
   existing generation. Redeclaring it with different parameters raises `PMQ03`,
   and the error message includes the existing values.
-- A redeclaration locks the queue row `FOR UPDATE` until its transaction ends.
-- A redeclaration that meets an uncommitted deletion of the queue waits for it;
-  if the deletion commits, the queue is created anew with a new generation. If
-  the deletion commits after the redeclaration has found the existing row, the
-  call raises `PMQ03` and reports the existing values as NULL.
-- The topic check takes no lock. If the topic is deleted after the check but
-  before the insert, the insert fails with `23503`. Once the queue row is
-  inserted or locked, a concurrent topic deletion waits until the transaction
-  ends.
+- A redeclaration locks the queue row `FOR UPDATE` until its transaction ends,
+  so other writers of the row wait for the transaction, among them a later
+  `delete_queue` of the queue, `delete_topic` of its topic, and publishes to
+  the topic.
+- Each call runs in its own subtransaction. A transaction that declares more
+  than 64 queues overflows the backend's subtransaction cache, which slows
+  other sessions while it stays open.
+- A new queue is invisible to other transactions until its transaction
+  commits, so a `delete_queue` of it does nothing. Its insert key-share locks
+  the topic, so a later `delete_topic` waits for the transaction.
+- Under `READ COMMITTED`, a call that meets an uncommitted deletion of the queue
+  or its topic waits for it. If the deletion commits, the queue is created anew
+  with a new generation, or the call raises `PMQ02` when the topic is gone.
+- Under `REPEATABLE READ` or `SERIALIZABLE`, the call can raise `40001` (retry
+  the transaction), for example when:
+  - the queue row was changed after the transaction's snapshot, such as by a
+    keep-alive refresh of an exclusive queue;
+  - the queue row was deleted while the call waited to lock it;
+  - the topic was deleted after the snapshot;
+  - the queue was created after the snapshot.
+
+  A queue whose deletion committed before the call is created anew, though
+  `SERIALIZABLE` may still raise `40001` at commit.
 
 `publish_message(topic, payload, deliver_after, group_key)` inserts the payload
 and returns its ID. The trigger then distributes it, in the same transaction, to
@@ -711,7 +725,7 @@ PostgreMQ raises three custom SQLSTATEs:
 |---|---|---|
 | `PMQ01` | The delivery is not held under this token: unknown message, already settled, reclaimed by another consumer, or (for extension) the lease has expired | `ack_message`, `nack_message`, `release_message`, `set_vt` |
 | `PMQ02` | Target does not exist or is gone | `publish_message` and `create_queue` (topic missing); `consume_message` (queue missing, expired, or generation mismatch); `create_queue` (redeclaring an expired exclusive queue) |
-| `PMQ03` | Invalid argument or refused operation | NULL in a required argument (any function; see below); invalid or too-long name (`create_topic`, `create_queue`); negative `max_attempts`; non-positive `keep_alive_interval`; redeclaration with different parameters (or of a queue deleted concurrently, see [Topics, queues and publishing](#topics-queues-and-publishing)); empty or over-255-character group key; negative `vt` (`consume_message`, `set_vt`); negative or over-100-year `delay_ms` (`nack_message`); non-positive batch size (`consume_message`); NULL heartbeat array; mismatched heartbeat or prune array lengths; NULL or negative `p_vts` element; NULL or non-positive `p_intervals_ms` element; negative retention or non-positive batch size in cleanup; `delete_topic` with messages; `delete_queue` or `clean_up_topic` with DLQ entries |
+| `PMQ03` | Invalid argument or refused operation | NULL in a required argument (any function; see below); invalid or too-long name (`create_topic`, `create_queue`); negative `max_attempts`; non-positive `keep_alive_interval`; redeclaration with different parameters; empty or over-255-character group key; negative `vt` (`consume_message`, `set_vt`); negative or over-100-year `delay_ms` (`nack_message`); non-positive batch size (`consume_message`); NULL heartbeat array; mismatched heartbeat or prune array lengths; NULL or negative `p_vts` element; NULL or non-positive `p_intervals_ms` element; negative retention or non-positive batch size in cleanup; `delete_topic` with messages; `delete_queue` or `clean_up_topic` with DLQ entries |
 
 Every argument is required unless NULL has a meaning, and a NULL in a required
 argument raises `PMQ03` before the function does anything. NULL is meaningful
@@ -728,9 +742,8 @@ Standard SQLSTATEs callers should expect:
 |---|---|---|
 | `55P03` (`lock_not_available`) | `set_vt` on a row that is locked | Retry |
 | `40P01` (deadlock) | Transactions publishing to several groups in different orders | Retry the transaction |
-| `40001` (serialization failure) | Grouped publish or group pruning under `REPEATABLE READ`/`SERIALIZABLE` | Retry the transaction |
+| `40001` (serialization failure) | Grouped publish, group pruning, or `create_queue` racing a change to its queue or topic, under `REPEATABLE READ`/`SERIALIZABLE` | Retry the transaction |
 | `23503` (foreign-key violation) | Direct deletes of a queue, message or topic still referenced by the DLQ | Requeue or purge the DLQ first |
-| | `create_queue` whose topic is deleted between its topic check and its insert | Create the topic again before retrying |
 
 ## Validation
 

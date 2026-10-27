@@ -1,5 +1,6 @@
 import os
 import sys
+import threading
 from pathlib import Path
 import pytest
 import psycopg2
@@ -313,6 +314,267 @@ def test_create_queue_missing_topic_raises_pmq02(cur: psycopg2.extensions.cursor
     assert exc_info.value.pgcode == 'PMQ02', \
         f"expected PMQ02, got {exc_info.value.pgcode}: {exc_info.value}"
     assert "does not exist" in str(exc_info.value)
+
+def _in_thread(conn, statements, isolation=None):
+    """Runs statements on conn (autocommit) in a thread, in one transaction of
+    the given isolation level if any, and keeps the last statement's first
+    value. statement_timeout bounds each statement, so a regression that
+    blocks for good fails the test instead of hanging it."""
+    result = {}
+
+    def run():
+        with conn.cursor() as c:
+            c.execute("SET statement_timeout = '10s'")
+            try:
+                if isolation:
+                    c.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+                for statement in statements:
+                    c.execute(statement)
+                result['value'] = c.fetchone()[0] if c.description else None
+                if isolation:
+                    c.execute("COMMIT")
+            except psycopg2.Error as e:
+                result['error'] = e
+                if isolation:
+                    c.execute("ROLLBACK")
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    return thread, result
+
+def test_create_queue_concurrent_with_delete_queue_creates_it(cur, db_config, test_db):
+    """A redeclaration whose existing row is deleted, and the deletion
+    committed, before the redeclaration locks it creates the queue anew. It
+    used to raise PMQ03 'already exists with different parameters' with every
+    existing value NULL."""
+    cur.execute("SELECT postgremq.create_topic('t')")
+    cur.execute("SELECT postgremq.create_queue('q', 't', 3, false)")
+    old_generation = cur.fetchone()[0]
+    deleter = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    declarer = _connect(db_config, test_db)
+    try:
+        # A row lock that the insert's conflict check passes but locking the
+        # row waits on, so the deletion lands after the conflict is found.
+        with deleter.cursor() as d:
+            d.execute("SELECT 1 FROM postgremq.queues WHERE name = 'q' FOR SHARE")
+        thread, result = _in_thread(declarer, ["SELECT postgremq.create_queue('q', 't', 3, false)"])
+        try:
+            assert _wait_until(lambda: _backend_waits_on_lock(cur, declarer)), \
+                'the redeclaration must wait for the row lock'
+            with deleter.cursor() as d:
+                d.execute("SELECT postgremq.delete_queue('q')")
+        finally:
+            deleter.commit()
+            thread.join(timeout=15)
+        assert not thread.is_alive()
+        assert 'error' not in result, result.get('error')
+        assert result['value'] != old_generation
+        cur.execute("SELECT generation, topic_name, max_delivery_attempts, exclusive FROM postgremq.queues WHERE name = 'q'")
+        assert tuple(cur.fetchone()) == (result['value'], 't', 3, False)
+    finally:
+        deleter.close()
+        declarer.close()
+
+def test_create_queue_concurrent_with_delete_topic_raises_pmq02(cur, db_config, test_db):
+    """A declaration whose topic is deleted after its existence check raises
+    PMQ02 'does not exist', not a raw 23503 foreign-key violation from its
+    insert."""
+    cur.execute("SELECT postgremq.create_topic('t')")
+    deleter = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    declarer = _connect(db_config, test_db)
+    try:
+        # The existence check takes no lock and passes; the insert's FK check
+        # waits on this lock, so the deletion lands between them.
+        with deleter.cursor() as d:
+            d.execute("SELECT 1 FROM postgremq.topics WHERE name = 't' FOR UPDATE")
+        thread, result = _in_thread(declarer, ["SELECT postgremq.create_queue('q', 't')"])
+        try:
+            assert _wait_until(lambda: _backend_waits_on_lock(cur, declarer)), \
+                'the declaration must wait for the topic row lock'
+            with deleter.cursor() as d:
+                d.execute("SELECT postgremq.delete_topic('t')")
+        finally:
+            deleter.commit()
+            thread.join(timeout=15)
+        assert not thread.is_alive()
+        assert 'error' in result, 'the declaration must fail: its topic is gone'
+        assert result['error'].pgcode == 'PMQ02', \
+            f"expected PMQ02, got {result['error'].pgcode}: {result['error']}"
+        assert 'does not exist' in str(result['error'])
+        cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'q'")
+        assert cur.fetchone()[0] == 0
+    finally:
+        deleter.close()
+        declarer.close()
+
+def test_create_queue_does_not_deadlock_queue_then_topic_teardown(cur, db_config, test_db):
+    """A transaction that deletes a queue and then its topic, while the queue
+    is redeclared, commits; the redeclaration then raises PMQ02. Holding a
+    topic lock while waiting on the queue row would deadlock (40P01) here."""
+    cur.execute("SELECT postgremq.create_topic('t')")
+    cur.execute("SELECT postgremq.create_queue('q', 't')")
+    teardown = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    declarer = _connect(db_config, test_db)
+    try:
+        with teardown.cursor() as d:
+            d.execute("SET lock_timeout = '5s'")
+            d.execute("SELECT postgremq.delete_queue('q')")
+        thread, result = _in_thread(declarer, ["SELECT postgremq.create_queue('q', 't')"])
+        try:
+            assert _wait_until(lambda: _backend_waits_on_lock(cur, declarer)), \
+                'the redeclaration must wait for the uncommitted deletion'
+            with teardown.cursor() as d:
+                d.execute("SELECT postgremq.delete_topic('t')")
+            teardown.commit()
+        finally:
+            teardown.rollback()
+            thread.join(timeout=15)
+        assert not thread.is_alive()
+        assert 'error' in result and result['error'].pgcode == 'PMQ02', result
+        cur.execute("SELECT (SELECT count(*) FROM postgremq.topics), (SELECT count(*) FROM postgremq.queues)")
+        assert tuple(cur.fetchone()) == (0, 0)
+    finally:
+        teardown.close()
+        declarer.close()
+
+def test_create_queue_holds_queue_and_topic_until_commit(cur, db_config, test_db):
+    """Until a declaration's transaction ends, a delete_topic of a newly
+    inserted queue's topic, and a delete_queue of a redeclared queue, wait
+    for it."""
+    cur.execute("SELECT postgremq.create_topic('t')")
+    declarer = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    deleter = _connect(db_config, test_db)
+    try:
+        for declare, delete in [("SELECT postgremq.create_queue('q', 't')", "SELECT postgremq.delete_topic('t')"),
+                                ("SELECT postgremq.create_queue('q', 't')", "SELECT postgremq.delete_queue('q')")]:
+            cur.execute("SELECT postgremq.create_topic('t')")
+            with declarer.cursor() as d:
+                d.execute(declare)
+            thread, result = _in_thread(deleter, [delete])
+            try:
+                assert _wait_until(lambda: _backend_waits_on_lock(cur, deleter)), \
+                    f'{delete} must wait for the declaring transaction'
+                with declarer.cursor() as d:
+                    d.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'q'")
+                    assert d.fetchone()[0] == 1
+            finally:
+                declarer.commit()
+                thread.join(timeout=15)
+            assert not thread.is_alive() and 'error' not in result, result
+            cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'q'")
+            assert cur.fetchone()[0] == 0
+            # Leave a committed queue for the second round's redeclaration.
+            cur.execute("SELECT postgremq.create_topic('t'); SELECT postgremq.create_queue('q', 't')")
+    finally:
+        declarer.close()
+        deleter.close()
+
+def test_create_queue_exclusive_redeclare_lock_and_savepoint(cur, db_config, test_db):
+    """An exclusive queue's redeclaration (row lock plus keep-alive refresh)
+    holds the row until the caller's transaction ends, and rolling back to a
+    savepoint taken before it releases the lock and undoes the refresh."""
+    cur.execute("SELECT postgremq.create_topic('t')")
+    cur.execute("SELECT postgremq.create_queue('ex', 't', 0, true, interval '60 seconds')")
+    cur.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ex'")
+    deadline = cur.fetchone()[0]
+    declarer = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    deleter = _connect(db_config, test_db)
+    try:
+        with declarer.cursor() as d:
+            d.execute("SAVEPOINT before_declare")
+            d.execute("SELECT postgremq.create_queue('ex', 't', 0, true, interval '60 seconds')")
+            d.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ex'")
+            assert d.fetchone()[0] > deadline
+        with deleter.cursor() as x:
+            x.execute("SET lock_timeout = '200ms'")
+            with pytest.raises(psycopg2.Error) as error:
+                x.execute("SELECT postgremq.delete_queue('ex')")
+            assert error.value.pgcode == '55P03', 'the redeclaration must still hold the row'
+        with declarer.cursor() as d:
+            d.execute("ROLLBACK TO SAVEPOINT before_declare")
+        with deleter.cursor() as x:
+            x.execute("SELECT keep_alive_until FROM postgremq.queues WHERE name = 'ex'")
+            assert x.fetchone()[0] == deadline, 'the rollback must undo the refresh'
+            x.execute("SELECT postgremq.delete_queue('ex')")  # no longer locked
+        declarer.commit()
+        cur.execute("SELECT count(*) FROM postgremq.queues WHERE name = 'ex'")
+        assert cur.fetchone()[0] == 0
+    finally:
+        declarer.close()
+        deleter.close()
+
+@pytest.mark.parametrize('isolation', ['REPEATABLE READ', 'SERIALIZABLE'])
+def test_create_queue_concurrent_with_delete_queue_snapshot_isolation_raises_40001(cur, db_config, test_db, isolation):
+    """Under REPEATABLE READ and SERIALIZABLE, a redeclaration whose existing
+    row is deleted, and the deletion committed, while it waits to lock the row
+    raises 40001 (the documented retry-the-transaction case) instead of
+    creating the queue."""
+    cur.execute("SELECT postgremq.create_topic('t')")
+    cur.execute("SELECT postgremq.create_queue('q', 't', 3, false)")
+    deleter = psycopg2.connect(**{**db_config, 'dbname': test_db})
+    declarer = _connect(db_config, test_db)
+    try:
+        with deleter.cursor() as d:
+            d.execute("SELECT 1 FROM postgremq.queues WHERE name = 'q' FOR SHARE")
+        thread, result = _in_thread(declarer, ["SELECT postgremq.create_queue('q', 't', 3, false)"],
+                                    isolation=isolation)
+        try:
+            assert _wait_until(lambda: _backend_waits_on_lock(cur, declarer))
+            with deleter.cursor() as d:
+                d.execute("SELECT postgremq.delete_queue('q')")
+        finally:
+            deleter.commit()
+            thread.join(timeout=15)
+        assert not thread.is_alive()
+        assert result.get('error') is not None and result['error'].pgcode == '40001', result
+    finally:
+        deleter.close()
+        declarer.close()
+
+@pytest.mark.parametrize('isolation', ['REPEATABLE READ', 'SERIALIZABLE'])
+def test_create_queue_snapshot_isolation_redeclare_after_recreate_raises_40001(cur, db_config, test_db, isolation):
+    """Under REPEATABLE READ and SERIALIZABLE, a queue deleted after the
+    snapshot (deletion committed before the call) is created anew. A second create_queue in the
+    same transaction then sees both the old row (in the snapshot) and the new
+    one: it raises 40001, not too_many_rows (P0003)."""
+    cur.execute("SELECT postgremq.create_topic('t')")
+    cur.execute("SELECT postgremq.create_queue('q', 't')")
+    old_generation = cur.fetchone()[0]
+    declarer = _connect(db_config, test_db)
+    try:
+        with declarer.cursor() as d:
+            d.execute("SET statement_timeout = '5s'")
+            d.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+            d.execute("SELECT 1")  # take the snapshot
+            cur.execute("SELECT postgremq.delete_queue('q')")
+            d.execute("SELECT postgremq.create_queue('q', 't')")
+            assert d.fetchone()[0] != old_generation
+            with pytest.raises(psycopg2.Error) as error:
+                d.execute("SELECT postgremq.create_queue('q', 't')")
+            assert error.value.pgcode == '40001', error.value
+            d.execute("ROLLBACK")
+    finally:
+        declarer.close()
+
+@pytest.mark.parametrize('isolation', ['REPEATABLE READ', 'SERIALIZABLE'])
+def test_create_queue_snapshot_isolation_queue_created_after_snapshot_raises_40001(cur, db_config, test_db, isolation):
+    """Under REPEATABLE READ and SERIALIZABLE, a queue committed after the
+    snapshot conflicts with the insert but is invisible to the snapshot: create_queue raises
+    40001 (the documented retry-the-transaction case)."""
+    cur.execute("SELECT postgremq.create_topic('t')")
+    declarer = _connect(db_config, test_db)
+    try:
+        with declarer.cursor() as d:
+            d.execute("SET statement_timeout = '5s'")
+            d.execute(f"BEGIN ISOLATION LEVEL {isolation}")
+            d.execute("SELECT 1")  # take the snapshot
+            cur.execute("SELECT postgremq.create_queue('q', 't')")
+            with pytest.raises(psycopg2.Error) as error:
+                d.execute("SELECT postgremq.create_queue('q', 't')")
+            assert error.value.pgcode == '40001', error.value
+            d.execute("ROLLBACK")
+    finally:
+        declarer.close()
 
 def test_unlimited_delivery_attempts(cur: psycopg2.extensions.cursor) -> None:
     """Test queue with unlimited delivery attempts (max_delivery_attempts = 0)."""
@@ -2978,7 +3240,6 @@ def test_queue_metrics_transaction_visibility(cur, conn, db_config, test_db):
 # ---------------------------------------------------------------------------
 
 import random
-import threading
 
 
 def _connect(db_config, test_db):
